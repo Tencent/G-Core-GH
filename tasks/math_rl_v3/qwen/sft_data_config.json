@@ -1,0 +1,15 @@
+{
+    "train_data_infos": {
+        "train_math": {
+            "path": "./hf-hub/AI-MO/NuminaMath-CoT-jsonl/train/",
+            "probability": 1.0,
+            "sample_rate": 1.0
+        }
+    },
+    "eval_data_infos": {
+        "eval_math": {
+            "path": "./hf-hub/AI-MO/NuminaMath-CoT-jsonl/eval/",
+            "eval_samples_num": 300
+        }
+    }
+}

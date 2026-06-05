@@ -1,0 +1,66 @@
+# @package _global_
+_target_: gpatch_v4.configs.config.FinetuneConfig
+
+training:
+  training_backend: mcore
+  use_fast_tokenizer: True
+  train_gbs: 256
+  train_mbs: 1
+  seq_length: 4096
+  data_parallel_random_init: False
+  save_interval: 1000
+  eval_interval: 100
+  eval_before_train: False
+  num_train_epoches: 1
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+  build_from_mbridge: True
+  pad_to_mulitiple_of: 128
+  use_dynamic_mbs: True
+
+checkpoint:
+  load_ckpt_path: ckpt_qwen3_omni_pmc_vqa
+  save_ckpt_path: ckpt_qwen3_omni_pmc_vqa
+  strict_export: False
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 5.0e-7
+  lr_warmup_steps: 0
+  lr_decay_style: "constant"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "/tmp/filter_4k_pmc_vqa_gdataset_v4.json"
+    - "/tmp/filter_4k_pmc_vqa_gdataset_v4_eval.json"
+  py_path: "tasks/multimodal_v4/finetune/qwen3vl_sft_v4.py"
+  fn_name: "get_dataset_and_dataloader"
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+  dataloader_verify_fn_name: "verify_dataloader_func"
+
+policy:
+  dist_config:
+    num_gpus_per_node: 8
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8
+  model_arch: "qwen3_omni_moe"
+  without_ref: True
+  hf_model_path: "hf-hub/Qwen/Qwen3-Omni-30B-A3B-Instruct"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3-Omni-30B-A3B-Instruct"
+  override_transformer_config:
+    variable_seq_lengths: False
+
+debug:
+  save_first_rollout_data: True
+
+task:
+  shuffle_buffer_size: 102400
+  smart_padding_buffer_size: 2048

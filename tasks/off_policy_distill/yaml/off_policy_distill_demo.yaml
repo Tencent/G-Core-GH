@@ -1,0 +1,81 @@
+# @package _global_
+# enable teacher rollout
+
+training:
+  training_backend: mcore
+  use_fast_tokenizer: True
+  train_gbs: 256
+  train_mbs: 1
+  seq_length: 16384
+  data_parallel_random_init: False
+  save_interval: 1000
+  num_train_epoches: 10
+  prefetch_num_gb: 16
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+  enable_teacher_rollout: True
+  setup_teacher_in_independent_topo: False
+
+checkpoint:
+  load_ckpt_path: load_qwen3_1_7b_base_distill_ckpt
+  save_ckpt_path: save_qwen3_1_7b_base_distill_ckpt
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 2.0e-5
+  lr_warmup_steps: 200
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "hf-hub/AI-MO/NuminaMath-CoT-jsonl/train_sub"
+  py_path: "tasks/off_policy_distill/simple_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+policy:
+  dist_config:
+    nnodes: 8
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+  model_arch: "qwen3"
+  without_ref: True
+  hf_model_path: "hf-hub/Qwen/Qwen3-1.7B-Base"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3-1.7B-Base"
+  ref_hf_model_path: "hf-hub/Qwen/Qwen3-1.7B-Base"
+  rollout_gen_type: "off_policy_distill"
+  sampler_client:
+    rpc_type: ray
+
+sampler:
+  backend: sglang
+  sampler_type: "off-policy-sampler"
+  dist_config:
+    nnodes: 8
+  model_info:
+    - model_arch: "qwen3"
+      hf_model_path: "hf-hub/Qwen/Qwen3-32B/"
+      gen_rollout_py_path: "tasks/off_policy_distill/generate_samples.py"
+      gen_rollout_fn_name: "off_policy_generate_func"
+
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 8
+        tensor_model_parallel_size: 4
+      gpu_memory_utilization: 0.7
+      temperature: 1.0
+      top_p: 0.9
+      generate_max_tokens: 14336
+      use_fast_tokenizer: True
+
+debug:
+  save_first_rollout_data: True
+  debug_engine_update_weight: False

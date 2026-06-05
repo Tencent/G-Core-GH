@@ -1,0 +1,85 @@
+# @package _global_
+# copy from tasks/t2i_grpo_tv4/yaml/oteam4_4_rl_exp7.yaml, only modify ppo_ratio_eps
+
+training:
+  training_backend: fsdp2
+  use_gen_rm_reward: True
+  use_bt_rm_reward: False
+  rollout_gbs: 32
+  rollout_mbs: 1
+  rollout_model_mbs: 1
+  train_gbs_wo_timestep: 128
+  train_mbs: 1
+  sampling_repeat_n: 12
+  init_same_noise: True
+  width: 512
+  height: 512
+  max_prompt_length: 256
+  eta: 0.3
+  sampling_steps: 16
+  shift: 3
+  data_parallel_random_init: True
+  timestep_fraction: 0.6
+  save_interval: 100
+  num_train_epoches: 4
+  enable_cfg: True
+  guidance_scale: 3.5
+  disable_cfg_uncond_grad: True
+  custom_actors:
+    - name : "oteam_text_gen_rm"
+      cls_path: "tasks.t2i_grpo_tv4_text.custom_gen_rm_actor.OteamTextGrpoGenRmActor"
+
+
+checkpoint:
+  load_ckpt_path: t2i_grpo_tv4_oteam4_4_text
+  save_ckpt_path: t2i_grpo_tv4_oteam4_4_text
+
+optimizer:
+  lr: 1e-5
+  lr_warmup_steps: 0
+  lr_decay_style: "constant_with_warmup"
+  weight_decay: 0.0001
+  max_grad_norm: 1.0
+
+data:
+  data_pathes:
+    - "/mnt/ceph-sz2-csp/mm-base-plt2/user_hessianliu/sampled_text_data_100000.jsonl"
+  py_path: "tasks/t2i_grpo_tv4_text/simple_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+
+policy:
+  dist_config:
+    nnodes: 1
+  without_ref: true
+  model_arch: "oteam4_4"
+  hf_model_path: "hf-hub/wechat/oteam4_4-step-10000"
+  ref_hf_model_path: "hf-hub/wechat/oteam4_4-step-10000"
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+
+gen_rm:
+  dist_config:
+    nnodes: ${policy.dist_config.nnodes}
+    tensor_model_parallel_size: 8
+  reward_model_info:
+    - model_arch: "qwen3_vl_moe"
+      hf_model_path: /data/Qwen3-VL-30B-A3B-Instruct
+      reward_weight: 1.0
+  infer_engine_configs:
+    - dist_config:
+        nnodes: ${policy.dist_config.nnodes}
+        tensor_model_parallel_size: 8
+      custom_rm_actor_impl: oteam_text_gen_rm
+      generate_max_tokens: 32768
+      max_running_requests: 256
+ppo:
+  grpo_advantage_epsilon: 1.0e-8
+  ppo_ratio_eps: 1.0e-2
+  adv_clip_max: 5.0
+  adv_clip_min: -5.0
+
+debug:
+  save_images: True
+  save_images_dir: debug_images_offp_cfg3_5_disable_cfg_neg_grad_clip1e-2

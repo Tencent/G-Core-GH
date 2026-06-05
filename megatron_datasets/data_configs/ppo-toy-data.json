@@ -1,0 +1,9 @@
+{
+    "train_data_infos": {
+        "dqa-ppo": {
+            "path": "toy-data/ppo",
+            "probability": 1.0,
+            "sample_rate": 1.0
+        }
+    }
+}

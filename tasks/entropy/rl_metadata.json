@@ -1,0 +1,11 @@
+{
+    "name": "dapo-math",
+    "data_files": [
+        {
+            "fp": "./data/DAPO-Math-17k-jsonl/train/dapo-math-17k-v2.jsonl"
+        }
+    ],
+    "data_file_num_lines": [
+        1791700
+    ]
+}

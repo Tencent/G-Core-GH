@@ -1,0 +1,15 @@
+{
+    "train_data_infos": {
+        "dqa-dpo-v1.0": {
+            "path": "toy-data/rm",
+            "probability": 1.0,
+            "sample_rate": 1.0
+        }
+    },
+    "eval_data_infos": {
+        "dqa-dpo-v1.0": {
+            "path": "toy-data/rm",
+            "eval_samples_num": 48
+        }
+    }
+}

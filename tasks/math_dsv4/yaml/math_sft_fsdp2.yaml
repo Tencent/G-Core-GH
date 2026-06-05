@@ -1,0 +1,81 @@
+# @package _global_
+#
+# DeepSeek-V4 SFT on NuminaMath-CoT, EP + FSDP2 (CP=1 by default).
+#
+# Cloned from tasks/math_rl_v4/yaml/math_sft_fsdp2.yaml. Diffs vs the Qwen2.5
+# baseline:
+#   * model_arch -> "deepseek_v4" (engine dispatches to gpatch_v4.models.deepseek_v4
+#     and constructs the model on meta-device + apply_hp + load_checkpoint_hp).
+#   * hf_model_path -> DeepSeek-V4-Flash (FP8/FP4 mixed; engine streams +
+#     dequantizes per-rank in load_checkpoint_hp, no rank-0 480 GB blow-up).
+#   * dist_config.expert_model_parallel_size > 1 to opt into the HpModule path.
+#   * HpModule save uses save_checkpoint_hp -> writes
+#     <save_ckpt_path>/iter_{step:07d}/hf_hp/ as a from_pretrained-ready bf16
+#     directory. convert_mcore_to_hf_online is disabled because the HpModule
+#     path already produces an HF-compatible directory by construction.
+#   * Dataset is a byte copy of math_rl_v4's; py_path points to the local copy
+#     so this task is self-contained.
+
+training:
+  training_backend: fsdp2
+  use_fast_tokenizer: True
+  train_gbs: 32                  # cp-validation: dp_size=32 on both cp=1 (32 GPU) and cp=4 (128 GPU)
+  train_mbs: 1
+  seq_length: 4096
+  data_parallel_random_init: False
+  save_interval: 1               # full-43L smoke: save at every step (verify new parallel save)
+  num_train_epoches: 1
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+  exit_step: 2                   # full-43L smoke: 1 step + 1 save, kill after
+  recompute: True
+  mtp_loss_scaling_factor: 0.1
+
+policy:
+  dist_config:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 4   # must divide world_size; opts into HpModule path
+    context_parallel_size: 4
+  model_arch: "deepseek_v4"
+  # DeepSeek-V4 fork doesn't register flash_attention_2 (raises in
+  # transformers _flash_attn_can_dispatch); use eager. The tested CP
+  # path also runs eager, so this matches the validated configuration.
+  attn_implementation: "eager"
+  without_ref: True
+  hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
+  hf_tokenizer_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
+
+checkpoint:
+  load_ckpt_path: load_dsv4_sft_ckpt
+  save_ckpt_path: save_dsv4_sft_ckpt   # HpModule path writes iter_*/hf_hp/ here
+  convert_mcore_to_hf_online: False    # HpModule save_checkpoint_hp already writes HF format
+  mbridge_distributed_filesystem: True
+  override_tokenizer_special_token:
+    eos_token: "<｜end▁of▁sentence｜>"
+
+optimizer:
+  lr: 1.0e-5
+  lr_warmup_steps: 100
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "hf-hub/AI-MO/NuminaMath-CoT-jsonl/train/"
+  py_path: "tasks/math_dsv4/finetune_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+debug:
+  save_first_rollout_data: True
+  # OOM smoke knob: truncate DSV4-Flash from its full layer count down to N
+  # decoder layers, mirroring `_truncate_config` in tests/test_gfused/
+  # test_deepseek_v4_ep_cp.py. Leave unset (= None) for full 43-layer training.
+  debug_truncate_num_hidden_layers:    # full-43L smoke (remove truncation to test new master load/save)

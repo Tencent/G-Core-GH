@@ -1,0 +1,26 @@
+{
+    "train_data_infos": {
+        "baike": {
+            "path": "toy-data/pretrain/baike",
+            "probability": 0.5,
+            "sample_rate": 1.0
+        },
+        "arxiv": {
+            "path": "toy-data/pretrain/arxiv",
+            "probability": 0.5,
+            "sample_rate": 1.0
+        }
+    },
+    "eval_data_infos": {
+        "baike": {
+            "path": "toy-data/pretrain/baike",
+            "probability": 0.5,
+            "sample_rate": 1.0
+        },
+        "arxiv": {
+            "path": "toy-data/pretrain/arxiv",
+            "probability": 0.5,
+            "sample_rate": 1.0
+        }
+    }
+}

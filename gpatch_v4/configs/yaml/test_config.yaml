@@ -1,0 +1,54 @@
+# @package _global_
+
+dist_config:
+  tensor_model_parallel_size: 2
+  pipeline_model_parallel_size: 2
+
+train_config:
+  strategy: mcore
+  total_training_step: 100
+  use_bt_rm_reward: True
+  rollout_gbs: 16
+
+report_config:
+  report_to: "wandb"
+
+data:
+  data_path: "qwen2.5-3b-instruct"
+
+optimizer_config:
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  lr: 2e-5
+
+actor_config:
+  hf_model_path: /mnt/ceph-hz1-csp/mm-base-plt2/user_xiaotaoliu/project/gcore-dev/hf-hub/Qwen/Qwen2.5-Math-1.5B/
+  hf_tokenizer_path: /mnt/ceph-hz1-csp/mm-base-plt2/user_xiaotaoliu/project/gcore-dev/hf-hub/Qwen/Qwen2.5-Math-1.5B/
+  ref_hf_model_path: /mnt/ceph-hz1-csp/mm-base-plt2/user_xiaotaoliu/project/gcore-dev/hf-hub/Qwen/Qwen2.5-Math-1.5B/
+  sampler_client:
+    rpc_type: http
+    rpc_timeout: 120
+    update_weight_max_size_mb: 512
+  bt_reward_client:
+    rpc_type: http
+    rpc_timeout: 120
+
+sampler_config:
+  infer_engine_impl: sglang
+  model_path: /mnt/ceph-hz1-csp/mm-base-plt2/user_xiaotaoliu/project/gcore-dev/hf-hub/Qwen/Qwen2.5-Math-1.5B/
+  infer_engine:
+    tp_size: 2
+    pp_size: 1
+    top_p: 0.9
+    top_k: 0
+    temperature: 0.7
+
+bt_reward_config:
+  hf_tokenizer_pathes: [/mnt/ceph-hz1-csp/mm-base-plt2/user_xiaotaoliu/project/gcore-dev/hf-hub/Qwen/Qwen2.5-Math-RM-72B, ]
+  num_reward_models: 1
+  custom_reward_model_path: gpatch/v4/math_rl/rewards.py
+  reward_type: rule_only
+
+debug_config:
+  debug_engine_update_weight: False

@@ -1,0 +1,15 @@
+{
+    "train_data_infos": {
+        "sft": {
+            "path": "toy-data/sft",
+            "probability": 1.0,
+            "sample_rate": 1.0
+        }
+    },
+    "eval_data_infos": {
+        "sft_eval": {
+            "path": "toy-data/sft",
+            "eval_samples_num": 16
+        }
+    }
+}

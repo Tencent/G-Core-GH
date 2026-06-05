@@ -1,0 +1,11 @@
+{
+    "name": "gsm8k",
+    "data_files": [
+        {
+            "fp": "/mnt/ceph-hz1-csp/mm-base-plt2/nrwu/hf-hub/HuggingFaceH4/Multilingual-Thinking/data/train-00000-of-00001.jsonl"
+        }
+    ],
+    "data_file_num_lines": [
+        1000
+    ]
+}

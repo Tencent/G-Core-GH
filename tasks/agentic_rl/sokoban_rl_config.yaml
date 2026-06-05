@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - rl_config
+  - _self_
+
+policy:
+  hf_model_path: "hf-hub/Qwen/Qwen2.5-VL-7B-Instruct"
+
+critic:
+  hf_model_path: "hf-hub/Qwen/Qwen2.5-VL-7B-Instruct"
+
+checkpoint:
+  load_ckpt_path: ../ckpts/save_qwen_2_5_vl_7b_grpo
+  save_ckpt_path: ../ckpts/save_qwen_2_5_vl_7b_grpo

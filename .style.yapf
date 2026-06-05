@@ -1,0 +1,4 @@
+[style]
+based_on_style = facebook
+# 行最大长度
+column_limit = 100

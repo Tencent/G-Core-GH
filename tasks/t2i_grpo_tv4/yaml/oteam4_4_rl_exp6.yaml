@@ -1,0 +1,79 @@
+# @package _global_
+# copy from tasks/t2i_grpo_tv4/yaml/oteam4_4_rl_config.yaml, only modify cfg
+
+training:
+  training_backend: fsdp2
+  use_gen_rm_reward: False
+  use_bt_rm_reward: True
+  rollout_gbs: 64
+  rollout_mbs: 1
+  rollout_model_mbs: 1
+  train_gbs_wo_timestep: 256
+  train_mbs: 1
+  sampling_repeat_n: 12
+  init_same_noise: True
+  width: 512
+  height: 512
+  max_prompt_length: 256
+  eta: 0.3
+  sampling_steps: 16
+  shift: 3
+  data_parallel_random_init: True
+  timestep_fraction: 0.6
+  save_interval: 100
+  num_train_epoches: 4
+  enable_cfg: True
+  guidance_scale: 3.5
+
+checkpoint:
+  load_ckpt_path: t2i_grpo_tv4_oteam4_4_offp_cfg3_5
+  save_ckpt_path: t2i_grpo_tv4_oteam4_4_offp_cfg3_5
+
+optimizer:
+  lr: 1e-5
+  lr_warmup_steps: 0
+  lr_decay_style: "constant_with_warmup"
+  weight_decay: 0.0001
+  clip_grad: 1.0
+
+data:
+  data_pathes:
+    - "tasks/t2i_grpo_tv4/prompts.txt"
+  py_path: "tasks/t2i_grpo_tv4/simple_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+
+policy:
+  dist_config:
+    nnodes: 8
+  without_ref: true
+  model_arch: "oteam4_4"
+  hf_model_path: "hf-hub/wechat/oteam4_4-step-10000"
+  ref_hf_model_path: "hf-hub/wechat/oteam4_4-step-10000"
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+
+bt_rm:
+  dist_config:
+    nnodes: 8
+  reward_model_info:
+    - model_arch: "hpsv3"
+      # hf_model_path: hf-hub/laion/CLIP-ViT-H-14-laion2B-s32B-b79K/open_clip_pytorch_model.bin
+      # model_weight_path: hf-hub/xswu/HPSv2/HPS_v2.1_compressed.pt
+      reward_weight: 1.0
+      reward_py_path: tasks/t2i_grpo_tv4/my_hpsv3.py
+      rm_cls_name: Hpsv3RewardModel
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 8
+
+ppo:
+  grpo_advantage_epsilon: 1.0e-8
+  ppo_ratio_eps: 1.0e-4
+  adv_clip_max: 5.0
+  adv_clip_min: -5.0
+
+debug:
+  save_images: True
+  save_images_dir: debug_images_offp_cfg3_5

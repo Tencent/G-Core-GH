@@ -1,0 +1,73 @@
+# @package _global_
+_target_: gpatch_v4.configs.config.FinetuneConfig
+
+training:
+  training_backend: mcore
+  use_fast_tokenizer: True
+  train_gbs: 128
+  train_mbs: 1
+  seq_length: 4096
+  data_parallel_random_init: False
+  save_interval: 1000
+  num_train_epoches: 1
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+  build_from_mbridge: True
+  pad_to_mulitiple_of: 256
+  use_dynamic_mbs: True
+  moe_pad_with_random_tokens: True
+  freeze_moe_router: True
+  freeze_vit: True
+  freeze_projector: True
+  enable_thinking: False
+
+checkpoint:
+  load_ckpt_path: save_ckpt_qwen3_6_27b
+  save_ckpt_path: save_ckpt_qwen3_6_27b
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 5.0e-7
+  lr_warmup_step_frac: 0.02
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "hf-hub/AI-MO/NuminaMath-CoT-jsonl/train/"
+  py_path: "tasks/multimodal_v4/finetune/qwenvl_sft_text_only.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+  dataloader_verify_fn_name: "verify_dataloader_func"
+
+policy:
+  dist_config:
+    num_gpus_per_node: 8
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 1
+  model_arch: "qwen3_5"
+  without_ref: True
+  hf_model_path: "hf-hub/Qwen/Qwen3.6-27B/"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3.6-27B/"
+  override_transformer_config:
+    variable_seq_lengths: False
+    moe_router_load_balancing_type: "none"
+    moe_aux_loss_coeff: 0.0
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+
+debug:
+  save_first_rollout_data: True
+
+task:
+  shuffle_buffer_size: 102400
+  smart_padding_buffer_size: 2048

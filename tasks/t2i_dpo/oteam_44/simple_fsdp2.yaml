@@ -1,0 +1,28 @@
+# https://github.com/SalesforceAIResearch/DiffusionDPO/blob/main/README.md
+MODEL_NAME: hf-hub/runwayml/stable-diffusion-v1-5
+DATASET_NAME: xzuyn/pickapic_v2_only_some
+trainer:
+  _target_: tasks.t2i_dpo.oteam_44.simple_fsdp2.SimpleDpoTrainer
+  args:
+    training:
+      pretrained_model_name_or_path: ${MODEL_NAME}
+      train_batch_size: 1
+      mixed_precision: "bf16"
+      gradient_accumulation_steps: 1
+      max_train_steps: 5000
+      save_interval: 10000
+    data:
+      dataset_name: ${DATASET_NAME}
+      dataloader_num_workers: 16
+      cache_dir: "./pick_a_pic_v2/"
+    dpo:
+      beta_dpo: 5000
+    optimizer:
+      lr: 1e-8
+      lr_warmup_steps: 500
+      lr_decay_style: constant_with_warmup
+      weight_decay: 0.0001
+      max_grad_norm: 1.0
+    checkpoint:
+      checkpointing_steps: 500
+      output_dir: "tmp-sd15"

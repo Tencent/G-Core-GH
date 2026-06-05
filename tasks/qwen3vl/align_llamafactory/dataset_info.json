@@ -1,0 +1,17 @@
+{
+    "llava_150k_zh": {
+        "hf_hub_url": "../hf-hub/BUAADreamer/llava-en-zh-300k",
+        "subset": "zh",
+        "formatting": "sharegpt",
+        "columns": {
+            "messages": "messages",
+            "images": "images"
+        },
+        "tags": {
+            "role_tag": "role",
+            "content_tag": "content",
+            "user_tag": "user",
+            "assistant_tag": "assistant"
+        }
+    }
+}

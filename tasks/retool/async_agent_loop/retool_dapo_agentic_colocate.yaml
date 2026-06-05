@@ -1,0 +1,153 @@
+# @package _global_
+# ReTool DAPO – colocate placement via EnvAgentLoopActor + simplified TrajEnvManager.
+# Policy and sampler share the same GPU nodes; rollout_max_staleness=0 enforced.
+_target_: gpatch_v4.configs.config.AgenticRlConfig
+placement_type: colocate
+
+training:
+  training_backend: mcore
+  single_controller: True
+  use_gen_rm_reward: False
+  use_bt_rm_reward: False
+  use_fast_tokenizer: True
+  seq_length: 18432
+  rollout_gbs: 32
+  sampling_repeat_n: 8
+  sampling_keep_n: 8
+  train_gbs: 128
+  num_train_epoches: 1
+  total_ppo_step: 4096
+  ppo_step_per_epoch: 4096
+  save_interval: 100
+  build_from_mbridge: True
+  async_rollout: False
+  rollout_max_staleness: 0
+  agent_loop_actor_cls: "gpatch_v4.rollout_generator.async_rollout.env_agent_loop_actor.EnvAgentLoopActor"
+  num_agent_loop_workers: 8
+  agentic:
+    train_env_manager:
+      llm_proxy:
+        proxy_type: engine
+    env_cfg_template:
+      env_type: retool_dapo
+      custom_env_cls: tasks.retool.async_agent_loop.retool_env:RetoolEnv
+      env_manager_cls: gpatch_v4.agentic.env_manager.traj_env_manager.TrajEnvManager
+      max_steps: 8
+      max_tokens_per_step: 2048
+      agent_system_template: ""
+      agent_template: "{observation}"
+      env_tool_config:
+        use_tools: true
+        tools_json_path: tasks/retool/async_agent_loop/tools_code_interpreter.json
+        tool_call_parser: sglang/qwen25
+      env_config:
+        env_instruction: "You are solving a math problem, the code_interpreter tool provided to you will return traceback if the code is invalid, you should fix the code and try again."
+        sandbox_timeout: 20
+        max_steps: 8
+
+data:
+  py_path: "tasks/retool/async_agent_loop/retool_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  data_pathes:
+    - "tasks/retool/async_agent_loop/metadata.json"
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+policy:
+  dist_config:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    nnodes: -1
+    num_gpus_per_node: 8
+  model_arch: "qwen2"
+  hf_model_path: "hf-hub/Qwen/Qwen2.5-7B-Instruct"
+  hf_tokenizer_path: ${policy.hf_model_path}
+  ref_hf_model_path: ${policy.hf_model_path}
+  smart_pad_infer: True
+  smart_pad_train: True
+  sampler_client:
+    rpc_type: ray
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+  override_transformer_config:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+
+critic:
+  dist_config:
+    nnodes: 0
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+  model_arch: "qwen2"
+  hf_model_path: "hf-hub/Qwen/Qwen2.5-7B-Instruct"
+  hf_tokenizer_path: ${critic.hf_model_path}
+
+sampler:
+  dist_config:
+    nnodes: -1
+    num_gpus_per_node: 8
+    pipeline_model_parallel_size: 1
+    tensor_model_parallel_size: 4
+  backend: sglang
+  model_info:
+    - model_arch: "qwen2"
+      hf_model_path: ${policy.hf_model_path}
+      gen_rollout_py_path: "gpatch_v4/agentic/generate_func.py"
+      gen_rollout_fn_name: "generate_func"
+  infer_engine_configs:
+    - dist_config:
+        tensor_model_parallel_size: 4
+        nnodes: -1
+        num_gpus_per_node: 8
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.5
+      max_running_requests: 64
+      temperature: 1.0
+      top_p: 1.0
+      generate_max_tokens: 2048
+
+gen_rm:
+  dist_config:
+    nnodes: 0
+
+bt_rm:
+  dist_config:
+    nnodes: 0
+  reward_type: "rule_only"
+  reward_model_info:
+    - model_arch: "qwen2.5-math-rm-72b"
+      hf_model_path: "hf-hub/Qwen/Qwen2.5-Math-RM-72B/"
+      reward_py_path: tasks/math_rl_v4/bt_reward.py
+      parse_reward_fn_name: math_rl_rule_reward
+      reward_weight: 1.0
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 0
+
+checkpoint:
+  load_ckpt_path: /mnt/ceph-hz1-csp/mm-base-plt2/user_yeazhao/ckpts/save_qwen_2_5_7b_agentic
+  save_ckpt_path: /mnt/ceph-hz1-csp/mm-base-plt2/user_yeazhao/ckpts/save_qwen_2_5_7b_agentic
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 1e-6
+  lr_warmup_steps: 0
+  lr_decay_style: "constant"
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+ppo:
+  grpo_advantage_epsilon: 1.0e-6
+  enable_off_policy_correction: False
+  ppo_ratio_eps: 0.2
+  grpo_kl_loss_beta: 0
+  advantage_type: grpo
+  ppo_discount_factor: 0.99
+  critic_model_warmup_steps: 20

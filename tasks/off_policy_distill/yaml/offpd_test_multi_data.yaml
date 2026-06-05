@@ -1,0 +1,81 @@
+# @package _global_
+_target_: gpatch_v4.configs.config.OffPolicyDistillConfig
+
+training:
+  training_backend: mcore
+  use_fast_tokenizer: True
+  train_gbs: 128
+  train_mbs: 1
+  use_dynamic_mbs: True
+  seq_length: 16384
+  pad_to_mulitiple_of: 4096
+  data_parallel_random_init: False
+  save_interval: 500
+  num_train_epoches: 10
+  prefetch_num_gb: 1
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+  enable_teacher_rollout: False
+  enable_teacher_kl_loss: True
+  setup_teacher_in_independent_topo: False
+  loss_func: ce_with_kl
+
+checkpoint:
+  load_ckpt_path: test_offpd_kl_shard_debug
+  save_ckpt_path: test_offpd_kl_shard_debug
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 5e-6
+  lr_warmup_steps: 0
+  lr_decay_style: "constant"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "/mnt/ceph-hz1-csp/mm-base-plt2/user_xiaotaoliu/data/offpad_data_mod"
+  py_path: "tasks/math_rl_v4/finetune_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: |-
+    ======== 角色 ========
+    你是一位程序员，你只会生成相关的代码。现给你提供一份较为详细的小程序需求文档，要求你根据该需求文档生成页面代码。严格遵守规则帮助用户生成被简单易懂地语言充分注释后的全部完整项目页面代码，不要输出别的。
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+policy:
+  dist_config:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 2
+  model_arch: "qwen3"
+  forward_only_mbs: 1
+  without_ref: True
+  hf_model_path: "hf-hub/Qwen/Qwen3-1.7B-Base"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3-1.7B-Base"
+  rollout_gen_type: "off_policy_distill"
+  smart_pad_train: True
+  sampler_client:
+    rpc_type: ray
+  teacher_client:
+    rpc_type: ray
+
+teacher:
+  model_arch: "qwen3"
+  hf_model_path: "hf-hub/Qwen/Qwen3-32B"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3-32B"
+  wrap_with_ddp: False
+  forward_only_mbs: 1
+  smart_pad_infer: True
+
+distill:
+  enable_data_with_alpha: True
+
+debug:
+  save_first_rollout_data: True
+  debug_engine_update_weight: False
+  test_ray_rpc: False

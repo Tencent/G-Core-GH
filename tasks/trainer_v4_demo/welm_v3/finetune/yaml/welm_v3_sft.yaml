@@ -1,0 +1,69 @@
+# @package _global_
+
+training:
+  training_backend: mcore
+  build_from_mbridge: True
+  use_fast_tokenizer: True
+  train_gbs: 256
+  train_mbs: 1
+  seq_length: 4096
+  data_parallel_random_init: False
+  save_interval: 500
+  num_train_epoches: 1
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+  attention_backend: "flash"
+  freeze_moe_router: True
+  moe_pad_with_random_tokens: True
+
+policy:
+  dist_config:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 4
+    expert_model_parallel_size: 16
+    expert_tensor_parallel_size: 1
+    context_parallel_size: 1
+    num_layers_in_first_pipeline_stage: 20
+    num_layers_in_last_pipeline_stage: 20
+  model_arch: "welm_moe"
+  without_ref: True
+  hf_model_path: "/mnt/ceph-hz1-csp/mm-base-plt2/user_xiaotaoliu/models/welm_ckpt/WeLM-v3-258B-A22B-Instruct-0305"
+  hf_tokenizer_path: "/mnt/ceph-hz1-csp/mm-base-plt2/user_xiaotaoliu/models/welm_ckpt/WeLM-v3-258B-A22B-Instruct-0305"
+  override_transformer_config:
+    moe_router_load_balancing_type: "none"
+    moe_aux_loss_coeff: 0.0
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+
+checkpoint:
+  load_ckpt_path: save_welm_v3_258b_sft
+  save_ckpt_path: save_welm_v3_258b_sft
+  no_save_optim: True
+  no_load_optim: True
+  save_total_limit: 3
+  save_retain_interval: 500
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 5.0e-6
+  lr_warmup_steps: 100
+  lr_decay_style: "cosine"
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "hf-hub/AI-MO/NuminaMath-CoT-jsonl/train/"
+  py_path: "tasks/math_rl_v4/finetune_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "You are a helpful assistant. Please reason step by step, keep your reasoning as short as possible, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+debug:
+  save_first_rollout_data: True

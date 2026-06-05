@@ -1,0 +1,42 @@
+default_language_version:
+  python: python3.12
+
+exclude: |
+  (?x)^(
+      tasks/|
+      test/|
+      tests/|
+      debug/|
+      examples/|
+      archive/|
+      docs/|
+      gpatch/|
+      gcore-dev/gpatch_v4/models/deepseek_v4/modeling_deepseek_v4.py
+  )
+
+repos:
+  # 通用格式检查（保留）
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: [ "--profile", "black" ]  # 与 yapf 兼容
+        additional_dependencies: [ "setuptools==70" ]
+
+  # 替换 black 为 yapf（Python 格式化）
+  - repo: https://github.com/google/yapf
+    rev: v0.40.2  # 使用最新稳定版本
+    hooks:
+      - id: yapf
+        args: [--in-place]  # 直接修改文件（而非仅检查）
+        types: [python]     # 仅格式化 Python 文件
+        additional_dependencies: [ "setuptools==70" ]

@@ -1,0 +1,11 @@
+{
+    "name": "gsm8k",
+    "data_files": [
+        {
+            "fp": "./hf-hub/openai/gsm8k-jsonl/eval/test-00000-of-00001.jsonl"
+        }
+    ],
+    "data_file_num_lines": [
+        1319
+    ]
+}

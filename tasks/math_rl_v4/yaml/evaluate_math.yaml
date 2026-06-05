@@ -1,0 +1,49 @@
+training:
+  seq_length: 4096
+  train_mbs: 1
+  use_fast_tokenizer: True
+
+data:
+  data_pathes:
+    - "hf-hub/openai/gsm8k-jsonl/eval"
+  py_path: "tasks/off_policy_distill/simple_dataset.py"
+  fn_name: "get_eval_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+policy:
+  dist_config:
+    nnodes: 1
+  model_arch: "qwen2"
+  hf_tokenizer_path: "save_qwen_2_5_1_5b_grpo_dp_balance/hf/58/"
+  hf_model_path: "save_qwen_2_5_1_5b_grpo_dp_balance/hf/58/"
+  sampler_client:
+    rpc_type: ray
+
+sampler:
+  backend: sglang
+  sampler_type: "sampler"
+  dist_config:
+    nnodes: 1
+  model_info:
+    - model_arch: "qwen2"
+      hf_model_path: "save_qwen_2_5_1_5b_grpo_dp_balance/hf/58/"
+      gen_rollout_py_path: "tasks/math_rl_v4/eval_math_demo.py"
+      gen_rollout_fn_name: "eval_generate_func"
+
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 1
+        tensor_model_parallel_size: 1
+      gpu_memory_utilization: 0.7
+      max_running_requests: 128
+      temperature: 0.0
+      generate_max_tokens: 2048
+      use_fast_tokenizer: True
+
+evaluate_result:
+  output_dir: "eval_math_answer"
+  output_prefix: "math_v4_grpo_answer_dp_balance"
+  evaluate_py_path: tasks/math_rl_v4/eval_math_demo.py
+  evaluate_fn_name: eval_acc_and_fmt_score

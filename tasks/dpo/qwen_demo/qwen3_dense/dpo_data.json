@@ -1,0 +1,9 @@
+{
+    "train_data_infos": {
+        "dqa-dpo": {
+            "path": "/mnt/ceph-sz2-csp/mm-base-plt2/user_xiaotaoliu/code/gcore11/data/dpo_data_with_ref_dense/dqa-dpo/",
+            "probability": 1.0,
+            "sample_rate": 1.0
+        }
+    }
+}
