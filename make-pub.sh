@@ -119,6 +119,6 @@ fi
 
 git remote remove txpub
 git remote remove github
-# git checkout master
-# git branch -D prepare_public
-# git branch -D public
+git checkout master
+git branch -D prepare_public
+git branch -D public

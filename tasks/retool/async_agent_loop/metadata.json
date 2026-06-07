@@ -1,5 +1,0 @@
-{
-  "name": "dapo_mini_fixture",
-  "data_files": [{"fp": "/mnt/ceph-hz1-csp/mm-base-plt2/user_yeazhao/data/dapo-math-17k-sample-128k.jsonl"}],
-  "data_file_num_lines": [131072]
-}

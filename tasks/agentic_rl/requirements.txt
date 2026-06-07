@@ -1,7 +1,0 @@
-TensorDict
-codetiming
-git+https://github.com/axon-rl/gem.git
-transformers==4.55
-gym_sokoban
-antlr4-python3-runtime==4.9.3
-msgspec==0.20.0
