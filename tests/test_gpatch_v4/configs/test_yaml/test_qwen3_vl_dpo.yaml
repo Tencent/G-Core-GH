@@ -1,0 +1,63 @@
+_target_: gpatch_v4.configs.config.DpoConfig
+
+training:
+  training_backend: mcore
+  use_fast_tokenizer: True
+  train_gbs: 256
+  # 这里的 mbs 是指取数据的 mbs, 但实现上一个 dpo 样本会出两个数据
+  # 所以实际上 mbs 是 train_mbs * 2
+  train_mbs: 1
+  seq_length: 16384
+  data_parallel_random_init: False
+  save_interval: 400
+  num_train_epoches: 10
+  comput_attn_mask: False
+  sort_batched: False
+  build_from_mbridge: True
+  auto_load_from_save_ckpt: True
+  loss_func: dpo
+  dpo_beta: 0.1
+  dpo_label_smoothing: 0.0
+  dpo_loss_type: sigmoid
+  dpo_ftx_gamma: 0.0
+  exit_step: 1
+
+checkpoint:
+  load_ckpt_path: unittest_dpo
+  save_ckpt_path: unittest_dpo
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 0
+  lr_warmup_steps: 0
+  lr_decay_style: "constant"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "hf-hub/llamafactory/RLHF-V"
+  py_path: "tasks/multimodal_v4/dpo/qwen3vl_dpo_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  dataloader_num_workers: 4
+  dataloader_pin_memory: True
+  # only for verify dataloader in gpatch_v4/entry/verify_dataloader.py
+  dataloader_verify_fn_name: "verify_dataloader_func"
+
+policy:
+  dist_config:
+    nnodes: 1
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+  model_arch: "qwen3_vl"
+  hf_model_path: "hf-hub/Qwen/Qwen3-VL-2B-Instruct"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3-VL-2B-Instruct"
+  ref_hf_model_path: "hf-hub/Qwen/Qwen3-VL-2B-Instruct"
+  without_ref: False
+
+debug:
+  trainer_return_ppo_step_metrics: True

@@ -1,0 +1,58 @@
+# @package _global_
+#
+# 异构 gen-rm 端到端测试配置 (colocate 模式, GRPO 代码路径)
+# GPU 需求: 4 卡 (policy 与 gen-rm 共享)
+#   RM0: TP=2, 分配 2 GPU (DP=1)
+#   RM1: TP=1, 分配 2 GPU (DP=2)
+#
+# 使用 RlConfig
+
+training:
+  use_gen_rm_reward: True
+  sampling_repeat_n: 2
+  rollout_mbs: 1
+
+policy:
+  without_ref: true
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen2.5-3B-Instruct"
+  dist_config:
+    nnodes: 1
+    num_gpus_per_node: 4
+
+gen_rm:
+  backend: sglang
+  dist_config:
+    nnodes: 1
+
+  reward_model_info:
+    - model_arch: "qwen2"
+      hf_model_path: "hf-hub/Qwen/Qwen2.5-3B-Instruct"
+      input_token_key:
+        - "math_tokens"
+    - model_arch: "qwen2"
+      hf_model_path: "hf-hub/Qwen/Qwen2.5-3B-Instruct"
+      input_token_key:
+        - "code_tokens"
+
+  infer_engine_configs:
+    - dist_config:
+        tensor_model_parallel_size: 2
+        num_gpus_per_node: 4
+      custom_rm_actor_impl: "stub_gen_rm"
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.3
+      max_running_requests: 64
+      temperature: 1.0
+      top_p: 0.9
+      generate_max_tokens: 512
+    - dist_config:
+        tensor_model_parallel_size: 1
+        num_gpus_per_node: 4
+      allocated_gpus: 2
+      custom_rm_actor_impl: "stub_gen_rm"
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.3
+      max_running_requests: 64
+      temperature: 1.0
+      top_p: 0.9
+      generate_max_tokens: 512

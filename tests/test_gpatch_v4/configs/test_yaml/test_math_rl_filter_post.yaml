@@ -1,0 +1,111 @@
+# @package _global_
+# Test filter_sampling_stage="post" with random filter (repeat_n=8, keep_n=4)
+
+training:
+  training_backend: mcore
+  use_gen_rm_reward: False
+  use_bt_rm_reward: True
+  use_fast_tokenizer: True
+  rollout_gbs: 128
+  rollout_mbs: 1
+  sampling_repeat_n: 8
+  sampling_keep_n: 4
+  sampling_keeping_strategy: "random_filter"
+  ppo_filter_samplings_path: "tests/test_gpatch_v4/custom_py/random_filter.py"
+  ppo_filter_samplings_name: "random_filter"
+  filter_sampling_stage: "post"
+  train_gbs: 512
+  train_mbs: 1
+  data_parallel_random_init: False
+  save_interval: 100
+  build_from_mbridge: True
+  num_train_epoches: 1
+  ppo_max_epochs_2: 1
+  metrics_report:
+    - "acc_reward"
+    - "fmt_reward"
+
+checkpoint:
+  load_ckpt_path: save_qwen_2_5_1_5b_grpo
+  save_ckpt_path: save_qwen_2_5_1_5b_grpo
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 5.0e-7
+  lr_warmup_steps: 0
+  lr_decay_steps: 1
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "tests/test_gpatch_v4/gsm8k_small"
+  py_path: "tests/test_gpatch_v4/custom_py/simple_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+policy:
+  dist_config:
+    nnodes: 2
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 2
+  model_arch: "qwen2"
+  hf_model_path: "hf-hub/Qwen/Qwen2.5-Math-1.5B"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen2.5-Math-1.5B"
+  ref_hf_model_path: "hf-hub/Qwen/Qwen2.5-Math-1.5B"
+  sampler_client:
+    rpc_type: ray
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+  override_transformer_config:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+
+sampler:
+  backend: sglang
+  dist_config:
+    nnodes: 2
+  model_info:
+    - model_arch: "qwen2"
+      hf_model_path: "hf-hub/Qwen/Qwen2.5-Math-1.5B"
+
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 2
+        tensor_model_parallel_size: 2
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.7
+      max_running_requests: 128
+      temperature: 1.0
+      top_p: 0.9
+      generate_max_tokens: 1024
+
+bt_rm:
+  reward_type: "rule_only"
+  reward_model_info:
+    - model_arch: "qwen2.5-math-rm-72b"
+      hf_model_path: "hf-hub/Qwen/Qwen2.5-7B"
+      reward_py_path: tasks/math_rl_v4/bt_reward.py
+      parse_reward_fn_name: math_rl_rule_reward
+      reward_weight: 1.0
+  infer_engine_configs:
+    - dist_config:
+        tensor_model_parallel_size: 1
+        nnodes: 2
+
+ppo:
+  grpo_advantage_epsilon: 1.0e-4
+  ppo_ratio_eps: 0.2
+
+debug:
+  save_first_rollout_data: True
+  debug_engine_update_weight: False
+  trainer_return_ppo_step_metrics: True

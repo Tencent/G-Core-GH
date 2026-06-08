@@ -1,0 +1,76 @@
+# @package _global_
+_target_: gpatch_v4.configs.config.FinetuneConfig
+
+training:
+  training_backend: mcore
+  use_fast_tokenizer: True
+  train_gbs: 8
+  train_mbs: 1
+  seq_length: 4096
+  data_parallel_random_init: False
+  save_interval: 1000
+  num_train_epoches: 1
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+  build_from_mbridge: True
+  pad_to_mulitiple_of: 256
+  moe_pad_with_random_tokens: True
+  freeze_moe_router: True
+  enable_thinking: False
+  enable_mtp: True
+  online_mtp_sft: True
+  mtp_loss_scaling_factor: 0.1
+  exit_step: 1
+
+checkpoint:
+  load_ckpt_path: ckpt_test_qwen3_6_moe_sft_mtp
+  save_ckpt_path: ckpt_test_qwen3_6_moe_sft_mtp
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 0
+  lr_warmup_steps: 0
+  lr_decay_style: "constant"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "hf-hub/AI-MO/NuminaMath-CoT-jsonl/train/"
+  py_path: "tasks/multimodal_v4/finetune/qwenvl_sft_text_only.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+  dataloader_verify_fn_name: "verify_dataloader_func"
+
+policy:
+  dist_config:
+    num_gpus_per_node: 8
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 2
+    expert_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    context_parallel_size: 2
+  model_arch: "qwen3_5_moe"
+  without_ref: True
+  hf_model_path: "hf-hub/Qwen/Qwen3.6-35B-A3B/"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3.6-35B-A3B/"
+  override_transformer_config:
+    variable_seq_lengths: False
+    moe_router_load_balancing_type: "none"
+    moe_aux_loss_coeff: 0.0
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+
+debug:
+  save_first_rollout_data: True
+
+task:
+  shuffle_buffer_size: 102400
+  smart_padding_buffer_size: 2048

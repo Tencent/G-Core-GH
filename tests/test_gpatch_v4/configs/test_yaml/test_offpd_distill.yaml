@@ -1,0 +1,81 @@
+# @package _global_
+
+training:
+  training_backend: mcore
+  use_fast_tokenizer: True
+  train_gbs: 32
+  train_mbs: 1
+  use_dynamic_mbs: True
+  seq_length: 32768
+  data_parallel_random_init: False
+  save_interval: 500
+  num_train_epoches: 10
+  prefetch_num_gb: 1
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+  enable_teacher_rollout: False
+  enable_teacher_kl_loss: True
+  setup_teacher_in_independent_topo: False
+  loss_func: ce_with_kl
+  exit_step: 2
+
+checkpoint:
+  load_ckpt_path: unittest_offpd
+  save_ckpt_path: unittest_offpd
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 5e-6
+  lr_warmup_steps: 0
+  lr_decay_style: "constant"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "tests/test_gpatch_v4/test_data/offpd"
+  py_path: "tasks/math_rl_v4/finetune_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+  custom_add_eos: True
+  tokenizer_eos_token: ""
+
+policy:
+  dist_config:
+    nnodes: 2
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 2
+  model_arch: "qwen3"
+  without_ref: True
+  hf_model_path: "hf-hub/Qwen/Qwen3-1.7B-Base"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3-1.7B-Base"
+  rollout_gen_type: "off_policy_distill"
+  smart_pad_train: True
+  sampler_client:
+    rpc_type: ray
+  teacher_client:
+    rpc_type: ray
+
+# test 用，理论上不能用相同的模型
+teacher:
+  dist_config:
+    nnodes: 2
+  model_arch: "qwen3"
+  hf_model_path: "hf-hub/Qwen/Qwen3-4B-Instruct-2507"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3-4B-Instruct-2507"
+  wrap_with_ddp: False
+  smart_pad_infer: True
+  forward_only_mbs: 1
+
+debug:
+  save_first_rollout_data: True
+  debug_engine_update_weight: False
+  test_ray_rpc: False
+  trainer_return_ppo_step_metrics: True

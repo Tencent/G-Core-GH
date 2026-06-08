@@ -764,7 +764,10 @@ def _pack_sequences_by_keys(
             if sample[key] is None:
                 continue
             cat_tensors.append(sample[key])
-        new_sample[key] = torch.cat(cat_tensors, dim=0)
+        if len(cat_tensors) > 0:
+            new_sample[key] = torch.cat(cat_tensors, dim=0)
+        else:
+            new_sample[key] = None
 
     padded_lengths = padded_lengths.to(device=dev, dtype=torch.int32, non_blocking=True).reshape(-1)
     cu_seqlens_padded = torch.empty(padded_lengths.numel() + 1, device=dev, dtype=torch.int32)

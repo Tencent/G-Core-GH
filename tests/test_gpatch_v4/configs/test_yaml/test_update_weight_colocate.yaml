@@ -1,0 +1,116 @@
+# @package _global_
+# Small-model colocate config dedicated to ``test_update_weight``.
+#
+# The only axis this test exercises is the sampler weight-update pipeline
+# (see ``SamplerClient.update_weights``), so we strip everything else to the
+# minimum that keeps the trainer happy: a single node of Qwen3-1.7B (dense),
+# no bt_rm / gen_rm, a tiny rollout budget. The sampler backend is overridden
+# by the test (sglang vs vllm) via ``config.sampler.backend``.
+#
+# GPU layout (8 GPU = 1 physical node):
+#   policy:  tp=2, pp=1, dp=4  = 8 GPU
+#   sampler: tp=2, 4 engines   = 8 GPU (colocated with policy via sleep)
+
+training:
+  training_backend: mcore
+  use_gen_rm_reward: False
+  use_bt_rm_reward: False
+  use_fast_tokenizer: True
+  rollout_gbs: 8
+  rollout_mbs: 1
+  sampling_repeat_n: 2
+  sampling_keep_n: 2
+  train_gbs: 16
+  train_mbs: 1
+  data_parallel_random_init: False
+  save_interval: 100
+  build_from_mbridge: True
+  num_train_epoches: 1
+  ppo_max_epochs_2: 1
+  metrics_report: []
+
+checkpoint:
+  load_ckpt_path: save_qwen3_1_7b_update_weight
+  save_ckpt_path: save_qwen3_1_7b_update_weight
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 5.0e-7
+  lr_warmup_steps: 0
+  lr_decay_steps: 1
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "tests/test_gpatch_v4/gsm8k_small"
+  py_path: "tests/test_gpatch_v4/custom_py/simple_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+policy:
+  dist_config:
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    nnodes: 1
+  model_arch: "qwen3"
+  hf_model_path: "hf-hub/Qwen/Qwen3-1.7B"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3-1.7B"
+  ref_hf_model_path: "hf-hub/Qwen/Qwen3-1.7B"
+  sampler_client:
+    rpc_type: ray
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+  override_transformer_config:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+
+sampler:
+  backend: sglang
+  dist_config:
+    nnodes: 1
+  model_info:
+    - model_arch: "qwen3"
+      hf_model_path: "hf-hub/Qwen/Qwen3-1.7B"
+
+  infer_engine_configs:
+    - dist_config:
+        tensor_model_parallel_size: 2
+        nnodes: 1
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.5
+      max_running_requests: 32
+      temperature: 1.0
+      top_p: 0.9
+      generate_max_tokens: 128
+      # vLLM's torch.compile + flashinfer allreduce-fusion pass asserts when
+      # the flashinfer workspace is not yet initialised for Qwen3-1.7B/tp=2.
+      # CUDA graphs are irrelevant for the weight-update test, so we turn
+      # them off (maps to ``enforce_eager=True`` in both sglang and vllm).
+      disable_cuda_graph: True
+
+bt_rm:
+  dist_config:
+    nnodes: 0
+
+gen_rm:
+  dist_config:
+    nnodes: 0
+
+ppo:
+  grpo_advantage_epsilon: 1.0e-4
+  ppo_ratio_eps: 0.2
+
+debug:
+  save_first_rollout_data: False
+  debug_engine_update_weight: False
+  trainer_return_ppo_step_metrics: True

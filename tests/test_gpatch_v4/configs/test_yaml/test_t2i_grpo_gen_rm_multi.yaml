@@ -1,0 +1,47 @@
+# @package _global_
+
+training:
+  use_gen_rm_reward: True
+  sampling_repeat_n: 2
+
+policy:
+  without_ref: true
+  dist_config:
+    nnodes: 1
+
+gen_rm:
+  backend: sglang
+  dist_config:
+    nnodes: 1
+
+  reward_model_info:
+    - model_arch: "qwen2_5_vl"
+      hf_model_path: "hf-hub/Qwen/Qwen2.5-VL-32B-Instruct"
+      reward_py_path: "tasks/t2i_grpo_tv4/gen_rewards.py"
+      prompt_fn_name: "get_qwen2_5_vl_prompt"
+      parse_reward_fn_name: "parse_qwen2_5_vl_rewards"
+    - model_arch: "qwen2_5_vl"
+      hf_model_path: "hf-hub/Qwen/Qwen2.5-VL-32B-Instruct"
+      reward_py_path: "tasks/t2i_grpo_tv4/gen_rewards.py"
+      prompt_fn_name: "get_qwen2_5_vl_prompt"
+      parse_reward_fn_name: "parse_qwen2_5_vl_rewards"
+
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 1
+        tensor_model_parallel_size: 4
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.7
+      max_running_requests: 128
+      temperature: 1.0
+      top_p: 0.9
+      generate_max_tokens: 1024
+    - dist_config:
+        nnodes: 1
+        tensor_model_parallel_size: 4
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.7
+      max_running_requests: 128
+      temperature: 1.0
+      top_p: 0.9
+      generate_max_tokens: 1024

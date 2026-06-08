@@ -1,0 +1,57 @@
+# @package _global_
+_target_: gpatch_v4.configs.config.FinetuneConfig
+
+training:
+  training_backend: mcore
+  use_fast_tokenizer: True
+  train_gbs: 8
+  train_mbs: 1
+  seq_length: 4096
+  data_parallel_random_init: False
+  save_interval: 1000
+  num_train_epoches: 1
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+  build_from_mbridge: True
+  pad_to_mulitiple_of: 128
+  exit_step: 1
+
+checkpoint:
+  load_ckpt_path: save_sft_ckpt_train_4B
+  save_ckpt_path: save_sft_ckpt_train_4B
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 0
+  lr_warmup_steps: 0
+  lr_decay_style: "constant"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "hf-hub/wechat/geometry3k_16_samples"
+  py_path: "tasks/multimodal_v4/finetune/qwen3vl_simple_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  dataloader_num_workers: 8
+  dataloader_pin_memory: True
+  dataloader_verify_fn_name: "verify_dataloader_func"
+
+policy:
+  dist_config:
+    nnodes: 1
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 2
+  model_arch: "qwen3_vl"
+  without_ref: True
+  hf_model_path: "hf-hub/Qwen/Qwen3-VL-4B-Instruct"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3-VL-4B-Instruct"
+
+debug:
+  save_first_rollout_data: True
+  trainer_return_ppo_step_metrics: True

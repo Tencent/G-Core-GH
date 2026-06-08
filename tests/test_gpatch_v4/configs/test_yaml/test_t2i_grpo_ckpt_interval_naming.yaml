@@ -1,0 +1,31 @@
+# @package _global_
+
+training:
+  training_backend: fsdp2
+  ppo_step_per_epoch: 10
+  num_train_epoches: 1
+  save_interval: 3
+  skip_train_step: True
+  exit_step: 5
+  train_gbs_wo_timestep: 8
+
+data:
+  data_pathes:
+    - "tasks/t2i_grpo_tv4/prompts.txt"
+  py_path: "tasks/t2i_grpo_tv4/simple_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+
+checkpoint:
+  load_ckpt_path: tests/test_gpatch_v4/ckpt/test_ckpt_interval_naming
+  save_ckpt_path: tests/test_gpatch_v4/ckpt/test_ckpt_interval_naming
+  no_load_optim: True
+
+policy:
+  dist_config:
+    nnodes: 1
+  model_arch: "flux"
+  hf_model_path: "hf-hub/black-forest-labs/FLUX.1-dev"
+  ref_hf_model_path: "hf-hub/black-forest-labs/FLUX.1-dev"
+  gen_rm_client:
+    rpc_type: ray
+  without_ref: true

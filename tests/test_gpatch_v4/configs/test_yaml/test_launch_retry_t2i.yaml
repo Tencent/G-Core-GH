@@ -1,0 +1,78 @@
+# @package _global_
+
+training:
+  training_backend: fsdp2
+  use_gen_rm_reward: False
+  use_bt_rm_reward: True
+  rollout_gbs: 16
+  rollout_mbs: 1
+  train_gbs_wo_timestep: 32
+  train_mbs: 1
+  sampling_repeat_n: 2
+  init_same_noise: True
+  guidance_scale: 3.5
+  width: 512
+  height: 512
+  eta: 0.3
+  sampling_steps: 3
+  shift: 3
+  data_parallel_random_init: True
+  timestep_fraction: 1.0
+  save_interval: 100
+  num_train_epoches: 1
+  skip_train_step: true
+  exit_step: 10
+
+
+checkpoint:
+  load_ckpt_path: test_launch_retry
+  save_ckpt_path: test_launch_retry
+
+optimizer:
+  lr: 1e-5
+  lr_warmup_steps: 0
+  lr_decay_style: "constant_with_warmup"
+  weight_decay: 0.0001
+
+data:
+  data_pathes:
+    - "tasks/t2i_grpo_tv4/prompts.txt"
+  py_path: "tasks/t2i_grpo_tv4/simple_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+
+policy:
+  dist_config:
+    nnodes: 1
+  without_ref: true
+  model_arch: "flux"
+  hf_model_path: "hf-hub/black-forest-labs/FLUX.1-dev"
+  ref_hf_model_path: "hf-hub/black-forest-labs/FLUX.1-dev"
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+
+bt_rm:
+  dist_config:
+    nnodes: 1
+  reward_model_info:
+    - model_arch: "hpsv2"
+      hf_model_path: hf-hub/laion/CLIP-ViT-H-14-laion2B-s32B-b79K/open_clip_pytorch_model.bin
+      model_weight_path: hf-hub/xswu/HPSv2/HPS_v2.1_compressed.pt
+      reward_weight: 1.0
+      reward_py_path: tests/test_gpatch_v4/custom_py/stub_reward.py
+      rm_cls_name: StubRewardModel
+
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 1
+
+ppo:
+  grpo_advantage_epsilon: 1.0e-8
+  ppo_ratio_eps: 1.0e-4
+  adv_clip_max: 5.0
+  adv_clip_min: -5.0
+
+debug:
+  save_images: True
+  save_images_dir: debug_images

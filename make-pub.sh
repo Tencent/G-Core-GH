@@ -14,7 +14,7 @@ git checkout -b prepare_public
 
 # clean
 git rm -rf examples
-git rm -rf tests
+git rm -rf tests/test_gpatch_v3
 git rm -rf `find -type d -name 'priv'`
 git rm `find -name '*-priv.*'`
 git rm `find -name '*_priv.*'`

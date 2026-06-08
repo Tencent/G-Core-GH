@@ -1,0 +1,25 @@
+# @package _global_
+
+training:
+  use_bt_rm_reward: True
+  sampling_repeat_n: 2
+
+policy:
+  without_ref: true
+  dist_config:
+    nnodes: 1
+
+bt_rm:
+  dist_config:
+    nnodes: 1
+  reward_model_info:
+    - model_arch: "hpsv2"
+      hf_model_path: hf-hub/laion/CLIP-ViT-H-14-laion2B-s32B-b79K/open_clip_pytorch_model.bin
+      model_weight_path: hf-hub/xswu/HPSv2/HPS_v2.1_compressed.pt
+      reward_weight: 1.0
+      reward_py_path: tests/test_gpatch_v4/custom_py/stub_reward.py
+      rm_cls_name: StubRewardModel
+
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 1
