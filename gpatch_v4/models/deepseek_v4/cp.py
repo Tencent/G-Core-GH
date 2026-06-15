@@ -46,6 +46,32 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
+def _ring_all_to_all(
+    *,
+    send_tensor: torch.Tensor,
+    send_peer: int,
+    recv_peer: int,
+    group,
+    seq_dim: int,
+) -> torch.Tensor:
+    group_size = dist.get_world_size(group)
+    send_flat = send_tensor.movedim(seq_dim, 0).contiguous()
+    num_tokens = send_flat.shape[0]
+    input_split_sizes = [0] * group_size
+    output_split_sizes = [0] * group_size
+    input_split_sizes[send_peer] = num_tokens
+    output_split_sizes[recv_peer] = num_tokens
+    recv_flat = torch.empty_like(send_flat)
+    dist.all_to_all_single(
+        recv_flat,
+        send_flat,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
+        group=group,
+    )
+    return recv_flat.movedim(0, seq_dim).contiguous()
+
+
 class _SendLastAndPrepend(Function):
     r"""Send last ``k`` tokens along ``seq_dim`` to the next CP rank, recv
     the corresponding prefix from the previous CP rank, and **return the
@@ -65,10 +91,11 @@ class _SendLastAndPrepend(Function):
     -------
     * Input: ``x`` shape ``[..., S, ...]`` along ``seq_dim``.
     * Side effects:
-      - ``isend(x[..., -k:, ...])`` to ``cp_rank + 1`` if ``cp_rank < cp_size - 1``.
-      - ``irecv prefix`` from ``cp_rank - 1`` if ``cp_rank > 0``.
+      - every rank sends its last ``k`` tokens to ``(cp_rank + 1) % cp_size``
+        through an all-to-all permutation.
+      - every rank receives a prefix from ``(cp_rank - 1) % cp_size``.
     * Output:
-      - rank 0: ``x``.
+      - rank 0: ``x`` (the received last-rank prefix is intentionally dropped).
       - rank > 0: ``cat([prefix, x], dim=seq_dim)`` shape ``[..., k+S, ...]``.
 
     Backward
@@ -85,6 +112,9 @@ class _SendLastAndPrepend(Function):
     * rank < cp_size-1: ``irecv`` the gradient from rank ``r+1`` (it computed
       the gradient on the slice we sent forward) and add it to the last-k
       slice of ``grad_local``.
+    * rank 0 sends a dummy zero prefix-gradient to the last rank, which drops
+      it; this keeps the ring communication topology symmetric without changing
+      the math.
 
     The result is ``grad_x = grad_local`` with the cross-rank contribution
     folded into the last-k slice.
@@ -96,27 +126,16 @@ class _SendLastAndPrepend(Function):
         ctx.cp_rank, ctx.cp_size, ctx.cp_group = cp_rank, cp_size, cp_group
         ctx.k, ctx.seq_dim = k, seq_dim
 
-        prefix: torch.Tensor | None = None
-        if cp_rank > 0:
-            prefix_shape = list(x.shape)
-            prefix_shape[seq_dim] = k
-            prefix = x.new_zeros(prefix_shape)
+        send_buf = x.narrow(seq_dim, x.shape[seq_dim] - k, k).contiguous()
+        prefix = _ring_all_to_all(
+            send_tensor=send_buf,
+            send_peer=(cp_rank + 1) % cp_size,
+            recv_peer=(cp_rank - 1) % cp_size,
+            group=cp_group,
+            seq_dim=seq_dim,
+        )
 
-        # NOTE: ``dist.P2POp(peer=...)`` expects the *global* rank; we have
-        # only group-local cp_rank±1 (and the model code never even sees the
-        # global rank → group-local mapping). Use ``group_peer=`` instead,
-        # which is interpreted relative to ``group``.
-        ops: list[dist.P2POp] = []
-        if cp_rank > 0:
-            ops.append(dist.P2POp(dist.irecv, prefix, group_peer=cp_rank - 1, group=cp_group))
-        if cp_rank < cp_size - 1:
-            send_buf = x.narrow(seq_dim, x.shape[seq_dim] - k, k).contiguous()
-            ops.append(dist.P2POp(dist.isend, send_buf, group_peer=cp_rank + 1, group=cp_group))
-        if ops:
-            for req in dist.batch_isend_irecv(ops):
-                req.wait()
-
-        if prefix is None:
+        if cp_rank == 0:
             # rank 0: no prefix → output is ``x`` itself. Returning ``x``
             # directly (rather than a clone) is fine: backward only uses
             # ``ctx.cp_rank`` etc.; no save_for_backward is needed.
@@ -128,36 +147,29 @@ class _SendLastAndPrepend(Function):
         cp_rank, cp_size, cp_group = ctx.cp_rank, ctx.cp_size, ctx.cp_group
         k, seq_dim = ctx.k, ctx.seq_dim
 
-        # Split grad_out into prefix-grad (rank > 0) and local-grad.
+        prefix_shape = list(grad_out.shape)
+        prefix_shape[seq_dim] = k
+
         if cp_rank > 0:
             grad_prefix = grad_out.narrow(seq_dim, 0, k).contiguous()
             grad_local = grad_out.narrow(seq_dim, k, grad_out.shape[seq_dim] - k).contiguous()
         else:
-            grad_prefix = None
+            grad_prefix = grad_out.new_zeros(prefix_shape)
             grad_local = grad_out.contiguous()
 
-        # Allocate recv buffer (sized off grad_local so dtype/shape match
-        # the original input).
-        recv_grad: torch.Tensor | None = None
-        if cp_rank < cp_size - 1:
-            recv_shape = list(grad_local.shape)
-            recv_shape[seq_dim] = k
-            recv_grad = grad_local.new_zeros(recv_shape)
-
-        ops: list[dist.P2POp] = []
-        if cp_rank > 0:
-            ops.append(dist.P2POp(dist.isend, grad_prefix, group_peer=cp_rank - 1, group=cp_group))
-        if cp_rank < cp_size - 1:
-            ops.append(dist.P2POp(dist.irecv, recv_grad, group_peer=cp_rank + 1, group=cp_group))
-        if ops:
-            for req in dist.batch_isend_irecv(ops):
-                req.wait()
+        recv_grad = _ring_all_to_all(
+            send_tensor=grad_prefix,
+            send_peer=(cp_rank - 1) % cp_size,
+            recv_peer=(cp_rank + 1) % cp_size,
+            group=cp_group,
+            seq_dim=seq_dim,
+        )
 
         # local-path grad + cross-rank grad on the sent slice.
         # ``grad_local`` may be a narrowed view of ``grad_out``; clone so
         # the in-place add doesn't surprise upstream.
         grad_x = grad_local.clone()
-        if recv_grad is not None:
+        if cp_rank < cp_size - 1:
             grad_x.narrow(seq_dim, grad_x.shape[seq_dim] - k, k).add_(recv_grad)
         return grad_x, None, None, None
 

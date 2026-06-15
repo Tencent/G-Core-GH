@@ -121,6 +121,9 @@ def apply_hp(
     mp_policy: Optional[MixedPrecisionPolicy] = None,
     cp_mesh: Optional["torch.distributed.device_mesh.DeviceMesh"] = None,
     attn_backend: str = "eager",
+    indexer_backend: str = "eager",
+    ep_backend: str = "eager",
+    deepep_num_sms: int = 24,
     *,
     amp_fp32: bool = True,
 ) -> nn.Module:
@@ -158,6 +161,10 @@ def apply_hp(
         fused top-k SWA tilelang kernel and currently raises
         ``NotImplementedError``. Any other value raises ``ValueError``
         at forward time.
+    ep_backend : str, default "eager"
+        Expert dispatch backend. ``"eager"`` keeps the existing
+        ``all_to_all_uneven`` path; ``"deepep"`` uses DeepEP dispatch and
+        combine kernels.
     amp_fp32 : bool, keyword-only, default True
         When True (default), wrap each disk-FP32 leaf (mHC ``attn_hc /
         ffn_hc / hc_head``, ``attn._sink_holder``,
@@ -191,13 +198,29 @@ def apply_hp(
     file in Phase 2; rank 0 globally renames and writes index + config +
     tokenizer in Phase 3. See :func:`_save_checkpoint_hp`.
     """
+    if ep_backend not in ("eager", "deepep"):
+        raise ValueError(f"unknown ep_backend: {ep_backend}")
+    if ep_backend == "deepep":
+        from .deepep_a2a import set_deepep_num_sms
+        set_deepep_num_sms(deepep_num_sms)
+
     model.config.attn_backend = attn_backend
-    # Sync attn_backend to every DeepseekV4Attention (including MTP blocks),
-    # because MTP blocks are constructed before apply_hp runs, and their
-    # self.self_attn.config is a deepcopy that may not have attn_backend.
+    model.config.indexer_backend = indexer_backend
+    model.config.ep_backend = ep_backend
+    model.config.deepep_num_sms = deepep_num_sms
+    model.config.amp_fp32 = amp_fp32
+    # Sync backend knobs to every DeepseekV4Attention / DeepseekV4Experts
+    # (including MTP blocks), because MTP blocks are constructed before
+    # apply_hp runs, and their self.self_attn.config is a deepcopy that
+    # may not have these attrs.
     for layer in _get_layers(model):
+        layer.mlp.experts.ep_backend = ep_backend
         if isinstance(layer, DeepseekV4MTPBlock):
             layer.config.attn_backend = attn_backend
+            layer.config.indexer_backend = indexer_backend
+            layer.config.ep_backend = ep_backend
+            layer.config.deepep_num_sms = deepep_num_sms
+            layer.config.amp_fp32 = amp_fp32
             assert layer.self_attn.config.attn_backend == attn_backend
 
     if mp_policy is None:

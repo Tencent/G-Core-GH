@@ -189,6 +189,12 @@ def _mtp_smoke_worker(
 
     model = apply_hp(model, ep_2d_mesh, cp_mesh=None, amp_fp32=False)
     model.gradient_checkpointing_enable()
+    for _bi, _blk in enumerate(model.mtp.layers):
+        assert _blk.gradient_checkpointing, (
+            f"MTP block {_bi} gradient_checkpointing not enabled after "
+            f"gradient_checkpointing_enable(); "
+            f"DeepseekV4MTPBlock must inherit GradientCheckpointingLayer"
+        )
     _t_apply_hp_done = time.time()
     model.load_checkpoint_hp(hf_model_path)
     _t_load_end = time.time()
@@ -229,7 +235,22 @@ def _mtp_smoke_worker(
     full_labels = torch.roll(full_labels, shifts=-1, dims=-1)
     full_labels[:, -1] = -100
 
+    # 计数 MTP block 真实进入 forward 的次数：正常 forward 一次，checkpoint backward 再重算一次。
+    mtp_forward_counts = [0 for _ in model.mtp.layers]
+    mtp_forward_hook_handles = []
+    for i, block in enumerate(model.mtp.layers):
+        def _count_mtp_forward(_module, _args, i=i):
+            mtp_forward_counts[i] += 1
+
+        mtp_forward_hook_handles.append(block.register_forward_pre_hook(_count_mtp_forward))
+
     outputs = model(input_ids=input_ids)
+    # forward 结束时每个 MTP block 应只跑过一次。
+    expected_forward_counts = [1] * len(model.mtp.layers)
+    assert mtp_forward_counts == expected_forward_counts, (
+        f"MTP block forward counts after forward = {mtp_forward_counts}, "
+        f"expected {expected_forward_counts}"
+    )
     assert outputs.mtp_per_depth_h is not None, (
         "model forward in train() mode returned mtp_per_depth_h=None; "
         "MTP path did not fire (check use_mtp gate)."
@@ -263,6 +284,14 @@ def _mtp_smoke_worker(
     mtp_norms_before = {n: v for n, v in norms_before.items() if n.startswith("mtp.")}
 
     mtp_total_loss.backward()
+    # backward 若触发 activation checkpoint，每个 MTP block 会再进入一次 forward 重算。
+    expected_recompute_counts = [2] * len(model.mtp.layers)
+    assert mtp_forward_counts == expected_recompute_counts, (
+        f"MTP block forward counts after backward = {mtp_forward_counts}, "
+        f"expected {expected_recompute_counts}; MTP was not recomputed during backward"
+    )
+    for handle in mtp_forward_hook_handles:
+        handle.remove()
 
     # ----- Assertion 2: every trainable mtp param got a non-zero grad -----
     grad_norms = _grad_norms(model, model._ep_group)

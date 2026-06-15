@@ -34,5 +34,6 @@ class EngineProxy(BaseLLMProxy):
             f"-> engine_index={engine_index} (num_engine={num_engine})"
         )
         data = {k: [v] for (k, v) in data.items()}
-        task = self.sampler_client.generate(0, 0, engine_index, data, 1, load_aware=True)
+        load_aware = self.sampler_client.config.training.load_aware_sampler_routing
+        task = self.sampler_client.generate(0, 0, engine_index, data, 1, load_aware=load_aware)
         return asyncio.run(task)

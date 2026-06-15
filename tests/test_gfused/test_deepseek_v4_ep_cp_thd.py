@@ -42,10 +42,12 @@ TODO:
 - [x] fix trainer v4 的 cp and loss
 - [x] Add pack seq
 - [x] ~~Add dyn CP~~（对于 swa 没有意义）
-- [ ] THD 的 CP 改成 zz
-- [ ] Add FA
-- [ ] 特殊处理 fp32 mhc
 - [x] MTP
+- [x] 特殊处理 fp32 mhc
+- [x] Add FA
+- [x] DeepEP
+- [ ] 优化 CSA 与 HCA 的 op
+- [ ] THD 的 CP 改成 zz
 - [ ] better use real data to test it
 """
 
@@ -53,6 +55,7 @@ import math
 import os
 import time
 import unittest
+import importlib.util
 from contextlib import nullcontext
 
 import ray
@@ -80,6 +83,7 @@ from gpatch_v4.models.deepseek_v4.router_replay import (
     router_replay_ctx,
 )
 from gpatch_v4.models.deepseek_v4.thd import pack_sequences
+from gpatch_v4.orches.placement_group import _create_placement_group
 
 HF_MODEL_PATH = "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
 NUM_GPUS = 32
@@ -104,6 +108,8 @@ T_TOTAL = sum(PADDED_SEQ_LENS)  # 512
 # pack 也是所有 rank 同 input → 全部用 baseline rank 0 的 routing。
 # 这样 vanilla baseline 用满 NUM_GPUS=32 张卡均摊 FSDP unshard 显存（8 卡时 OOM）。
 FAKE_QA_SEED = 20260530
+_DEEPEP_AVAILABLE = importlib.util.find_spec("deep_ep") is not None
+requires_deepep = unittest.skipUnless(_DEEPEP_AVAILABLE, "deep_ep not installed")
 
 
 # ---------------------------------------------------------------------------
@@ -131,13 +137,15 @@ def _get_node_ip():
 # ---------------------------------------------------------------------------
 
 
-def _make_fake_qa(tokenizer, device):
+def _make_fake_qa(tokenizer, device, fake_seq_lens=None):
     """3 段 ids + per-seg roll-shift labels（next-token 预测，末位 -100）。
 
     所有 rank 用同一 ``FAKE_QA_SEED`` → vanilla baseline 全 rank loss/grad
     一致（DP 复制），仅借多卡均摊 FSDP unshard 显存；pack 全 rank 同 input
     → 共享同一份 baseline routing。
     """
+    if fake_seq_lens is None:
+        fake_seq_lens = FAKE_SEQ_LENS
     pad_id = tokenizer.pad_token_id
     vocab = tokenizer.vocab_size
     assert pad_id < vocab, (
@@ -145,7 +153,7 @@ def _make_fake_qa(tokenizer, device):
         f"collision-fix below assumes pad_id is in randint range"
     )
     ids_list, labels_list = [], []
-    for i, s in enumerate(FAKE_SEQ_LENS):
+    for i, s in enumerate(fake_seq_lens):
         rng = torch.Generator().manual_seed(FAKE_QA_SEED + i)
         ids = torch.randint(0, vocab, (s,), generator=rng).to(device)
         # DSV4 pad_id 大，randint(pad_id+1, vocab) 会压扁低位 vocab；
@@ -158,17 +166,19 @@ def _make_fake_qa(tokenizer, device):
     return ids_list, labels_list
 
 
-def _prep_vanilla_baseline(ids_list, labels_list, pad_id, device):
-    """Vanilla baseline: 每段独立 pad 到 PADDED_SEQ_LENS[i]（与 THD pack 完全一致）。
+def _prep_vanilla_baseline(ids_list, labels_list, pad_id, device, padded_seq_lens=None):
+    """Vanilla baseline: 每段独立 pad 到 padded_seq_lens[i]（与 THD pack 完全一致）。
 
     不走 CP，所以不需要 BSHD_PAD=512；每段 [1, padded_len_i] 单独 forward。
     Routing capture 出 [padded_len_i, top_k]/layer，cat 后正好对齐 T_TOTAL。
     """
+    if padded_seq_lens is None:
+        padded_seq_lens = PADDED_SEQ_LENS
     per_seg_ids = []
     per_seg_labels = []
     for i, (ids, lab) in enumerate(zip(ids_list, labels_list)):
         s = ids.numel()
-        padded = PADDED_SEQ_LENS[i]
+        padded = padded_seq_lens[i]
         assert s <= padded, f"seg {i} length {s} exceeds padded {padded}"
         seg_ids = torch.full((1, padded), pad_id, dtype=torch.long, device=device)
         seg_labels = torch.full((1, padded), -100, dtype=torch.long, device=device)
@@ -184,6 +194,7 @@ def _prep_pack(ids_list, labels_list, tokenizer, config):
         ids_list, labels_list,
         config=config,
         pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
+        cp_size=CP_SIZE,
         pad_token_id=tokenizer.pad_token_id,
         label_ignore_index=-100,
     )
@@ -250,12 +261,16 @@ def _common_fwd_bwd_diagnostics(
     }
 
 
-def _run_fwd_bwd_vanilla_baseline(model, per_seg_ids, per_seg_labels, rank, tag):
+def _run_fwd_bwd_vanilla_baseline(
+    model, per_seg_ids, per_seg_labels, rank, tag, padded_seq_lens=None,
+):
     """N 段独立 [1, padded_len_i] forward；不走 CP（vanilla = 纯 FSDP）。
 
     每段一次 capture_routing_decisions ctx；段间 cat 每层 indices 得到
     [T_TOTAL, top_k]/layer。loss 累加除以全段 n_valid 总和（所有 rank 求 sum）。
     """
+    if padded_seq_lens is None:
+        padded_seq_lens = PADDED_SEQ_LENS
     model.train()
     torch.cuda.reset_peak_memory_stats()
     mem_after_shard = torch.cuda.memory_allocated() / 1024**3
@@ -310,9 +325,9 @@ def _run_fwd_bwd_vanilla_baseline(model, per_seg_ids, per_seg_labels, rank, tag)
     for layer_i in range(n_layers):
         layer_per_seg = [per_seg_routing[s][layer_i] for s in range(len(per_seg_routing))]
         for s, t in enumerate(layer_per_seg):
-            assert t.shape[0] == PADDED_SEQ_LENS[s], (
+            assert t.shape[0] == padded_seq_lens[s], (
                 f"layer {layer_i} seg {s}: routing shape[0]={t.shape[0]} "
-                f"!= PADDED_SEQ_LENS[{s}]={PADDED_SEQ_LENS[s]}"
+                f"!= padded_seq_lens[{s}]={padded_seq_lens[s]}"
             )
         recorded_routing.append(torch.cat(layer_per_seg, dim=0))  # [T_TOTAL, top_k]
 
@@ -462,6 +477,8 @@ def _build_fork_model(hf_model_path, tokenizer):
 def _vanilla_baseline_worker(
     hf_model_path: str, rank: int, world_size: int,
     master_addr: str, master_port: int,
+    fake_seq_lens: list[int] | None = None,
+    padded_seq_lens: list[int] | None = None,
 ):
     """Vanilla HF transformers DSV4 + 纯 FSDP，不走 EP/CP。
 
@@ -480,9 +497,11 @@ def _vanilla_baseline_worker(
 
     ids_list, labels_list = _make_fake_qa(
         tokenizer, device=torch.device("cuda"),
+        fake_seq_lens=fake_seq_lens,
     )
     per_seg_ids, per_seg_labels = _prep_vanilla_baseline(
         ids_list, labels_list, tokenizer.pad_token_id, device=torch.device("cuda"),
+        padded_seq_lens=padded_seq_lens,
     )
 
     tag = "vanilla_baseline"
@@ -518,6 +537,7 @@ def _vanilla_baseline_worker(
 
     result = _run_fwd_bwd_vanilla_baseline(
         model, per_seg_ids, per_seg_labels, rank, tag,
+        padded_seq_lens=padded_seq_lens,
     )
     result["load_seconds"] = load_seconds
 
@@ -532,6 +552,11 @@ def _pack_thd_worker(
     hf_model_path: str, rank: int, world_size: int,
     master_addr: str, master_port: int,
     replay_indices=None,
+    attn_backend: str = "fused",
+    indexer_backend: str = "fused",
+    ep_backend: str = "eager",
+    fake_seq_lens: list[int] | None = None,
+    padded_seq_lens: list[int] | None = None,
 ):
     """THD [1, T=512] packed，cp_size=4 切 [1, 128]/rank。
 
@@ -541,6 +566,8 @@ def _pack_thd_worker(
     replay_indices: list[Tensor[T_TOTAL, top_k]]/layer，来自 vanilla baseline
     rank 0 的 recorded_routing。
     """
+    if padded_seq_lens is None:
+        padded_seq_lens = PADDED_SEQ_LENS
     _setup_dist(rank, world_size, master_addr, master_port)
     ep_2d_mesh, cp_mesh = _setup_ep_cp_meshes(world_size)
 
@@ -550,6 +577,7 @@ def _pack_thd_worker(
 
     ids_list, labels_list = _make_fake_qa(
         tokenizer, device=torch.device("cuda"),
+        fake_seq_lens=fake_seq_lens,
     )
     config = _truncate_config(DeepseekV4Config.from_pretrained(hf_model_path))
     packed_ids, packed_position_ids, packed_labels, psp = _prep_pack(
@@ -560,22 +588,32 @@ def _pack_thd_worker(
     # 一旦 pack_sequences 改换内部对齐策略（合段 / 重排 / 不同 pad），
     # router replay 会 silent 错位（indices 仍 valid range，无 NaN）。
     expected_cu = [0]
-    for s in PADDED_SEQ_LENS:
+    for s in padded_seq_lens:
         expected_cu.append(expected_cu[-1] + s)
     actual_cu = psp.cu_seqlens_q_padded.tolist()
     assert actual_cu == expected_cu, (
         f"cu_seqlens_q_padded mismatch: pack={actual_cu} vs expected "
-        f"(from PADDED_SEQ_LENS)={expected_cu}; vanilla baseline routing "
+        f"(from padded_seq_lens)={expected_cu}; vanilla baseline routing "
         f"order would silently misalign with pack token order"
     )
 
     tag = f"pack_thd_ep{EP_SIZE}_cp{CP_SIZE}"
     if replay_indices is not None:
         tag += "_replay"
+    if ep_backend != "eager":
+        tag += f"_{ep_backend}"
     print(f"[{tag}] rank {rank}: loading {hf_model_path} via meta-device ...")
     _t_start = time.time()
     model = _build_fork_model(hf_model_path, tokenizer)
-    model = apply_hp(model, ep_2d_mesh, cp_mesh=cp_mesh, amp_fp32=False)
+    model = apply_hp(
+        model,
+        ep_2d_mesh,
+        cp_mesh=cp_mesh,
+        amp_fp32=False,
+        attn_backend=attn_backend,
+        indexer_backend=indexer_backend,
+        ep_backend=ep_backend,
+    )
     model.gradient_checkpointing_enable()
     model.load_checkpoint_hp(hf_model_path)
     load_seconds = time.time() - _t_start
@@ -616,21 +654,43 @@ class TestEpCpThd(unittest.TestCase):
     def tearDown(self):
         kill_all_actors_and_shutdown_ray()
 
-    def _run_workers(self, worker_fn, world_size, pg, master_port, **extra_kwargs):
+    def _run_workers(
+        self, worker_fn, world_size, pg, master_port,
+        *,
+        replay_indices_per_rank: "list | None" = None,
+        attn_backend: "str | None" = None,
+        indexer_backend: "str | None" = None,
+        ep_backend: "str | None" = None,
+        fake_seq_lens: "list[int] | None" = None,
+        padded_seq_lens: "list[int] | None" = None,
+    ):
+        pg_obj, bundle_indices = pg
         master_addr = ray.get(
             _get_node_ip.options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg, placement_group_bundle_index=0,
+                    placement_group=pg_obj, placement_group_bundle_index=bundle_indices[0],
                 )
             ).remote()
         )
         futures = []
         for r in range(world_size):
-            kw = {k: v[r] if isinstance(v, list) else v for k, v in extra_kwargs.items()}
+            kw = {}
+            if attn_backend is not None:
+                kw["attn_backend"] = attn_backend
+            if indexer_backend is not None:
+                kw["indexer_backend"] = indexer_backend
+            if ep_backend is not None:
+                kw["ep_backend"] = ep_backend
+            if replay_indices_per_rank is not None:
+                kw["replay_indices"] = replay_indices_per_rank[r]
+            if fake_seq_lens is not None:
+                kw["fake_seq_lens"] = fake_seq_lens
+                kw["padded_seq_lens"] = padded_seq_lens
             futures.append(
                 worker_fn.options(
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg, placement_group_bundle_index=r,
+                        placement_group=pg_obj,
+                        placement_group_bundle_index=bundle_indices[r],
                     )
                 ).remote(
                     HF_MODEL_PATH,
@@ -643,24 +703,15 @@ class TestEpCpThd(unittest.TestCase):
             )
         return ray.get(futures)
 
-    def test_pack_runs(self):
-        """Vanilla HF baseline + router replay → THD pack 跑通 + ratio 报告.
-
-        分两阶段（共享同一 placement group）：
-        1. Vanilla baseline (HF transformers + 纯 FSDP, world=NUM_GPUS=32):
-           全 rank 喂同一份 fake QA → loss/grad 全 rank 一致；多卡仅用于
-           均摊 FSDP unshard 显存。3 段独立 forward 录每层 routing →
-           recorded_routing[T_TOTAL, top_k]/layer。
-        2. THD pack (our fork EP=8 CP=4, world=NUM_GPUS=32): 全 rank 同
-           input；用 router_replay_ctx 把 baseline rank 0 的 routing 喂回 →
-           去掉 routing 这一层噪声。
-
-        断言：finite/no-nan + logits/loss/total_grad_norm rel_diff 在
-        rtol_logits=0.02 / rtol_loss=0.005 / rtol_grad_norm=0.01 内 + 逐
-        参数 grad norm ratio places=1（|ratio-1| < 0.05）。
-        rtol 基于 sibling test_deepseek_v4_ep_cp.py 的 6.8e-5 / 5.3e-4
-        实测量级与本测试的 6.5e-5 / 1.1e-4 / per-param 最差 4.1% 取余量。
-        """
+    def _pack_runs_impl(
+        self,
+        attn_backend: str = "fused",
+        indexer_backend: str = "fused",
+        ep_backend: str = "eager",
+        master_port_base: int = 12500,
+        fake_seq_lens: list[int] | None = None,
+        padded_seq_lens: list[int] | None = None,
+    ):
         assert os.path.isdir(HF_MODEL_PATH), (
             f"model dir not found: {HF_MODEL_PATH}; "
             f"download DeepSeek-V4-Flash into hf-hub/ first"
@@ -672,10 +723,7 @@ class TestEpCpThd(unittest.TestCase):
             f"NUM_GPUS={NUM_GPUS} not divisible by CP_SIZE={CP_SIZE}"
         )
 
-        pg = placement_group(
-            [{"GPU": 1, "CPU": 1}] * NUM_GPUS, strategy="PACK",
-        )
-        ray.get(pg.ready())
+        pg = _create_placement_group(NUM_GPUS)
 
         # --- Stage 1: vanilla baseline + 录 routing（全 rank 同 input，
         # loss/grad 一致；32 卡均摊 FSDP unshard 显存）---
@@ -684,10 +732,12 @@ class TestEpCpThd(unittest.TestCase):
             f"Running vanilla baseline (HF + 纯 FSDP, world={NUM_GPUS}) + routing capture ..."
         )
         baseline_results = self._run_workers(
-            _vanilla_baseline_worker, NUM_GPUS, pg, master_port=12500,
+            _vanilla_baseline_worker, NUM_GPUS, pg, master_port=master_port_base,
+            fake_seq_lens=fake_seq_lens,
+            padded_seq_lens=padded_seq_lens,
         )
 
-        # 全 rank 共享同一份 routing（baseline rank 0）
+        replay_indices_per_rank = None
         rank0_routing = baseline_results[0]["recorded_routing"]
         replay_indices_per_rank = [rank0_routing for _ in range(NUM_GPUS)]
         print(
@@ -697,17 +747,22 @@ class TestEpCpThd(unittest.TestCase):
         for layer_i, t in enumerate(rank0_routing[:1]):
             print(f"    layer {layer_i}: shape={list(t.shape)}")
 
-        # --- Stage 2: THD pack + router replay ---
         print("=" * 60)
         print(
-            f"Running THD pack (ep={EP_SIZE} cp={CP_SIZE} N={NUM_GPUS}) + router replay ..."
+            f"Running THD pack (ep={EP_SIZE} cp={CP_SIZE} N={NUM_GPUS} "
+            f"attn={attn_backend}) + router replay ..."
         )
         pack_results = self._run_workers(
-            _pack_thd_worker, NUM_GPUS, pg, master_port=12501,
-            replay_indices=replay_indices_per_rank,
+            _pack_thd_worker, NUM_GPUS, pg, master_port=master_port_base + 1,
+            replay_indices_per_rank=replay_indices_per_rank,
+            attn_backend=attn_backend,
+            indexer_backend=indexer_backend,
+            ep_backend=ep_backend,
+            fake_seq_lens=fake_seq_lens,
+            padded_seq_lens=padded_seq_lens,
         )
 
-        remove_placement_group(pg)
+        remove_placement_group(pg[0])
 
         # --- sanity ---
         print("\n--- sanity (finite / no-nan) ---")
@@ -736,6 +791,7 @@ class TestEpCpThd(unittest.TestCase):
         rtol_grad_norm = 0.01
         rtol_logits = 0.02
         rtol_per_param_places = 1  # |ratio-1| < 0.05
+        fused_atol_per_param = 1e-3
 
         bl0 = baseline_results[0]
         pk0 = pack_results[0]
@@ -826,10 +882,46 @@ class TestEpCpThd(unittest.TestCase):
             ratio = pk_n / bl_n if bl_n > 1e-12 else float("nan")
             print(f"  {name:<75s} {bl_n:12.6f} {pk_n:12.6f} {ratio:8.4f}")
             if bl_n > 1e-10:
-                self.assertAlmostEqual(
-                    ratio, 1.0, places=rtol_per_param_places,
-                    msg=f"Grad norm mismatch: {name}: "
-                        f"baseline={bl_n:.6f}, pack={pk_n:.6f}, ratio={ratio:.4f}",
-                )
+                if attn_backend == "fused":
+                    rel_ok = abs(ratio - 1.0) < 0.05
+                    abs_ok = abs(pk_n - bl_n) < fused_atol_per_param
+                    self.assertTrue(
+                        rel_ok or abs_ok,
+                        msg=f"Grad norm mismatch: {name}: baseline={bl_n:.6f}, "
+                            f"pack={pk_n:.6f}, ratio={ratio:.4f}, "
+                            f"abs_diff={abs(pk_n - bl_n):.2e}",
+                    )
+                else:
+                    self.assertAlmostEqual(
+                        ratio, 1.0, places=rtol_per_param_places,
+                        msg=f"Grad norm mismatch: {name}: "
+                            f"baseline={bl_n:.6f}, pack={pk_n:.6f}, ratio={ratio:.4f}",
+                    )
 
-        print("\nPASSED")
+        print(f"\nPASSED (attn={attn_backend})")
+
+    def test_pack_runs_fused(self):
+        """THD pack fused attn vs vanilla baseline, short segs [100, 200, 100]."""
+        self._pack_runs_impl(attn_backend="fused", indexer_backend="fused", ep_backend="deepep")
+
+    def test_pack_runs_eager(self):
+        """THD pack eager attn + fused indexer vs vanilla baseline."""
+        self._pack_runs_impl(attn_backend="eager", indexer_backend="eager", ep_backend="eager",
+                             master_port_base=12600)
+
+    def test_pack_runs_eager_topk(self):
+        """THD pack eager attn + fused indexer vs vanilla baseline."""
+        self._pack_runs_impl(attn_backend="eager-topk", indexer_backend="fused", ep_backend="deepep",
+                             master_port_base=12600)
+
+    def test_pack_runs_long(self):
+        """THD pack fused attn, long segs [1, 2023, 200] padded to [128, 2048, 384]=2560.
+
+        T_TOTAL=2560 必须是 cp_size(4)×m'(128)=512 的倍数，所以第三段 pad 到 384
+        而非 256（否则 T_TOTAL=2432, s_local=608, 608%128≠0）。
+        pack_sequences 的 cp_size 参数会自动处理这个对齐。
+        """
+        self._pack_runs_impl(attn_backend="fused", indexer_backend="fused",
+                             master_port_base=12700,
+                             fake_seq_lens=[1, 2023, 200],
+                             padded_seq_lens=[128, 2048, 384])

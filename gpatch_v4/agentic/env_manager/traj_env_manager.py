@@ -359,12 +359,25 @@ class TrajEnvManager(EnvManagerStrMixin):
         resp_mask = torch.tensor(response_masks, dtype=torch.bool)
         mask = resp_mask[1:]  # shifted by 1 to align with logprobs (L-1)
 
+        seq_length = self.rl_config.training.seq_length
+        pad_multi = self.rl_config.training.pad_to_mulitiple_of
+        L = tokens.shape[-1]
+        pad_to_len = ((L + pad_multi - 1) // pad_multi) * pad_multi
+        pos_len = max(seq_length, pad_to_len)
+        position_ids = (
+            torch.arange(pos_len, dtype=torch.long).view(1, 1, pos_len).expand(3, 1,
+                                                                               pos_len).contiguous()
+        )
+        image_input_mask = torch.zeros(1, pos_len, dtype=torch.bool)
+
         result = {
             "tokens": [tokens],
             "prompt_lengths": [prompt_lengths],
             "sequence_lengths": [sequence_lengths],
             "rewards": [rewards],
             "mask": [mask],
+            "position_ids": [position_ids],
+            "image_input_mask": [image_input_mask],
         }
 
         if rollout_log_probs:

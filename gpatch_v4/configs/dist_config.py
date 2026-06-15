@@ -159,10 +159,6 @@ class DistConfig(MappingProtocol):
             assert self.max_seqlen_per_dp_cp_rank is not None, (
                 "max_seqlen_per_dp_cp_rank must be set when dynamic_context_parallel=True"
             )
-            assert self.context_parallel_size >= 2, (
-                "dynamic_context_parallel requires context_parallel_size >= 2, "
-                f"got context_parallel_size={self.context_parallel_size}"
-            )
             assert 1 <= self.min_dynamic_context_parallel_size <= self.context_parallel_size, (
                 "min_dynamic_context_parallel_size must be in "
                 f"[1, context_parallel_size={self.context_parallel_size}], "

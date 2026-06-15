@@ -53,9 +53,7 @@ except ImportError as exc:
         "无法导入 Deepseek-V4 依赖（transformers.models.deepseek_v4.*）。依赖 transformers==5.8.1, 不是使用 dsv4 的话可以忽略"
     )
     DeepseekV4Config = None
-    DeepseekV4CSACache = None
     DeepseekV4GroupedLinear = None
-    DeepseekV4HCACache = None
     DeepseekV4HashRouter = None
     DeepseekV4HyperConnection = None
     DeepseekV4HyperHead = None
@@ -65,10 +63,15 @@ except ImportError as exc:
     DeepseekV4UnweightedRMSNorm = None
 
 
+from einops import rearrange
+
 from gpatch_v4.models.hp_module import HpModule
 
 from .a2a import all_to_all_uneven
 from .cp import build_cp_causal_mask, compressor_cp_ag, compressor_cp_ring, swa_ring_kv
+from .deepep_a2a import fused_combine, fused_dispatch
+from .kernel.tilelang_indexer_fwd import _make_causal_cu_seqlens, batched_indexer_fwd
+from .kernel.tilelang_sparse_mla import sparse_attn_tilelang
 from .thd import PackedSeqParams
 
 
@@ -121,6 +124,7 @@ class DeepseekV4HCACompressor(nn.Module):
 
     def __init__(self, config: DeepseekV4Config):
         super().__init__()
+        self.config = config
         self.compress_rate = config.compress_rates["heavily_compressed_attention"]
         self.head_dim = config.head_dim
         self.kv_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
@@ -143,7 +147,7 @@ class DeepseekV4HCACompressor(nn.Module):
         *,
         cp_group: "torch.distributed.ProcessGroup | None" = None,
         packed_seq_params: PackedSeqParams | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         s_local = hidden_states.shape[1]
         if cp_group is None:
             cp_rank = 0
@@ -205,31 +209,50 @@ class DeepseekV4HCACompressor(nn.Module):
         seq_len = position_ids.shape[1]
         assert compressed_len > 0, "compressed_len should be greater than 0"
 
-        # query `t` may only see cache entries at pos `w` t > w * compress_rate (ex: t=7, w=2 t does not attend to it).
-        if packed_seq_params is None:
-            entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
-            causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
-            block_bias = compressed_kv.new_zeros((batch, 1, seq_len, compressed_len))
-            block_bias = block_bias.masked_fill(
-                entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
-                float("-inf"),
-            )
+        block_bias = None
+        compressed_topk = None
+        if self.config.attn_backend == 'eager':
+            # query `t` may only see cache entries at pos `w` t > w * compress_rate (ex: t=7, w=2 t does not attend to it).
+            if packed_seq_params is None:
+                entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
+                causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
+                block_bias = compressed_kv.new_zeros((batch, 1, seq_len, compressed_len))
+                block_bias = block_bias.masked_fill(
+                    entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
+                    float("-inf"),
+                )
+            else:
+                # [b=1, h=1, s_local, n_windows]
+                # todo zz: redo causal threshold, seg_id_per_token
+                # todo zz: wnd idx = arange(compressed_len//2) + arange(half + compressed_len//2)
+                wnd_idx = torch.arange(compressed_len, device=device)
+                per_m = packed_seq_params.layout.per_m[self.compress_rate]
+                future_mask = wnd_idx.view(1, 1, 1, -1) >= per_m.causal_threshold_per_token.view(1, 1, -1, 1)
+
+                # [s_local, n_windows] bool mask, True if the token's seg is different from the window's seg
+                cross_seg_mask = packed_seq_params.layout.seg_id_per_token.unsqueeze(-1) != per_m.seg_id_per_wnd.unsqueeze(0)
+                future_mask = future_mask | cross_seg_mask.view(1, 1, s_local, compressed_len)
+
+                block_bias = compressed_kv.new_zeros((batch, 1, seq_len, compressed_len))
+                block_bias = block_bias.masked_fill(future_mask, float("-inf"))
         else:
-            # [b=1, h=1, s_local, n_windows]
-            # todo zz: redo causal threshold, seg_id_per_token
-            # todo zz: wnd idx = arange(compressed_len//2) + arange(half + compressed_len//2)
-            wnd_idx = torch.arange(compressed_len, device=device)
-            per_m = packed_seq_params.layout.per_m[self.compress_rate]
-            future_mask = wnd_idx.view(1, 1, 1, -1) >= per_m.causal_threshold_per_token.view(1, 1, -1, 1)
+            entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
+            if packed_seq_params is None:
+                causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
+                invalid = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)
+            else:
+                per_m = packed_seq_params.layout.per_m[self.compress_rate]
+                future_mask = entry_indices.view(1, 1, -1) >= per_m.causal_threshold_per_token.view(1, -1, 1)
+                cross_seg_mask = (
+                    packed_seq_params.layout.seg_id_per_token.unsqueeze(-1)
+                    != per_m.seg_id_per_wnd.unsqueeze(0)
+                ).view(1, s_local, compressed_len)
+                invalid = future_mask | cross_seg_mask
 
-            # [s_local, n_windows] bool mask, True if the token's seg is different from the window's seg
-            cross_seg_mask = packed_seq_params.layout.seg_id_per_token.unsqueeze(-1) != per_m.seg_id_per_wnd.unsqueeze(0)
-            future_mask = future_mask | cross_seg_mask.view(1, 1, s_local, compressed_len)
+            compressed_topk = entry_indices.view(1, 1, -1).expand(batch, seq_len, -1).int()
+            compressed_topk = compressed_topk.masked_fill(invalid, -1)
 
-            block_bias = compressed_kv.new_zeros((batch, 1, seq_len, compressed_len))
-            block_bias = block_bias.masked_fill(future_mask, float("-inf"))
-
-        return compressed_kv, block_bias
+        return compressed_kv, block_bias, compressed_topk
 
 
 class DeepseekV4Indexer(nn.Module):
@@ -265,6 +288,7 @@ class DeepseekV4Indexer(nn.Module):
 
     def __init__(self, config: DeepseekV4Config):
         super().__init__()
+        self.config = config
         self.compress_rate = config.compress_rates["compressed_sparse_attention"]
         self.num_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
@@ -395,10 +419,22 @@ class DeepseekV4Indexer(nn.Module):
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
 
         # ReLU(q·kᵀ) * weights, then top-k
-        scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))  # [B, S, H, T]
-        scores = F.relu(scores) * self.softmax_scale
-        weights = self.weights_proj(local_hidden_states).float() * self.weights_scaling  # [B, S, H]
-        index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, T]
+        if self.config.indexer_backend == 'fused' and packed_seq_params is None:
+            weights = self.weights_proj(local_hidden_states).float() * self.weights_scaling
+            q_sbhd = rearrange(q, 'b s h d -> s b h d').contiguous().to(torch.bfloat16)
+            k_sbd = rearrange(compressed_kv, 'b t d -> t b d').contiguous().to(torch.bfloat16)
+            w_sbh = rearrange(weights, 'b s h -> s b h').contiguous()
+            positions = position_ids[0].to(torch.int32)
+            cu_ks, cu_ke = _make_causal_cu_seqlens(
+                s_local, compressed_kv.shape[1], self.compress_rate, device, positions=positions,
+            )
+            index_scores = batched_indexer_fwd(q_sbhd, k_sbd, w_sbh, cu_ks, cu_ke)  # [B, S, T]
+        else:
+            scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))  # [B, S, H, T]
+            scores = F.relu(scores) * self.softmax_scale
+            weights = self.weights_proj(local_hidden_states).float() * self.weights_scaling  # [B, S, H]
+            index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, T]
+
         compressed_len = compressed_kv.shape[1]
         top_k = min(self.index_topk, compressed_len)
 
@@ -466,6 +502,7 @@ class DeepseekV4CSACompressor(nn.Module):
 
     def __init__(self, config: DeepseekV4Config):
         super().__init__()
+        self.config = config
         self.compress_rate = config.compress_rates["compressed_sparse_attention"]
         self.head_dim = config.head_dim
         self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
@@ -490,7 +527,7 @@ class DeepseekV4CSACompressor(nn.Module):
         *,
         cp_group: "torch.distributed.ProcessGroup | None" = None,
         packed_seq_params: PackedSeqParams | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         s_local = hidden_states.shape[1]
         if cp_group is None:
             first_window_position = 0
@@ -600,14 +637,19 @@ class DeepseekV4CSACompressor(nn.Module):
             packed_seq_params=packed_seq_params,
         )
         compressed_len = compressed_kv.shape[2]
-        valid = top_k_indices >= 0  # [B, S, k]
-        # Per-query block bias: query `t` may only see the cache entries that are <= `seq_len // m`
-        # and in these, only the ones marked valid by the indexer. Everything else is `-inf`.
-        # While the above negated the indexer, here we apply the "causal" masking.
-        safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
-        block_bias = compressed_kv.new_full((batch, 1, s_local, compressed_len + 1), float("-inf"))
-        block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-        return compressed_kv, block_bias[..., :compressed_len]
+
+        if self.config.attn_backend == 'eager':
+            valid = top_k_indices >= 0  # [B, S, k]
+            # Per-query block bias: query `t` may only see the cache entries that are <= `seq_len // m`
+            # and in these, only the ones marked valid by the indexer. Everything else is `-inf`.
+            # While the above negated the indexer, here we apply the "causal" masking.
+            safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
+            block_bias = compressed_kv.new_full((batch, 1, s_local, compressed_len + 1), float("-inf"))
+            block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
+            block_bias = block_bias[..., :compressed_len]
+        else:
+            block_bias = None
+        return compressed_kv, block_bias, top_k_indices.int()
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -694,6 +736,7 @@ class DeepseekV4Attention(nn.Module):
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
         *,
+        swa_topk: torch.Tensor | None = None,
         packed_seq_params: PackedSeqParams | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -721,11 +764,13 @@ class DeepseekV4Attention(nn.Module):
             kv = past_key_values.update(kv, kv, self.layer_idx)[0]
 
         block_bias = None
+        compressed_topk = None
         assert position_ids is not None
         if not cp_active:
             # ----- non-CP path (upstream-equivalent) -----
+            swa_kv_len = kv.shape[2]
             if self.compressor is not None:  # Compressed KV (CSA or HCA)
-                compressed_kv, block_bias = self.compressor(
+                compressed_kv, block_bias, compressed_topk = self.compressor(
                     hidden_states, q_residual, position_ids, past_key_values, self.layer_idx,
                     packed_seq_params=packed_seq_params,
                 )
@@ -737,10 +782,11 @@ class DeepseekV4Attention(nn.Module):
             # SWA ring: prepend prev-rank's last sliding_window-1 KVs.
             # todo zz: double the slide
             kv = swa_ring_kv(kv, cp_group, self.sliding_window)
+            swa_kv_len = kv.shape[2]
 
             # Compressor stage-1 + stage-2 (CSA/HCA layers only).
             if self.compressor is not None:
-                compressed_kv_full, block_bias = self.compressor(
+                compressed_kv_full, block_bias, compressed_topk = self.compressor(
                     hidden_states,
                     q_residual,
                     position_ids,
@@ -751,21 +797,31 @@ class DeepseekV4Attention(nn.Module):
                 )
                 kv = torch.cat([kv, compressed_kv_full], dim=2)
 
-            assert attention_mask is not None, (
-                "CP path expects model.forward to build the SWA mask"
-            )
-
-        # The compressor path concatenates extra entries onto the KV axis after the
-        # standard sliding-window cache update, so a tensor `attention_mask` (built
-        # for the pre-concat KV length) needs to be extended to cover them. The
-        # compressor returns a `block_bias` carrying per-query causality + indexer
-        # validity over those new slots — cat it in instead of zero-padding (which
-        # would let every query see every compressed slot).
-        if isinstance(attention_mask, torch.Tensor) and kv.shape[2] > attention_mask.shape[-1]:
-            if block_bias is not None:
-                attention_mask = torch.cat([attention_mask, block_bias.to(attention_mask.dtype)], dim=-1)
-            else:
-                attention_mask = F.pad(attention_mask, (0, kv.shape[2] - attention_mask.shape[-1]), value=0.0)
+        if self.config.attn_backend == 'eager':
+            # The compressor path concatenates extra entries onto the KV axis after the
+            # standard sliding-window cache update, so a tensor `attention_mask` (built
+            # for the pre-concat KV length) needs to be extended to cover them. The
+            # compressor returns a `block_bias` carrying per-query causality + indexer
+            # validity over those new slots — cat it in instead of zero-padding (which
+            # would let every query see every compressed slot).
+            if isinstance(attention_mask, torch.Tensor) and kv.shape[2] > attention_mask.shape[-1]:
+                if block_bias is not None:
+                    attention_mask = torch.cat([attention_mask, block_bias.to(attention_mask.dtype)], dim=-1)
+                else:
+                    attention_mask = F.pad(attention_mask, (0, kv.shape[2] - attention_mask.shape[-1]), value=0.0)
+        else:
+            # fused path: swa_topk holds absolute indices into the sliding-window
+            # KV axis (length `swa_kv_len`); compressor entries were concatenated
+            # right after it, so shift the compressor top-k slots by `swa_kv_len`
+            # (NOT by swa_topk.shape[-1], which is the window size SW != KV length
+            # whenever s_local != SW or a CP rank > 0 carries a ring prefix).
+            assert attention_mask is None
+            if compressed_topk is not None:
+                assert swa_topk.shape[:2] == compressed_topk.shape[:2]
+                topk_len = swa_topk.shape[-1]
+                shifted_topk = torch.where(compressed_topk >= 0, compressed_topk + swa_kv_len, compressed_topk)
+                swa_topk = torch.cat([swa_topk, shifted_topk], dim=-1)
+                assert swa_topk.shape[-1] == topk_len + compressed_topk.shape[-1] and swa_topk.dtype == torch.int32
 
         # Backend dispatch — set by `apply_hp` from policy_config.attn_implementation.
         if self.config.attn_backend == "eager":
@@ -781,27 +837,36 @@ class DeepseekV4Attention(nn.Module):
             # for i in T.Parallel(h):
             #     sum_exp[i] += T.exp(attn_sink[i] - scores_max[i])
             # ```
-            attention_interface = eager_attention_forward
-        elif self.config.attn_backend == "fused":
-            raise NotImplementedError(
-                "attn_backend='fused' (fused top-k SWA) not yet wired in"
+            attn_output, attn_weights = eager_attention_forward(
+                self,
+                q,
+                kv,
+                kv,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                s_aux=self.sinks,
+                **kwargs,
             )
+        elif self.config.attn_backend == "fused":
+            _fsinks = self.sinks if self.config.amp_fp32 else self.sinks.float()
+            attn_output = sparse_attn_tilelang(
+                rearrange(q, 'B H S D -> B S H D').contiguous(),
+                rearrange(kv, 'B 1 Skv D -> B Skv D').contiguous(),
+                _fsinks,
+                swa_topk,
+                sm_scale=self.scaling,
+            )
+            attn_weights = None
+        elif self.config.attn_backend == "eager-topk":
+            from .kernel.eager_topk_attn import eager_topk_attention_forward
+            attn_output = eager_topk_attention_forward(
+                q, kv, self.sinks, swa_topk, sm_scale=self.scaling,
+            )
+            attn_weights = None
         else:
             raise ValueError(f"unknown attn_backend: {self.config.attn_backend!r}")
-
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            q,
-            kv,
-            kv,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            s_aux=self.sinks,
-            **kwargs,
-        )
 
         # K=V in V4, so V picked up rope on its trailing rope slice. Apply the conjugate
         # rotation (`-sin`) at the query position to undo it on the rope slice of the
@@ -851,6 +916,7 @@ class DeepseekV4Experts(nn.Module):
         self.ep_rank = 0
         self.ep_group: Optional[dist.ProcessGroup] = None
         self.num_local_experts = self.num_experts
+        self.ep_backend = "eager"
 
     def forward(
         self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
@@ -880,6 +946,18 @@ class DeepseekV4Experts(nn.Module):
             "DeepseekV4Experts.forward requires ep_group; "
             "did you forget to call apply_hp(model, ep_2d_mesh)?"
         )
+        if self.ep_backend == "eager":
+            return self._forward_eager(hidden_states, top_k_index, top_k_weights)
+        if self.ep_backend == "deepep":
+            return self._forward_deepep(hidden_states, top_k_index, top_k_weights)
+        raise ValueError(f"unknown ep_backend: {self.ep_backend}")
+
+    def _forward_eager(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
         N, H = hidden_states.shape
         num_top_k = top_k_index.size(-1)
 
@@ -918,6 +996,31 @@ class DeepseekV4Experts(nn.Module):
         inv_order = torch.argsort(order)
         back = back[inv_order]                          # [N*K, H]
         return back.view(N, num_top_k, H).sum(dim=1)    # [N, H]
+
+    def _forward_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        N, H = hidden_states.shape
+        recv_x, recv_expert, recv_weight, _, handle = fused_dispatch(
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+            self.num_experts,
+            self.ep_group,
+        )
+        valid = recv_expert >= 0
+        row_idx, slot_idx = valid.nonzero(as_tuple=True)
+        recv_out = recv_x.new_zeros(recv_x.shape[0], H)
+        if row_idx.numel() > 0:
+            local_expert_id = recv_expert[row_idx, slot_idx]
+            local_weight = recv_weight[row_idx, slot_idx]
+            expanded_x = recv_x.index_select(0, row_idx)
+            expanded_out = self.fwd_gmm(expanded_x, local_expert_id, local_weight)
+            recv_out.index_add_(0, row_idx, expanded_out)
+        return fused_combine(recv_out, self.ep_group, handle).view(N, H)
 
     def fwd_gmm(
         self,
@@ -1132,32 +1235,9 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["DeepseekV4DecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
-    # V4 ships eager-only. The non-eager backends are off for the following reasons:
-    #
-    #   * FlashAttention 2 / 3 cap the head dim at 256; V4's `head_dim=512`
-    #     (V4-Flash and V4-Pro both) is structurally incompatible — `flash_attention_2`
-    #     and the `kernels-community/vllm-flash-attn3` kernel both fail with
-    #     `RuntimeError: FlashAttention forward only supports head dimension at most
-    #     256`. FA4 has the same 256 cap, so it's off too.
-    #   * SDPA: torch's SDPA kernel doesn't carry the per-head learnable sink term V4
-    #     inherits from gpt-oss-style attention.
-    #   * FlexAttention: V4 attention concatenates compressor entries onto the KV
-    #     axis *inside* the attention block, after the model-level mask was built,
-    #     so the resulting KV length doesn't match the BlockMask's `kv_len`.
-    #     BlockMask has no runtime resize, and rebuilding it per-block would require
-    #     teaching the compressor's variable output count to a `mask_mod` — not
-    #     worth it for a path the compressor already owns its own causality
-    #     bookkeeping for.
     _supports_flash_attn = False
     _supports_sdpa = False
     _supports_flex_attn = False
-    # The compressor's rolling-window buffer / compressed-entries / overlap state
-    # lives on the per-layer cache (:class:`DeepseekV4HCACache` /
-    # :class:`DeepseekV4CSACache`) and isn't compatible with :class:`StaticCache`
-    # — that path would hand the compressor a :class:`StaticSlidingWindowLayer`
-    # with no `store_compression_weights` method. Disabling fullgraph compile
-    # keeps generation tests on the dynamic cache build that does dispatch to
-    # V4's own cache layers.
     _can_compile_fullgraph = False
     _supports_attention_backend = True
     _can_record_outputs = {
@@ -1177,11 +1257,6 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
         "norm",
     ]
     _keys_to_ignore_on_load_unexpected = [r"(^|\.)mtp\..*"]
-    # ``_is_stateful`` opts out of generation modes that need to roll the cache
-    # back across drafts (assisted generation, prompt lookup, contrastive search).
-    # The compressor's running-window state isn't rewindable, so `generate`
-    # raises a clear error early instead of failing deep in the compressor with
-    # a missing-method `AttributeError`.
     _is_stateful = True
 
     @torch.no_grad()
@@ -1266,6 +1341,12 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         return_hc_hidden: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeModelOutputWithPast:
+        r"""
+        packed_seq_params (`PackedSeqParams`, *optional*):
+            THD-format packing metadata for variable-length sequences in a single batch row.
+        return_hc_hidden (`bool`, *optional*, defaults to `False`):
+            Whether to return the pre-head hyper-connection hidden states for MTP.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -1291,35 +1372,66 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             # `create_masks_for_generate`; all V4 layer types use the same sliding-window
             # mask, so use the prebuilt one directly. Otherwise build it here.
 
-        if cp_active:
-            # 每层 sliding_window / s_local / cp_rank 一致，mask 一处算好
-            # 分发给所有 attention layer，避免重复算（NUM_LAYERS=4 时浪费
-            # 4 次）。``swa_ring_kv`` 在 rank 0 不送 prefix，rank > 0 送
-            # ``min(sliding_window-1, s_local)``。
-            s_local = inputs_embeds.shape[1]
-            assert self.config.sliding_window <= s_local
-            swa_prefix_len = 0 if self.cp_rank == 0 else self.config.sliding_window - 1
-            causal_mask = build_cp_causal_mask(
-                s_local, self.cp_rank, swa_prefix_len, self.config.sliding_window,
-                packed_seq_params=packed_seq_params,
-                dtype=inputs_embeds.dtype, device=inputs_embeds.device,
-            )
-        elif isinstance(attention_mask, dict):
-            assert NotImplementedError('not supported')
-        else:
-            causal_mask = create_sliding_window_causal_mask(
-                config=self.config,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-            )
-            if packed_seq_params is not None:
-                seg_id = packed_seq_params.layout.seg_id_per_token
-                cross_seg = seg_id.unsqueeze(0) != seg_id.unsqueeze(1)
-                causal_mask = causal_mask.masked_fill(
-                    cross_seg.view(1, 1, *cross_seg.shape), float("-inf"),
+        causal_mask = None
+        swa_topk = None
+        if self.config.attn_backend == 'eager':
+            if cp_active:
+                # 每层 sliding_window / s_local / cp_rank 一致，mask 一处算好
+                # 分发给所有 attention layer，避免重复算（NUM_LAYERS=4 时浪费
+                # 4 次）。``swa_ring_kv`` 在 rank 0 不送 prefix，rank > 0 送
+                # ``min(sliding_window-1, s_local)``。
+                s_local = inputs_embeds.shape[1]
+                assert self.config.sliding_window <= s_local
+                swa_prefix_len = 0 if self.cp_rank == 0 else self.config.sliding_window - 1
+                causal_mask = build_cp_causal_mask(
+                    s_local, self.cp_rank, swa_prefix_len, self.config.sliding_window,
+                    packed_seq_params=packed_seq_params,
+                    dtype=inputs_embeds.dtype, device=inputs_embeds.device,
                 )
+            elif isinstance(attention_mask, dict):
+                assert NotImplementedError('not supported')
+            else:
+                causal_mask = create_sliding_window_causal_mask(
+                    config=self.config,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    position_ids=position_ids,
+                )
+                if packed_seq_params is not None:
+                    seg_id = packed_seq_params.layout.seg_id_per_token
+                    cross_seg = seg_id.unsqueeze(0) != seg_id.unsqueeze(1)
+                    causal_mask = causal_mask.masked_fill(
+                        cross_seg.view(1, 1, *cross_seg.shape), float("-inf"),
+                    )
+        else:
+            # cp_rank == 0（无 prefix，buffer = local kv），W=4::
+            #     swa_topk[i] = [i-3, i-2, i-1, i]  # 序列起点不足处 clamp 成 -1
+            #     [[-1, -1, -1, 0],
+            #      [-1, -1,  0, 1],
+            #       ...
+            #      [ 4,  5,  6, 7]]
+            # cp_rank > 0（buffer = [prefix(W-1) ++ local kv]），W=4::
+            #     swa_topk[i] = [i, i+1, i+2, i+3]  # prefix 保证历史够，无 -1
+            s_local = inputs_embeds.shape[1]
+            SW = self.config.sliding_window
+            assert SW <= s_local
+            device = inputs_embeds.device
+            ta = torch.arange(s_local, device=device).view(1, -1, 1)
+            tb = torch.arange(SW, device=device).view(1, 1, -1)
+            if self.cp_rank == 0:
+                tb = tb - (SW - 1)
+            swa_topk = (ta + tb).clamp(min=-1)
+
+            if packed_seq_params is not None:
+                seg_id_q = packed_seq_params.layout.seg_id_per_token  # [s_local]
+                seg_id_kv = packed_seq_params.layout.seg_id_per_token_with_prefix
+                safe_idx = swa_topk.clamp(min=0).long()
+                cross_seg = seg_id_q.view(1, -1, 1) != seg_id_kv[safe_idx.view(-1)].view(1, s_local, SW)
+                swa_topk = swa_topk.masked_fill(cross_seg, -1)
+
+            swa_topk = swa_topk.expand(inputs_embeds.shape[0], -1, -1).int()
+            assert swa_topk.shape == (inputs_embeds.shape[0], s_local, SW) and swa_topk.dtype == torch.int32
 
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         position_embeddings = {
@@ -1333,6 +1445,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,
                 attention_mask=causal_mask,
+                swa_topk=swa_topk,
                 input_ids=input_ids,
                 past_key_values=past_key_values,
                 packed_seq_params=packed_seq_params,
@@ -1406,6 +1519,9 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
 
+        packed_seq_params (`PackedSeqParams`, *optional*):
+            THD-format packing metadata for variable-length sequences in a single batch row.
+
         Example:
 
         ```python
@@ -1472,15 +1588,17 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
                 mtp_position_ids = torch.arange(
                     mtp_inputs_embeds.shape[1], device=mtp_inputs_embeds.device
                 ).unsqueeze(0)
-            if isinstance(attention_mask, dict):
-                mtp_causal_mask = next(iter(attention_mask.values()))
-            else:
+
+            if packed_seq_params is not None:
+                raise NotImplementedError(
+                    "DeepSeek-V4 MTP+CP currently supports only non-packed sequence inputs."
+                )
+
+            mtp_causal_mask = None
+            mtp_swa_topk = None
+            if self.config.attn_backend == 'eager':
                 cp_active = self.model.cp_group is not None and self.model.cp_size > 1
                 if cp_active:
-                    if packed_seq_params is not None:
-                        raise NotImplementedError(
-                            "DeepSeek-V4 MTP+CP currently supports only non-packed sequence inputs."
-                        )
                     s_local = mtp_inputs_embeds.shape[1]
                     assert self.config.sliding_window <= s_local
                     swa_prefix_len = 0 if self.model.cp_rank == 0 else self.config.sliding_window - 1
@@ -1501,6 +1619,18 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
                         past_key_values=None,
                         position_ids=mtp_position_ids,
                     )
+            else:
+                # fused sparse attn: 同主干，构建 sliding-window 下标 [B, S, W]。
+                s_local = mtp_inputs_embeds.shape[1]
+                SW = self.config.sliding_window
+                assert SW <= s_local
+                device = mtp_inputs_embeds.device
+                ta = torch.arange(s_local, device=device).view(1, -1, 1)
+                tb = torch.arange(SW, device=device).view(1, 1, -1)
+                if self.model.cp_rank == 0:
+                    tb = tb - (SW - 1)
+                mtp_swa_topk = (ta + tb).clamp(min=-1).expand(mtp_inputs_embeds.shape[0], -1, -1).int()
+
             mtp_per_depth_h = self.mtp(
                 hidden_states=mtp_hc_hidden,
                 input_ids=input_ids,
@@ -1508,6 +1638,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
                 cp_group=self.model.cp_group,
                 position_ids=mtp_position_ids,
                 attention_mask=mtp_causal_mask,
+                swa_topk=mtp_swa_topk,
             )
 
         result = MoeCausalLMOutputWithPast(

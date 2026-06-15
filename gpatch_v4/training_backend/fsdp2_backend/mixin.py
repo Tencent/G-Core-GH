@@ -293,7 +293,10 @@ class Fsdp2EngineMixin:
             # asserts the master is fp32, so meta-construct under fp32
             # default dtype.
             cfg = model_cls.config_class.from_pretrained(hf_model_path, trust_remote_code=True)
-            cfg._attn_implementation = self.policy_config.attn_implementation
+
+            # HP Module 其实不用这个字段，写一个 'eager' fallback 下
+            cfg._attn_implementation = 'eager'
+
             enable_mtp = bool(self.training_config.enable_mtp)
             mtp_num_layers = int(cfg.num_nextn_predict_layers)
             if enable_mtp:
@@ -335,6 +338,9 @@ class Fsdp2EngineMixin:
                 self.ep_2d_mesh,
                 cp_mesh=self.cp_mesh_for_hp,
                 attn_backend=self.policy_config.attn_implementation,
+                indexer_backend=self.policy_config.indexer_backend,
+                ep_backend=self.policy_config.ep_backend,
+                deepep_num_sms=self.policy_config.deepep_num_sms,
             )
             model.load_checkpoint_hp(hf_model_path)
             if not model_only_inference:

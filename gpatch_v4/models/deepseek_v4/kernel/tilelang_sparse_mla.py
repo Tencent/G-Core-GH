@@ -22,7 +22,7 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
         sm_scale = ctx.sm_scale
 
         dq, dkv, d_attn_sink = sparse_mla_bwd.sparse_mqa_bwd_interface(
-            q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=sm_scale
+            q, kv, attn_sink, o, do.contiguous(), topk_idxs, lse, sm_scale=sm_scale
         )
 
         return dq, dkv, d_attn_sink, None, None

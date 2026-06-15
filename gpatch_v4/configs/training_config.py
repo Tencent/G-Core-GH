@@ -306,11 +306,32 @@ class TrainingConfig(MappingProtocol):
         metadata={"help": "Scaling factor for auxiliary MTP loss."},
     )
     docker_image_tag: str = field(default="", metadata={"help": "Docker image tag."})
+    use_linear_ce: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "Whether to use linear cross entropy loss. cross_entropy_loss_fusion=True and cross_entropy_fusion_impl=linear"
+        }
+    )
+    linear_ce_backend: str = field(
+        default="separate",
+        metadata={
+            "help":
+                "Backward method for linear cross entropy. Options: "
+                "'separate' (full d_logits buffer, native dtype, fastest & best memory, default), "
+                "'fuse_mn' (single fused kernel, no intermediate d_logits but needs fp32 d_hidden/d_weight), "
+                "'split_n' (split d_logits along vocab dim, loop over splits, slowest)."
+        },
+    )
 
     def __post_init__(self):
         assert self.training_backend in ["mcore", "fsdp2"]
         assert self.attention_backend in ["flash", "fused", "unfused", "local", "auto"]
         assert self.moe_token_dispatcher_type in ['allgather', 'alltoall', 'flex']
+        assert self.linear_ce_backend in ["fuse_mn", "separate", "split_n"], (
+            f"Unknown linear_ce_backend: '{self.linear_ce_backend}'. "
+            f"Choose from: ['fuse_mn', 'separate', 'split_n']"
+        )
         if self.ppo_dump_metrics_interval > 0:
             assert self.ppo_dump_metrics_dir
         if self.eval_before_train:
@@ -418,7 +439,7 @@ class FinetuneTrainingConfig(TrainingConfig):
         if self.loss_func == "custom":
             assert self.loss_func_py_path is not None and self.loss_func_py_name is not None, "Custom loss function must be provided"
         assert self.cross_entropy_fusion_impl in [
-            "native", "te"
+            "native", "te", "linear"
         ], f"Invalid cross entropy fusion implementation: {self.cross_entropy_fusion_impl}"
 
 
@@ -545,6 +566,11 @@ class RLTrainingConfig(TrainingConfig):
         synchronous training (no carry-over).  ``save_interval`` saves
         land on window boundaries (multiples of ``max(s, 1)``); the final
         step always gets a save.
+    rollout_ordered_collection : bool
+        When ``False`` (default), single-controller rollout collection
+        consumes the ready queue in first-finished order.  When ``True``,
+        collection waits for the requested original PPO step and preserves
+        original microbatch order.
     num_agent_loop_workers : int
         Number of AgentLoopActor Ray actors for the distributed rollout
         pipeline.  Only used when ``async_rollout`` is enabled.
@@ -685,6 +711,15 @@ class RLTrainingConfig(TrainingConfig):
                 "requests in backend load metrics."
         }
     )
+    rollout_ordered_collection: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "When True, single-controller rollout collection consumes "
+                "microbatches by original PPO step and microbatch order. "
+                "Default False keeps first-finished queue consumption."
+        }
+    )
     reflect_prompt: Optional[str] = field(
         default="请重新审视你的回答，仔细检查一下你的推理过程和最终答案。",
         metadata={
@@ -750,6 +785,11 @@ class RLTrainingConfig(TrainingConfig):
         else:
             assert self.rollout_max_staleness == 0, (
                 "rollout_max_staleness is only valid when async_rollout=True"
+            )
+        if self.rollout_ordered_collection:
+            assert self.async_rollout or self.single_controller, (
+                "rollout_ordered_collection is only valid for single-controller "
+                "async or colocate rollout"
             )
 
 

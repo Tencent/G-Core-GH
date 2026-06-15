@@ -368,6 +368,9 @@ class InferEngine:
             from vllm.engine.arg_utils import AsyncEngineArgs
             from vllm.v1.engine.async_llm import AsyncLLM
 
+            from gpatch_v4.generation_backend.flashinfer_cudart_fix import (
+                build_compilation_config_patch,
+            )
             from gpatch_v4.generation_backend.vllm_engine import VllmEngine
 
             # Must be called AFTER import vllm, because vllm's module-level
@@ -413,9 +416,15 @@ class InferEngine:
             mm_processor_kwargs = {}
             if use_fast:
                 mm_processor_kwargs = dict(use_fast=True)
+
+            vllm_compilation_config = build_compilation_config_patch(tensor_parallel_size)
+            user_compilation_config = extra_infer_engine_config.pop("compilation_config", None)
+            if user_compilation_config is not None:
+                vllm_compilation_config.update(user_compilation_config)
             engine_args = AsyncEngineArgs(
                 model=model_path,
                 dtype=dtype,
+                compilation_config=vllm_compilation_config,
                 distributed_executor_backend="mp" if use_mp else "ray",
                 tensor_parallel_size=tensor_parallel_size,
                 pipeline_parallel_size=pipeline_parallel_size,

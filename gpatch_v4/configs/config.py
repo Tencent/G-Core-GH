@@ -40,6 +40,19 @@ from gpatch_v4.configs.training_config import (
 from gpatch_v4.configs.utils import MappingProtocol
 
 
+def _assert_dynamic_cp_requires_flash_attention(training, *policies) -> None:
+    attention_backend = training.attention_backend
+    for policy in policies:
+        if policy is None:
+            continue
+        dist_config = getattr(policy, "dist_config", None)
+        if dist_config is not None and getattr(dist_config, "dynamic_context_parallel", False):
+            assert attention_backend == "flash", (
+                "dynamic_context_parallel requires training.attention_backend='flash', "
+                f"otherwise the grad_norm nan, got {attention_backend!r}"
+            )
+
+
 @dataclass
 class FinetuneConfig(MappingProtocol):
     """Configuration for supervised fine-tuning.
@@ -69,6 +82,9 @@ class FinetuneConfig(MappingProtocol):
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     task: Any = field(default=None, metadata={'help': 'any task related config'})
+
+    def __post_init__(self):
+        _assert_dynamic_cp_requires_flash_attention(self.training, self.policy)
 
 
 # rl config
@@ -111,6 +127,9 @@ class RlConfig(MappingProtocol):
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     task: Any = field(default=None, metadata={'help': 'any task related config'})
+
+    def __post_init__(self):
+        _assert_dynamic_cp_requires_flash_attention(self.training, self.policy, self.critic)
 
 
 @dataclass
@@ -217,6 +236,10 @@ class OnPolicyDistillConfig(MappingProtocol):
     task: Any = field(default=None, metadata={'help': 'any task related config'})
 
     def __post_init__(self):
+        teachers = tuple(self.teachers.values()) if self.teachers else ()
+        _assert_dynamic_cp_requires_flash_attention(
+            self.training, self.policy, self.teacher, *teachers
+        )
         if not self.teachers and self.teacher is not None:
             self.teachers = {"default": self.teacher}
         self.teacher = None
@@ -253,6 +276,7 @@ class DpoConfig(MappingProtocol):
 
     def __post_init__(self):
         assert self.placement_type in ["colocate", "disaggregated"]
+        _assert_dynamic_cp_requires_flash_attention(self.training, self.policy)
 
 
 @dataclass
@@ -292,6 +316,7 @@ class OffPolicyDistillConfig(MappingProtocol):
 
     def __post_init__(self):
         assert self.placement_type in ["colocate", "disaggregated"]
+        _assert_dynamic_cp_requires_flash_attention(self.training, self.policy, self.teacher)
 
         if not self.training.setup_teacher_in_independent_topo:
             # When CP > 1, teacher smart_pad_infer and student smart_pad_train must match

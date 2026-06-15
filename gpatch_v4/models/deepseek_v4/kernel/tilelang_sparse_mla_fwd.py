@@ -150,7 +150,7 @@ def sparse_mqa_fwd(
 
 
 def sparse_mqa_fwd_interface(
-    q, kv, attn_sink, topk_idxs, sm_scale=None, block_I=64, num_stages=2, threads=256
+    q, kv, attn_sink, topk_idxs, sm_scale=None, block_I=16, num_stages=1, threads=256
 ):
     """Forward interface for V4 sparse MQA attention.
 
@@ -166,12 +166,13 @@ def sparse_mqa_fwd_interface(
         lse: [B, S, H] fp32
     """
     assert q.is_contiguous() and kv.is_contiguous() and topk_idxs.is_contiguous()
+    assert attn_sink.dtype == torch.float32, f"attn_sink must be fp32, got {attn_sink.dtype}"
+    assert topk_idxs.dtype == torch.int32, f"topk_idxs must be int32, got {topk_idxs.dtype}"
     batch, seq_len, heads, dim = q.shape
     _, seq_len_kv, kv_dim = kv.shape
     assert kv_dim == dim
     _, _, topk = topk_idxs.shape
 
-    # Pad topk to next multiple of block_I (kernel requires divisibility)
     padded_topk = (topk + block_I - 1) // block_I * block_I
     if padded_topk != topk:
         pad = torch.full(

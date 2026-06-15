@@ -18,12 +18,13 @@ Usage::
 import math
 import os
 import unittest
+import importlib.util
 from contextlib import nullcontext
 
 import ray
 import torch
 import torch.nn.functional as F
-from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.placement_group import remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from torch import distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -43,11 +44,14 @@ from gpatch_v4.models.deepseek_v4.router_replay import (
     capture_routing_decisions,
     router_replay_ctx,
 )
+from gpatch_v4.orches.placement_group import _create_placement_group
 
 HF_MODEL_PATH = "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
 NUM_GPUS = 32
 NUM_LAYERS = 4  # 最小前缀，覆盖 3 种 attn + 2 种 moe 类型
 SEQ_LEN = 256  # HCA m'=128 需要 s_local>=128，cp=2 时 s_local=SEQ_LEN/2
+_DEEPEP_AVAILABLE = importlib.util.find_spec("deep_ep") is not None
+requires_deepep = unittest.skipUnless(_DEEPEP_AVAILABLE, "deep_ep not installed")
 
 
 def _truncate_config(config):
@@ -173,6 +177,7 @@ def _ep_worker(
     seq_len: int = SEQ_LEN,
     replay_indices: "list[torch.Tensor] | None" = None,
     dp_size: int = 1,
+    ep_backend: str = "eager",
 ):
     """我们的 EP 实现：meta-device init + load_checkpoint_hp。"""
 
@@ -196,7 +201,7 @@ def _ep_worker(
         0, tokenizer.vocab_size, (1, seq_len), generator=rng
     ).cuda()
 
-    tag = f"ep{ep_size}" if replay_indices is None else f"ep{ep_size}_replay"
+    tag = f"ep{ep_size}_{ep_backend}" if replay_indices is None else f"ep{ep_size}_{ep_backend}_replay"
     print(f"[{tag}] rank {rank}: loading {hf_model_path} via meta-device ...")
 
     config = DeepseekV4Config.from_pretrained(hf_model_path)
@@ -222,7 +227,7 @@ def _ep_worker(
 
     model.gradient_checkpointing_enable()
 
-    model = apply_hp(model, ep_2d_mesh, amp_fp32=False)
+    model = apply_hp(model, ep_2d_mesh, amp_fp32=False, ep_backend=ep_backend)
     model.load_checkpoint_hp(hf_model_path)
 
     if replay_indices is not None:
@@ -427,17 +432,18 @@ class TestFsdpVsEp(unittest.TestCase):
         dp_size: int = 1,
     ) -> list[dict]:
         """启动 baseline workers（纯 FSDP）。"""
+        pg_obj, bundle_indices = pg
         master_addr = ray.get(
             _get_node_ip.options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg, placement_group_bundle_index=0,
+                    placement_group=pg_obj, placement_group_bundle_index=bundle_indices[0],
                 )
             ).remote()
         )
         futures = [
             _baseline_worker.options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg, placement_group_bundle_index=r,
+                    placement_group=pg_obj, placement_group_bundle_index=bundle_indices[r],
                 )
             ).remote(
                 HF_MODEL_PATH,
@@ -461,19 +467,21 @@ class TestFsdpVsEp(unittest.TestCase):
         *,
         replay_indices_per_rank: "list[list[torch.Tensor]] | None" = None,
         dp_size: int = 1,
+        ep_backend: str = "eager",
     ) -> list[dict]:
         """启动 EP workers。"""
+        pg_obj, bundle_indices = pg
         master_addr = ray.get(
             _get_node_ip.options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg, placement_group_bundle_index=0,
+                    placement_group=pg_obj, placement_group_bundle_index=bundle_indices[0],
                 )
             ).remote()
         )
         futures = [
             _ep_worker.options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg, placement_group_bundle_index=r,
+                    placement_group=pg_obj, placement_group_bundle_index=bundle_indices[r],
                 )
             ).remote(
                 HF_MODEL_PATH,
@@ -488,6 +496,7 @@ class TestFsdpVsEp(unittest.TestCase):
                     else None
                 ),
                 dp_size=dp_size,
+                ep_backend=ep_backend,
             )
             for r in range(world_size)
         ]
@@ -573,7 +582,6 @@ class TestFsdpVsEp(unittest.TestCase):
 
         # --- 逐参数 grad norm 对比 ---
         print("\n--- per-param grad norm table ---")
-        bl_norms = baseline_results[0]["per_param_grad_norm"]
         # EP 端把 ``sinks`` / ``position_bias`` wrap 进了 ``_Fp32ParamHolder``；
         # 把 holder 路径名归一化回 baseline 端的扁平名再比对。
         def _strip_holder(name: str) -> str:
@@ -581,6 +589,7 @@ class TestFsdpVsEp(unittest.TestCase):
                 name.replace("._sink_holder.weight", ".sinks")
                     .replace("._position_bias_holder.weight", ".position_bias")
             )
+        bl_norms = {_strip_holder(k): v for k, v in baseline_results[0]["per_param_grad_norm"].items()}
         ep_norms = {_strip_holder(k): v for k, v in ep_results[0]["per_param_grad_norm"].items()}
 
         header = f"  {'parameter':<75s} {'bl_norm':>12s} {'ep_norm':>12s} {'ratio':>8s}"
@@ -651,10 +660,7 @@ class TestFsdpVsEp(unittest.TestCase):
             f"download DeepSeek-V4-Flash into hf-hub/ first"
         )
 
-        pg = placement_group(
-            [{"GPU": 1, "CPU": 1}] * world_size, strategy="PACK",
-        )
-        ray.get(pg.ready())
+        pg = _create_placement_group(world_size)
 
         # --- 运行 baseline ---
         print("=" * 60)
@@ -670,10 +676,56 @@ class TestFsdpVsEp(unittest.TestCase):
             world_size, pg, master_port_base + 1, ep_size=ep_size
         )
 
-        remove_placement_group(pg)
+        remove_placement_group(pg[0])
 
         self._assert_results(
             baseline_results, ep_results, f"ep{ep_size}", world_size, rtol,
+        )
+
+    @requires_deepep
+    def test_fsdp_vs_ep_deepep(
+        self,
+        world_size: int = 16,
+        ep_size: int = 16,
+        master_port_base: int = 12520,
+        rtol: float = 0.06,
+    ):
+        """DeepEP EP backend vs the eager EP backend.
+
+        Run with the DeepEP runtime environment sourced first, e.g.
+        ``source tasks/deepseek/V3/deepep_env.sh``.
+        """
+        assert os.path.isdir(HF_MODEL_PATH), (
+            f"model dir not found: {HF_MODEL_PATH}; "
+            f"download DeepSeek-V4-Flash into hf-hub/ first"
+        )
+
+        pg = _create_placement_group(world_size)
+
+        print("=" * 60)
+        print(f"Running EP eager (ep_size={ep_size}, world_size={world_size}) ...")
+        eager_results = self._run_ep(
+            world_size,
+            pg,
+            master_port_base,
+            ep_size=ep_size,
+            ep_backend="eager",
+        )
+
+        print("=" * 60)
+        print(f"Running EP DeepEP (ep_size={ep_size}, world_size={world_size}) ...")
+        ep_results = self._run_ep(
+            world_size,
+            pg,
+            master_port_base + 1,
+            ep_size=ep_size,
+            ep_backend="deepep",
+        )
+
+        remove_placement_group(pg[0])
+
+        self._assert_results(
+            eager_results, ep_results, f"ep{ep_size}_deepep", world_size, rtol,
         )
 
     def test_fsdp_vs_ep_with_router_replay(
@@ -691,10 +743,7 @@ class TestFsdpVsEp(unittest.TestCase):
             f"download DeepSeek-V4-Flash into hf-hub/ first"
         )
 
-        pg = placement_group(
-            [{"GPU": 1, "CPU": 1}] * world_size, strategy="PACK",
-        )
-        ray.get(pg.ready())
+        pg = _create_placement_group(world_size)
 
         # --- Baseline + 录制路由 ---
         print("=" * 60)
@@ -721,7 +770,7 @@ class TestFsdpVsEp(unittest.TestCase):
             replay_indices_per_rank=replay_indices_per_rank,
         )
 
-        remove_placement_group(pg)
+        remove_placement_group(pg[0])
 
         self._assert_results(
             baseline_results, ep_results,

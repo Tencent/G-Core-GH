@@ -166,6 +166,7 @@ def _load_checkpoint_hp(
 
     import time as _time
     _t0 = _time.time()
+    torch.cuda.reset_peak_memory_stats()
 
     # Late imports: keep this module importable when transformers is absent
     # for the rest of the EP / FSDP helpers.
@@ -204,20 +205,22 @@ def _load_checkpoint_hp(
     # form. Without these the rewritten key would no longer match the model's
     # current ``state_dict()`` (which now exposes ``_sink_holder.weight`` /
     # ``_position_bias_holder.weight`` instead).
-    renamings.extend([
-        WeightRenaming(
-            source_patterns=r"^(.*\.)?self_attn\.sinks$",
-            target_patterns=r"\1self_attn._sink_holder.weight",
-        ),
-        WeightRenaming(
-            source_patterns=r"^(.*\.)?self_attn\.compressor\.indexer\.position_bias$",
-            target_patterns=r"\1self_attn.compressor.indexer._position_bias_holder.weight",
-        ),
-        WeightRenaming(
-            source_patterns=r"^(.*\.)?self_attn\.compressor\.position_bias$",
-            target_patterns=r"\1self_attn.compressor._position_bias_holder.weight",
-        ),
-    ])
+    renamings.extend(
+        [
+            WeightRenaming(
+                source_patterns=r"^(.*\.)?self_attn\.sinks$",
+                target_patterns=r"\1self_attn._sink_holder.weight",
+            ),
+            WeightRenaming(
+                source_patterns=r"^(.*\.)?self_attn\.compressor\.indexer\.position_bias$",
+                target_patterns=r"\1self_attn.compressor.indexer._position_bias_holder.weight",
+            ),
+            WeightRenaming(
+                source_patterns=r"^(.*\.)?self_attn\.compressor\.position_bias$",
+                target_patterns=r"\1self_attn.compressor._position_bias_holder.weight",
+            ),
+        ]
+    )
 
     _t1 = _time.time()
     if rank == 0:
@@ -651,7 +654,8 @@ def _load_checkpoint_hp(
                 f"[load_checkpoint_hp]   wave {wave_idx + 1}/{len(waves)} {len(wave)} params "
                 f"({n_owned_rank0} owned by rank0, max param {(max_n_w * FP32_BYTES) >> 20} MiB "
                 f"in {max_chunks} chunk(s), {payload_bytes >> 20} MiB total payload): "
-                f"convert={_tw1 - _tw0:.2f}s allreduce+distribute={_tw2 - _tw1:.2f}s",
+                f"convert={_tw1 - _tw0:.2f}s allreduce+distribute={_tw2 - _tw1:.2f}s "
+                f"gpu_peak={torch.cuda.max_memory_allocated() / 1024**3:.2f} GiB",
                 flush=True,
             )
 
@@ -667,10 +671,12 @@ def _load_checkpoint_hp(
 
     _t3 = _time.time()
     if rank == 0:
+        _peak4 = torch.cuda.max_memory_allocated() / 1024**3
         print(
             f"[load_checkpoint_hp] phase 4 (parallel convert + all_reduce + EP slice + distribute): "
             f"{_t3 - _t2:.2f}s ({len(fqn_to_mapping)} tensors materialized; "
-            f"convert={_t_convert_total:.2f}s, all_reduce={_t_allreduce_total:.2f}s)",
+            f"convert={_t_convert_total:.2f}s, all_reduce={_t_allreduce_total:.2f}s, "
+            f"gpu_peak={_peak4:.2f} GiB)",
             flush=True,
         )
 
@@ -725,11 +731,13 @@ def _load_checkpoint_hp(
 
     _t5 = _time.time()
     if rank == 0:
+        _peak_total = torch.cuda.max_memory_allocated() / 1024**3
         print(
             f"[load_checkpoint_hp] phase 6 (materialize buffers): {_t5 - _t4:.2f}s\n"
-            f"[load_checkpoint_hp] TOTAL: {_t5 - _t0:.2f}s",
+            f"[load_checkpoint_hp] TOTAL: {_t5 - _t0:.2f}s, gpu_peak={_peak_total:.2f} GiB",
             flush=True,
         )
+    torch.cuda.reset_peak_memory_stats()
 
 
 def _discover_safetensor_shards(hf_path: str, ) -> tuple[dict[str, str], list[str]]:

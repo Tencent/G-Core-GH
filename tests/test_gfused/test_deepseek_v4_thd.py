@@ -28,12 +28,13 @@ from gpatch_v4.models.deepseek_v4.thd import (
 
 
 DEVICE = "cuda:0"
+SLIDING_WINDOW = 128
 
 
 def _config(compress_rates: dict[str, int] | None = None) -> SimpleNamespace:
     if compress_rates is None:
         compress_rates = {"compressed_sparse_attention": 4, "heavily_compressed_attention": 128}
-    return SimpleNamespace(compress_rates=compress_rates)
+    return SimpleNamespace(compress_rates=compress_rates, sliding_window=SLIDING_WINDOW)
 
 
 def _build_psp(seqlens: list[int], padded_seqlens: list[int]) -> PackedSeqParams:
@@ -210,6 +211,7 @@ class TestCpSliceLayout(unittest.TestCase):
         # q-side per-token fields: sliced to s_local (no prefix).
         self.assertEqual(sliced.seg_id_per_token.shape[0], 256)
         self.assertEqual(sliced.pad_token_mask.shape[0], 256)
+        self.assertEqual(sliced.seg_id_per_token_with_prefix.shape[0], 256)
         self.assertEqual(m4.causal_threshold_per_token.shape[0], 256)
         # k-side per-window fields stay global.
         self.assertEqual(m4.seg_id_per_wnd.shape[0], 512 // 4)
@@ -228,6 +230,10 @@ class TestCpSliceLayout(unittest.TestCase):
         # q-side per-token fields: sliced to s_local (no prefix).
         self.assertEqual(sliced.seg_id_per_token.shape[0], 256)
         self.assertEqual(m4.causal_threshold_per_token.shape[0], 256)
+        self.assertEqual(
+            sliced.seg_id_per_token_with_prefix.shape[0],
+            256 + (SLIDING_WINDOW - 1),
+        )
         # k-side per-window fields stay global.
         self.assertEqual(m4.seg_id_per_wnd.shape[0], 512 // 4)
         # with_prefix per-token / per-window meta: include the m-token prefix.
@@ -319,9 +325,8 @@ class TestCpSliceLayout(unittest.TestCase):
     def test_seg_id_per_token_full_stays_global(self):
         """``seg_id_per_token_full`` is **not** sliced by cp_slice_layout.
 
-        attention 的 CP path 切出 q-side ``[s_local]`` 与 k-side
-        ``[s_local + swa_prefix_len]``（swa_prefix_len = sliding_window-1，
-        与 compressor 的 m-prefix 不同），因此必须保留全局 ``[T]`` 副本。
+        ``seg_id_per_token_with_prefix`` carries the SWA kv-buffer view
+        (``l_swa_prefix = sliding_window - 1`` on rank > 0).
         """
         psp = _build_psp([200, 300], [256, 256])
         layout = make_packed_seq_layout(psp, _config())
@@ -330,10 +335,15 @@ class TestCpSliceLayout(unittest.TestCase):
         self.assertTrue(torch.equal(
             layout.seg_id_per_token_full, layout.seg_id_per_token,
         ))
+        self.assertTrue(torch.equal(
+            layout.seg_id_per_token_with_prefix, layout.seg_id_per_token,
+        ))
 
         # cp_slice_layout 后：seg_id_per_token 切到 [s_local]，但 _full 不切。
         for cp_rank in (0, 1):
-            sliced = cp_slice_layout(layout, cp_rank=cp_rank, cp_size=2, total_seqlen=512)
+            sliced = cp_slice_layout(
+                layout, cp_rank=cp_rank, cp_size=2, total_seqlen=512,
+            )
             self.assertEqual(sliced.seg_id_per_token.shape[0], 256)
             self.assertEqual(sliced.seg_id_per_token_full.shape[0], 512)
             self.assertTrue(torch.equal(
@@ -344,6 +354,12 @@ class TestCpSliceLayout(unittest.TestCase):
             self.assertTrue(torch.equal(
                 sliced.seg_id_per_token,
                 layout.seg_id_per_token_full[start : start + 256],
+            ))
+            l_swa_prefix = 0 if cp_rank == 0 else SLIDING_WINDOW - 1
+            self.assertEqual(sliced.seg_id_per_token_with_prefix.shape[0], 256 + l_swa_prefix)
+            self.assertTrue(torch.equal(
+                sliced.seg_id_per_token_with_prefix,
+                layout.seg_id_per_token_full[start - l_swa_prefix : start + 256],
             ))
 
 

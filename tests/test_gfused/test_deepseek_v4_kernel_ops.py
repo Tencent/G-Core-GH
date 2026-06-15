@@ -21,6 +21,7 @@ Usage::
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 from gpatch_v4.models.deepseek_v4.kernel.tilelang_indexer import v4_lighting_indexer
 from gpatch_v4.models.deepseek_v4.kernel.tilelang_indexer_fwd import (
@@ -41,11 +42,28 @@ def _worst_diff(actual: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
     return abs_d, rel_d
 
 
-class TestSparseAttnKernel(unittest.TestCase):
-    """sparse_attn_tilelang fwd / bwd 对照 fp32 参考。"""
+_SPARSE_ATTN_CASES = [
+    # (H, D, S, S_KV, TOPK, label)
+    # --- 原 miles 参数 ---
+    (512, 256, 128, 160, 132, "miles_S128"),
+    (512, 256, 1024, 1280, 132, "miles_S1024"),
+    (512, 256, 4096, 5120, 132, "miles_S4096"),
+    # --- DSV4-Flash 真实参数 (H=64, D=512) ---
+    (64, 512, 128, 128, 128, "dsv4_L0_cp0"),       # sliding-only, cp_rank=0
+    (64, 512, 128, 255, 128, "dsv4_L0_cp1"),        # sliding-only, cp_rank>0 (128+127 prefix)
+    (64, 512, 128, 192, 192, "dsv4_L2_cp0"),        # CSA layer cp_rank=0 (128 swa + 64 compressed)
+    (64, 512, 128, 319, 192, "dsv4_L2_cp1"),        # CSA layer cp_rank>0 (255 + 64)
+    # --- 长序列 ---
+    (64, 512, 2048, 2175, 192, "dsv4_S2048"),       # 2k seq
+    # --- topk 非 16 对齐 ---
+    (64, 512, 128, 200, 137, "dsv4_topk137"),       # topk=137, 需 pad 到 144
+]
 
-    # 形状：单 KV head MQA，head_dim=512（V4），topk 对齐 block_I=64
-    B, S, S_KV, H, D, TOPK = 1, 64, 128, 16, 512, 64
+
+class TestSparseAttnKernel(unittest.TestCase):
+    """sparse_attn_tilelang fwd / bwd 对照 fp32 参考，覆盖多种配置。"""
+
+    B = 1
 
     @classmethod
     def setUpClass(cls):
@@ -53,21 +71,19 @@ class TestSparseAttnKernel(unittest.TestCase):
             raise unittest.SkipTest("cuda is required")
         torch.cuda.set_device(0)
         cls.device = torch.device(DEVICE)
-        cls.sm_scale = cls.D**-0.5
 
-    def _make_inputs(self, seed: int):
-        """造 q / kv / sink / topk_idxs；topk_idxs 每行取不重复索引并随机插 -1。"""
+    def _make_inputs(self, H, D, S, S_KV, TOPK, seed: int):
+        self.H, self.D, self.TOPK = H, D, TOPK
         g = torch.Generator(device="cpu").manual_seed(seed)
-        q = torch.randn(self.B, self.S, self.H, self.D, generator=g)
-        kv = torch.randn(self.B, self.S_KV, self.D, generator=g)
+        q = torch.randn(self.B, S, self.H, self.D, generator=g)
+        kv = torch.randn(self.B, S_KV, self.D, generator=g)
         sink = torch.randn(self.H, generator=g)
 
-        idx = torch.empty(self.B, self.S, self.TOPK, dtype=torch.int32)
+        idx = torch.empty(self.B, S, self.TOPK, dtype=torch.int32)
         for b in range(self.B):
-            for s in range(self.S):
-                perm = torch.randperm(self.S_KV,
+            for s in range(S):
+                perm = torch.randperm(S_KV,
                                       generator=g)[:self.TOPK].to(torch.int32)
-                # 随机把约 10% 置 -1（无效 slot），但至少保留一个有效
                 drop = torch.rand(self.TOPK, generator=g) < 0.1
                 drop[0] = False
                 perm[drop] = -1
@@ -85,79 +101,87 @@ class TestSparseAttnKernel(unittest.TestCase):
         topk = idx.shape[-1]
         out = torch.zeros(B, S, H, D, dtype=torch.float32, device=q.device)
         for b in range(B):
-            safe = idx[b].clamp(min=0).long()  # [S, topk]
-            valid = idx[b] >= 0  # [S, topk]
-            k_g = kv[b][safe]  # [S, topk, D]
+            safe = idx[b].clamp(min=0).long()
+            valid = idx[b] >= 0
+            k_g = kv[b][safe]
             scores = torch.einsum(
                 "shd,std->sht", q[b], k_g
-            ) * sm_scale  # [S, H, topk]
+            ) * sm_scale
             scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
             sink_col = sink.view(1, H, 1).expand(S, H, 1)
-            logits = torch.cat([scores, sink_col], dim=-1)  # [S, H, topk+1]
-            probs = torch.softmax(logits, dim=-1)[..., :-1]  # 丢 sink 列
+            logits = torch.cat([scores, sink_col], dim=-1)
+            probs = torch.softmax(logits, dim=-1)[..., :-1]
             out[b] = torch.einsum("sht,std->shd", probs, k_g)
         return out
 
     def test_forward(self):
-        q, kv, sink, idx = self._make_inputs(seed=0)
-        dev = self.device
+        for H, D, S, S_KV, TOPK, label in _SPARSE_ATTN_CASES:
+            with self.subTest(label=label):
+                q, kv, sink, idx = self._make_inputs(H, D, S, S_KV, TOPK, seed=0)
+                dev = self.device
+                sm_scale = D**-0.5
 
-        ref = self._ref_forward(
-            q.to(dev).float(),
-            kv.to(dev).float(),
-            sink.to(dev).float(),
-            idx.to(dev),
-            self.sm_scale,
-        )
-        out = sparse_attn_tilelang(
-            q.to(dev, torch.bfloat16).contiguous(),
-            kv.to(dev, torch.bfloat16).contiguous(),
-            sink.to(dev, torch.float32).contiguous(),
-            idx.to(dev).contiguous(),
-            self.sm_scale,
-        )
-        abs_d, rel_d = _worst_diff(out, ref)
-        print(f"[sparse_attn:fwd] max_abs={abs_d:.3e} rel={rel_d:.3e}")
-        self.assertTrue(
-            rel_d <= 2e-2 or abs_d <= 2e-2,
-            f"fwd mismatch abs={abs_d:.3e} rel={rel_d:.3e}"
-        )
+                ref = self._ref_forward(
+                    q.to(dev).float(),
+                    kv.to(dev).float(),
+                    sink.to(dev).float(),
+                    idx.to(dev),
+                    sm_scale,
+                )
+                out = sparse_attn_tilelang(
+                    q.to(dev, torch.bfloat16).contiguous(),
+                    kv.to(dev, torch.bfloat16).contiguous(),
+                    sink.to(dev, torch.float32).contiguous(),
+                    idx.to(dev).contiguous(),
+                    sm_scale,
+                )
+                abs_d, rel_d = _worst_diff(out, ref)
+                print(f"[sparse_attn:fwd {label}] max_abs={abs_d:.3e} rel={rel_d:.3e}")
+                self.assertTrue(
+                    rel_d <= 2e-2 or abs_d <= 2e-2,
+                    f"fwd mismatch {label} abs={abs_d:.3e} rel={rel_d:.3e}"
+                )
+                del q, kv, sink, idx, ref, out
+                torch.cuda.empty_cache()
 
     def test_backward(self):
-        q, kv, sink, idx = self._make_inputs(seed=1)
-        dev = self.device
-        idx = idx.to(dev).contiguous()
+        for H, D, S, S_KV, TOPK, label in _SPARSE_ATTN_CASES:
+            with self.subTest(label=label):
+                q, kv, sink, idx = self._make_inputs(H, D, S, S_KV, TOPK, seed=1)
+                dev = self.device
+                sm_scale = D**-0.5
+                idx = idx.to(dev).contiguous()
 
-        g = torch.Generator(device="cpu").manual_seed(99)
-        do = torch.randn(self.B, self.S, self.H, self.D, generator=g).to(dev)
+                g = torch.Generator(device="cpu").manual_seed(99)
+                do = torch.randn(self.B, S, H, D, generator=g).to(dev)
 
-        # 参考路径（fp32 leaf）
-        q_r = q.to(dev).float().requires_grad_(True)
-        kv_r = kv.to(dev).float().requires_grad_(True)
-        sink_r = sink.to(dev).float().requires_grad_(True)
-        out_r = self._ref_forward(q_r, kv_r, sink_r, idx, self.sm_scale)
-        (out_r * do).sum().backward()
+                q_r = q.to(dev).float().requires_grad_(True)
+                kv_r = kv.to(dev).float().requires_grad_(True)
+                sink_r = sink.to(dev).float().requires_grad_(True)
+                out_r = self._ref_forward(q_r, kv_r, sink_r, idx, sm_scale)
+                (out_r * do).sum().backward()
 
-        # kernel 路径（bf16 leaf，与参考同值）
-        q_k = q.to(dev, torch.bfloat16).contiguous().requires_grad_(True)
-        kv_k = kv.to(dev, torch.bfloat16).contiguous().requires_grad_(True)
-        sink_k = sink.to(dev, torch.float32).contiguous().requires_grad_(True)
-        out_k = sparse_attn_tilelang(q_k, kv_k, sink_k, idx, self.sm_scale)
-        (out_k * do.to(torch.bfloat16)).sum().backward()
+                q_k = q.to(dev, torch.bfloat16).contiguous().requires_grad_(True)
+                kv_k = kv.to(dev, torch.bfloat16).contiguous().requires_grad_(True)
+                sink_k = sink.to(dev, torch.float32).contiguous().requires_grad_(True)
+                out_k = sparse_attn_tilelang(q_k, kv_k, sink_k, idx, sm_scale)
+                (out_k * do.to(torch.bfloat16)).sum().backward()
 
-        for name, gk, gr, rtol in [
-            ("dq", q_k.grad, q_r.grad, 5e-2),
-            ("dkv", kv_k.grad, kv_r.grad, 5e-2),
-            ("dsink", sink_k.grad, sink_r.grad, 5e-2),
-        ]:
-            abs_d, rel_d = _worst_diff(gk, gr)
-            print(
-                f"[sparse_attn:bwd:{name}] max_abs={abs_d:.3e} rel={rel_d:.3e}"
-            )
-            self.assertTrue(
-                rel_d <= rtol or abs_d <= rtol,
-                f"{name} mismatch abs={abs_d:.3e} rel={rel_d:.3e} (rtol={rtol})",
-            )
+                for name, gk, gr, rtol in [
+                    ("dq", q_k.grad, q_r.grad, 5e-2),
+                    ("dkv", kv_k.grad, kv_r.grad, 5e-2),
+                    ("dsink", sink_k.grad, sink_r.grad, 5e-2),
+                ]:
+                    abs_d, rel_d = _worst_diff(gk, gr)
+                    print(
+                        f"[sparse_attn:bwd:{name} {label}] max_abs={abs_d:.3e} rel={rel_d:.3e}"
+                    )
+                    self.assertTrue(
+                        rel_d <= rtol or abs_d <= rtol,
+                        f"{name} mismatch {label} abs={abs_d:.3e} rel={rel_d:.3e} (rtol={rtol})",
+                    )
+                del q, kv, sink, idx, do, q_r, kv_r, sink_r, out_r, q_k, kv_k, sink_k, out_k
+                torch.cuda.empty_cache()
 
 
 class TestIndexerKernel(unittest.TestCase):
@@ -182,21 +206,27 @@ class TestIndexerKernel(unittest.TestCase):
         return index_q, index_k, weights
 
     def _ref_logits(self, index_q, index_k, weights):
-        """fp32 参考：logits[b,s,kv] = Σ_h relu(q·k) * w；causal: kv < (s+1)//ratio。"""
-        qf = index_q.float()  # [Sq, B, H, dim]
-        kf = index_k.float()  # [Skv, B, dim]
-        dot = torch.einsum("sbhd,kbd->sbhk", qf, kf)  # [Sq, B, H, Skv]
-        relu = dot.clamp(min=0)
-        logits = torch.einsum(
-            "sbhk,sbh->bsk", relu, weights.float()
-        )  # [B, Sq, Skv]
-        # causal mask（与 _make_causal_cu_seqlens 一致：ke=(s+1)//ratio，capped Skv）
-        s_pos = torch.arange(self.SQ, device=logits.device)
-        ke = ((s_pos + 1) // self.RATIO).clamp(max=self.SKV)  # [Sq]
-        kv_pos = torch.arange(self.SKV, device=logits.device)
-        invalid = kv_pos[None, :] >= ke[:, None]  # [Sq, Skv]
-        logits = logits.masked_fill(invalid[None], float("-inf"))
-        return logits, invalid
+        """fp32 参考，直接对应 modeling_deepseek_v4.py index scoring 逻辑。"""
+        # 测试输入 S-first → 模型代码 B-first
+        q = index_q.float().permute(1, 0, 2, 3)         # [B, Sq, H, dim]
+        compressed_kv = index_k.float().transpose(0, 1)  # [B, Skv, dim]
+        w = weights.float().permute(1, 0, 2)             # [B, Sq, H]
+
+        # --- 直接对应 modeling_deepseek_v4.py L397-L416 ---
+        softmax_scale = self.DIM ** -0.5
+        scores = torch.matmul(q, compressed_kv.transpose(-1, -2).unsqueeze(1))  # [B, S, H, T]
+        scores = F.relu(scores) * softmax_scale
+        index_scores = (scores * w.unsqueeze(-1)).sum(dim=2)  # [B, S, T]
+
+        compressed_len = compressed_kv.shape[1]
+        position_ids = torch.arange(self.SQ, device=q.device).unsqueeze(0)
+        causal_threshold = (position_ids + 1) // self.RATIO  # [1, Sq]
+        entry_indices = torch.arange(compressed_len, device=q.device)
+        future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)  # [1, Sq, T]
+        index_scores = index_scores.masked_fill(future_mask, float("-inf"))
+
+        invalid = future_mask.squeeze(0)  # [Sq, Skv]
+        return index_scores, invalid
 
     def test_forward_logits(self):
         index_q, index_k, weights = self._make_inputs(seed=0)
@@ -215,6 +245,7 @@ class TestIndexerKernel(unittest.TestCase):
             cu_ks,
             cu_ke,
         )  # [B, Sq, Skv]
+
         # batched_indexer_fwd 不 clean 无效区，只比 causal 有效区
         finite = (~invalid[None]).expand_as(logits)
         abs_d, rel_d = _worst_diff(logits[finite], ref[finite])

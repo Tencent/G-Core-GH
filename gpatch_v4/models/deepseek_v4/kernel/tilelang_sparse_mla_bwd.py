@@ -12,8 +12,6 @@ from tilelang import language as T
 
 @tilelang.jit(out_idx=[-1])
 def preprocess(
-    B,
-    S,
     H,
     D,
     block_ND=32,
@@ -23,6 +21,9 @@ def preprocess(
 ):
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
+
+    B = T.dynamic("B")
+    S = T.dynamic("S")
     shape = [B, S, H, D]
 
     @T.prim_func
@@ -55,8 +56,6 @@ def preprocess(
 
 @tilelang.jit(out_idx=[-1])
 def postprocess(
-    B,
-    S_kv,
     D,
     block_N=64,
     threads=128,
@@ -65,6 +64,9 @@ def postprocess(
 ):
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
+
+    B = T.dynamic("B")
+    S_kv = T.dynamic("S_kv")
     dkv_shape = [B, S_kv, D]
 
     @T.prim_func
@@ -90,15 +92,12 @@ def postprocess(
     },
 )
 def bwd(
-    B,
-    S,
-    S_kv,
     H,
     D,
     topk,
     sm_scale=None,
     block_size=32,
-    num_stages=0,
+    num_stages=1,  # num_stages=0 produces NaN when NS>=2; likely shared memory race in pipelining.
     threads=128,
     indices_dtype=T.int32,
     dtype=T.bfloat16,
@@ -111,6 +110,10 @@ def bwd(
     if sm_scale is None:
         sm_scale = D**(-0.5)
     sm_scale_mul_reciprocal_log2 = sm_scale * 1.44269504  # log2(e)
+
+    B = T.dynamic("B")
+    S = T.dynamic("S")
+    S_kv = T.dynamic("S_kv")
 
     q_shape = [B, S, H, D]
     kv_shape = [B, S_kv, D]
@@ -278,12 +281,15 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     """
     assert q.is_contiguous() and kv.is_contiguous()
     assert topk_idxs.is_contiguous() and lse.is_contiguous()
+    assert attn_sink.dtype == torch.float32, f"attn_sink must be fp32, got {attn_sink.dtype}"
+    assert topk_idxs.dtype == torch.int32, f"topk_idxs must be int32, got {topk_idxs.dtype}"
+    assert o.is_contiguous(), f"o must be contiguous, strides={o.stride()}"
+    assert do.is_contiguous(), f"do must be contiguous, strides={do.stride()}"
     B, S, H, D = q.shape
     _, S_kv, _ = kv.shape
     topk = topk_idxs.shape[-1]
 
-    # Pad topk to next multiple of block_size (kernel requires divisibility)
-    block_size = 32
+    block_size = 16
     padded_topk = (topk + block_size - 1) // block_size * block_size
     if padded_topk != topk:
         pad = torch.full(
@@ -292,12 +298,12 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
         topk = padded_topk
 
-    preprocess_kernel = preprocess(B, S, H, D)
-    bwd_kernel = bwd(B, S, S_kv, H, D, topk, sm_scale)
-    postprocess_kernel = postprocess(B, S_kv, D)
+    preprocess_kernel = preprocess(H, D, num_stages=2)
+    bwd_kernel = bwd(H, D, topk, sm_scale, block_size=block_size)
+    postprocess_kernel = postprocess(D)
 
     delta = preprocess_kernel(o, do)
-    dkv = torch.zeros_like(kv, dtype=torch.float32)
+    dkv = torch.zeros(B, S_kv, D, device=kv.device, dtype=torch.float32)
     d_attn_sink = torch.zeros_like(attn_sink)
     dq = bwd_kernel(q, kv, do, attn_sink, topk_idxs, lse, delta, dkv, d_attn_sink)
     dkv = postprocess_kernel(dkv)

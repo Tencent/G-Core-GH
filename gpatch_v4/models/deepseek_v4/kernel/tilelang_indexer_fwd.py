@@ -22,6 +22,7 @@ def tl_indexer_fwd_impl(
 ):
     if block_Q is None:
         block_Q = 128 // heads
+    softmax_scale = index_dim**-0.5
     dtype = T.bfloat16
     accum_dtype = T.float32
     index_dtype = T.int32
@@ -81,8 +82,9 @@ def tl_indexer_fwd_impl(
                 )
 
                 for bn_i, bq_i, h_i in T.Parallel(block_N, block_Q, heads):
-                    s_reshaped[bn_i, bq_i,
-                               h_i] = T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]
+                    s_reshaped[bn_i, bq_i, h_i] = (
+                        T.max(s_reshaped[bn_i, bq_i, h_i], 0) * softmax_scale * weights[bq_i, h_i]
+                    )
 
                 T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
 
@@ -124,12 +126,19 @@ def clean_logits_(
     return clean_logits_kernel
 
 
-def _make_causal_cu_seqlens(seq_len_q, seq_len_kv, compress_ratio, device):
+def _make_causal_cu_seqlens(seq_len_q, seq_len_kv, compress_ratio, device, *, positions=None):
     """Generate cu_seqlens for causal masking on compressed KV positions.
 
     For query at position p, valid compressed groups are [0, (p+1) // compress_ratio).
+
+    Parameters
+    ----------
+    positions : Tensor, optional
+        Shape ``[seq_len_q]`` int32. Actual query positions (e.g. CP-offset).
+        Defaults to ``arange(seq_len_q)`` when ``None``.
     """
-    positions = torch.arange(seq_len_q, device=device, dtype=torch.int32)
+    if positions is None:
+        positions = torch.arange(seq_len_q, device=device, dtype=torch.int32)
     cu_seqlen_ks = torch.zeros(seq_len_q, device=device, dtype=torch.int32)
     cu_seqlen_ke = ((positions + 1) // compress_ratio).to(torch.int32)
     return cu_seqlen_ks, cu_seqlen_ke

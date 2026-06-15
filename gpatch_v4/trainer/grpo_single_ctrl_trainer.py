@@ -217,10 +217,10 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
         ret_metrics = []
 
         while train_step < total_ppo_step:
-            # Collect + train the current step.  ``collect_rollout_step``
-            # pulls ``num_microbatches`` items from the first-finished queue;
-            # they may come from different original ``ppo_step`` labels, but
-            # the controller assigns ``train_step`` as the consumption step.
+            # Collect + train the current step.  By default
+            # ``collect_rollout_step`` pulls from the first-finished queue;
+            # with ``rollout_ordered_collection`` it waits for the original
+            # ``train_step`` rollout and preserves microbatch order.
             if debug_skip_rollout:
                 dp_refs = None
                 t_collect_done = time.monotonic()

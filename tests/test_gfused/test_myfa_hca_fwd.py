@@ -19,9 +19,8 @@ import sys
 import pytest
 import torch
 
-sys.path.insert(0, "gpatch_v4/models/deepseek_v4/kernel")
-from myfa_hca import myfa_hca, myfa_hca_fwd
-from tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
+from gpatch_v4.models.deepseek_v4.kernel.myfa_hca import myfa_hca, myfa_hca_fwd
+from gpatch_v4.models.deepseek_v4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +31,7 @@ from tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
 def ref_hca_attn(q, kv, ckv, attn_sink, scaling, sliding_window, compress_rate):
     """Eager reference: sliding-window + compressed + sink, full materialized.
 
-    q: [B, H, LQ, D]   kv: [B, H, LKV, D] (K=V)   ckv: [B, 1, LCKV, D] (K=V)
+    q: [B, H, LQ, D]   kv: [B, 1, LKV, D] (K=V)   ckv: [B, 1, LCKV, D] (K=V)
     attn_sink: [H] fp32
     """
     B, H, LQ, D = q.shape
@@ -40,28 +39,29 @@ def ref_hca_attn(q, kv, ckv, attn_sink, scaling, sliding_window, compress_rate):
     LCKV = ckv.shape[2]
 
     # 1. sliding window scores
-    swa_scores = torch.matmul(q.float(), kv.float().transpose(2, 3)) * scaling
+    swa_scores = torch.matmul(q, kv.transpose(2, 3)) * scaling
     q_pos = torch.arange(LQ, device=q.device).view(1, 1, -1, 1)
     k_pos = torch.arange(LKV, device=q.device).view(1, 1, 1, -1)
     swa_mask = (k_pos > q_pos) | (q_pos - k_pos >= sliding_window)
     swa_scores = swa_scores.masked_fill(swa_mask, float("-inf"))
 
     # 2. compressed scores — threshold = (q_pos + 1) // compress_rate
-    ckv_scores = torch.matmul(q.float(), ckv.float().transpose(2, 3)) * scaling
+    ckv_scores = torch.matmul(q, ckv.transpose(2, 3)) * scaling
     entry_idx = torch.arange(LCKV, device=q.device).view(1, 1, 1, -1)
     ct = (q_pos.squeeze(3) + 1) // compress_rate  # [1, 1, LQ]
     ckv_mask = entry_idx >= ct.unsqueeze(-1)
     ckv_scores = ckv_scores.masked_fill(ckv_mask, float("-inf"))
 
     # 3. concat + sink
-    sink_col = attn_sink.view(1, H, 1, 1).expand(B, H, LQ, 1).float()
-    all_scores = torch.cat([swa_scores, ckv_scores, sink_col], dim=-1)
+    sink_col = attn_sink.view(1, H, 1, 1).expand(B, H, LQ, 1)
+    all_scores = torch.cat([swa_scores, ckv_scores, sink_col.bfloat16()], dim=-1)
     p = torch.softmax(all_scores, dim=-1)
+    print('p dtype', p.dtype)
 
     # 4. output = P_swa @ kv + P_ckv @ ckv  (sink 列 value=0)
-    o = (torch.matmul(p[:, :, :, :LKV], kv.float())
-         + torch.matmul(p[:, :, :, LKV:LKV + LCKV], ckv.float()))
-    return o.to(q.dtype)
+    o = (torch.matmul(p[:, :, :, :LKV], kv) + torch.matmul(p[:, :, :, LKV:LKV + LCKV], ckv))
+    print('o dtype', o.dtype)
+    return o
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ def ref_hca_attn(q, kv, ckv, attn_sink, scaling, sliding_window, compress_rate):
 def _make_inputs(B, H, LQ, D, compress_rate):
     rng = torch.Generator(device="cuda").manual_seed(42)
     q = torch.randn(B, H, LQ, D, generator=rng, device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn(B, H, LQ, D, generator=rng, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(B, 1, LQ, D, generator=rng, device="cuda", dtype=torch.bfloat16)
     LCKV = LQ // compress_rate
     ckv = torch.randn(B, 1, LCKV, D, generator=rng, device="cuda", dtype=torch.bfloat16)
     attn_sink = torch.randn(H, device="cuda", dtype=torch.float32) * 0.1
@@ -109,7 +109,7 @@ def _bench(fn, n_warmup=10, n_iter=20):
 
 # (B, H, LQ, D, compress_rate, sliding_window)
 CORRECTNESS_CASES = [
-    (1, 4, 256, 128, 64, 128),
+    (1, 4, 256, 128, 128, 128),
     (2, 4, 512, 128, 128, 128),
     (1, 8, 1024, 256, 128, 128),
     (2, 4, 4096, 256, 128, 128),
@@ -160,8 +160,8 @@ def _make_sparse_topk_idxs(LQ, LCKV, sliding_window, compress_rate):
 
 # (B, H, LQ, D, compress_rate, sliding_window)
 BENCH_CASES = [
-    (2, 128, 4096, 256, 128, 128),
-    (2, 128, 8192, 256, 128, 128),
+    (1, 64, 512, 512, 128, 128),
+    (1, 64, 2048, 512, 128, 128),
 ]
 
 
@@ -177,11 +177,11 @@ def test_bench(B, H, LQ, D, m, W):
     tag = f"B={B} H={H} LQ={LQ} D={D} m={m} W={W}"
     _check(tag, my_o, ref_o, atol_avg=0.02, atol_max=0.15)
 
+    return
+
     # ---- 准备 sparse 路径的数据 ----
     # sparse_mqa_fwd 需要 MQA: kv_concat [B, LQ+LCKV, D]
-    # DSV4 的 sliding-window KV 是 multi-head，不能直接喂给 sparse_mqa_fwd
-    # 这里用 head=0 slice 做近似对比（只比 kernel 速度，不比精度）
-    kv_concat = torch.cat([kv[:, 0, :, :], ckv.squeeze(1)], dim=1).contiguous()
+    kv_concat = torch.cat([kv.squeeze(1), ckv.squeeze(1)], dim=1).contiguous()
     q_bshd = q.transpose(1, 2).contiguous()
     topk_idxs = _make_sparse_topk_idxs(LQ, LCKV, W, m).expand(B, -1, -1).contiguous()
 

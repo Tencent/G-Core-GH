@@ -546,10 +546,18 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         }
         vision_data_last_dim = None
         for i, batch in enumerate(gbs_batches):
-            if vision_data_last_dim is None and "vision_data" in batch:
-                vision_data_last_dim = batch["vision_data"].shape[-1]
+            if batch.get("vision_data") is not None:
+                assert batch.get("vision_grid_thw") is not None
                 assert dtype_map["vision_data"] == batch["vision_data"].dtype
                 assert dtype_map["vision_grid_thw"] == batch["vision_grid_thw"].dtype
+                if batch["vision_data"].numel() > 0:
+                    if vision_data_last_dim is None:
+                        vision_data_last_dim = batch["vision_data"].shape[-1]
+                    else:
+                        assert vision_data_last_dim == batch["vision_data"].shape[-1], (
+                            f"inconsistent vision_data last dim across samples: "
+                            f"{vision_data_last_dim=} != {batch['vision_data'].shape[-1]=}"
+                        )
 
             tokens = batch["tokens"]
             labels = batch["labels"]
@@ -586,7 +594,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         if scheduler_type == "smart_padding":
             assert len(gbs_batches) % cp_size == 0, (
-                f"gbs/dp_size ({len(gbs_batches)}) must be divisible by config_cp_size ({config_cp_size}). "
+                f"gbs/dp_size ({len(gbs_batches)}) must be divisible by config_cp_size ({cp_size}). "
                 f"Adjust gbs or context_parallel_size."
             )
             new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum = (
@@ -635,7 +643,19 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             for k in sample.keys():
                 if sample[k] is None:
                     continue
-                if k in ["vision_data"] and vision_data_last_dim is not None:
+                if k in ["vision_data"]:
+                    if sample[k].numel() == 0:
+                        continue
+                    # dynamic-cp 交换数据后，不是所有 rank 的 vision_data_last_dim 都有值
+                    if vision_data_last_dim is None:
+                        vision_grid_thw = sample["vision_grid_thw"].reshape(-1, 3)
+                        vision_rows = vision_grid_thw.prod(dim=1).sum().item()
+                        assert vision_rows > 0, f"{vision_grid_thw=}"
+                        assert sample[k].numel() % vision_rows == 0, (
+                            f"invalid vision_data/grid_thw shape: {sample[k].shape=}, "
+                            f"{vision_grid_thw=}"
+                        )
+                        vision_data_last_dim = sample[k].numel() // vision_rows
                     sample[k] = sample[k].reshape(-1, vision_data_last_dim)
                 elif k in ["vision_grid_thw"]:
                     sample[k] = sample[k].reshape(-1, 3)
@@ -733,6 +753,9 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             cp_img_num=None,
             packed_seq_params=packed_seq_params,
         )
+
+        # Store cp_group in batch so the loss function can use it for CP reduction.
+        batch["cp_group"] = cp_group
 
         return batch, fwd_kwargs
 

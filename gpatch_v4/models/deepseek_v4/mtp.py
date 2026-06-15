@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from transformers.modeling_layers import GradientCheckpointingLayer
 
 from .modeling_deepseek_v4 import (
     DeepseekV4Attention,
@@ -122,7 +123,7 @@ class DeepseekV4MTPConfig:
         return self.num_layers > 0
 
 
-class DeepseekV4MTPBlock(nn.Module):
+class DeepseekV4MTPBlock(GradientCheckpointingLayer):
     """One MTP depth for DeepSeek-V4."""
     def __init__(self, config, layer_idx: int, rotary_emb):
         super().__init__()
@@ -259,7 +260,7 @@ class DeepseekV4MTPModule(nn.Module):
             )
             embed_input = embed_fn(cur_input_ids)
             hidden_states, prediction_hidden = block(
-                hidden_states=hidden_states,
+                hidden_states,
                 embed_input=embed_input,
                 input_ids=cur_input_ids,
                 position_ids=position_ids,

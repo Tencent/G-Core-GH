@@ -16,6 +16,7 @@ from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross
 from gpatch_v4.configs.config import OnPolicyDistillConfig
 from gpatch_v4.core.correction_helper import compute_off_policy_correction_weights
 from gpatch_v4.core.mappings import all_gather_from_context_parallel_region
+from gpatch_v4.kernel import linear_cross_entropy, set_linear_ce_backend
 from gpatch_v4.training_backend.vocab_parallel_entropy import vocab_parallel_entropy
 from gpatch_v4.utils import (
     all_reduce_autograd,
@@ -112,6 +113,14 @@ class FinetuneLossInput:
     batch: Dict[str, torch.Tensor]
     unwrapped_model: Optional[torch.nn.Module] = None
     skip_cp_loss_reduce: bool = False
+    """Dict from ``_postprocess`` when linear CE is enabled.
+    Expected keys: ``hidden_states``, ``weight``, ``runtime_gather_output``.
+    Used by ``linear_ce`` loss to compute fused linear+CE."""
+    linear_ce_input: Optional[Dict[str, Any]] = None
+    """Context-parallel process group for loss reduction.
+    When not None, this group is used instead of ``mpu.get_context_parallel_group()``.
+    Set by the dynamic-CP path to the per-microbatch dynamic CP subgroup."""
+    cp_group: Optional[Any] = None
 
 
 def register_loss(name: str):
@@ -256,9 +265,7 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
     bwd_loss = loss.clone()
 
     global_retention_ratio = loss_input.global_retention_ratio
-    if hasattr(config, "debug") and getattr(
-        config.debug, "ignore_global_retention_ratio", False
-    ):
+    if hasattr(config, "debug") and getattr(config.debug, "ignore_global_retention_ratio", False):
         # DEBUG: skip the 1/global_retention_ratio compensation for grad-scaling experiments.
         global_retention_ratio = None
     if global_retention_ratio is not None:
@@ -300,9 +307,7 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
 
     if global_retention_ratio is not None:
         grr_scalar = global_retention_ratio.flatten()[0].clamp(min=1e-6)
-        metrics["loss_dead_aware"] = torch.stack(
-            [loss.detach() / grr_scalar * numel, numel]
-        )
+        metrics["loss_dead_aware"] = torch.stack([loss.detach() / grr_scalar * numel, numel])
         metrics["policy_loss_dead_aware"] = torch.stack(
             [actor_loss.detach() / grr_scalar * numel, numel]
         )
@@ -613,9 +618,7 @@ def gspo_loss_func(config, loss_input: PolicyLossInput):
     bwd_loss = loss.clone()
 
     global_retention_ratio = loss_input.global_retention_ratio
-    if hasattr(config, "debug") and getattr(
-        config.debug, "ignore_global_retention_ratio", False
-    ):
+    if hasattr(config, "debug") and getattr(config.debug, "ignore_global_retention_ratio", False):
         # DEBUG: skip the 1/global_retention_ratio compensation for grad-scaling experiments.
         global_retention_ratio = None
     if global_retention_ratio is not None:
@@ -687,9 +690,7 @@ def gspo_loss_func(config, loss_input: PolicyLossInput):
     if global_retention_ratio is not None:
         grr_scalar = global_retention_ratio.flatten()[0].clamp(min=1e-6)
         metrics["loss_dead_aware"] = torch.stack([loss.detach() / grr_scalar, ones])
-        metrics["policy_loss_dead_aware"] = torch.stack(
-            [actor_loss.detach() / grr_scalar, ones]
-        )
+        metrics["policy_loss_dead_aware"] = torch.stack([actor_loss.detach() / grr_scalar, ones])
     reduce_metrics_across_data_parallel_group(metrics)
 
     if loss_input.should_dump_metrics:
@@ -975,6 +976,7 @@ def ce_loss(
     kl_alpha_mask: torch.Tensor = None,
     return_src_loss: bool = False,
     skip_cp_reduce: bool = False,
+    cp_group=None,
 ):
     labels = labels.transpose(0, 1).contiguous()
     logits = logits.transpose(0, 1).clone(memory_format=torch.contiguous_format)
@@ -1015,10 +1017,9 @@ def ce_loss(
     # When calculate_per_token_loss=True the pipeline schedule + finalize_model_grads
     # handle CP gradient aggregation.  Skipping the AVG here keeps each CP rank's
     # local loss_sum/tokens so finalize_model_grads produces correctly scaled gradients.
-    if not skip_cp_reduce and dist.get_world_size(mpu.get_context_parallel_group()) > 1:
-        torch.distributed.all_reduce(
-            loss, group=mpu.get_context_parallel_group(), op=torch.distributed.ReduceOp.AVG
-        )
+    _cp_group = cp_group if cp_group is not None else mpu.get_context_parallel_group()
+    if not skip_cp_reduce and dist.get_world_size(_cp_group) > 1:
+        torch.distributed.all_reduce(loss, group=_cp_group, op=torch.distributed.ReduceOp.AVG)
     return loss
 
 
@@ -1036,19 +1037,30 @@ def cross_entroy_loss_func(
     Returns:
         Tensor: ``[B, S]``.
     """
-    logits = loss_input.logits.float()
     batch = loss_input.batch
-    # [b s] => [s b]
     labels = batch["labels"]
     loss_mask = batch["loss_mask"]
 
-    loss = ce_loss(
-        config,
-        logits,
-        labels,
-        loss_mask,
-        skip_cp_reduce=loss_input.skip_cp_loss_reduce,
-    )
+    if loss_input.linear_ce_input is not None:
+        assert config.training.use_linear_ce
+        loss = linear_ce_loss(
+            config,
+            loss_input.linear_ce_input,
+            labels,
+            loss_mask,
+            skip_cp_reduce=loss_input.skip_cp_loss_reduce,
+            cp_group=loss_input.cp_group,
+        )
+    else:
+        logits = loss_input.logits.float()
+        loss = ce_loss(
+            config,
+            logits,
+            labels,
+            loss_mask,
+            skip_cp_reduce=loss_input.skip_cp_loss_reduce,
+            cp_group=loss_input.cp_group,
+        )
     #TODO: check loss nan or not
 
     local_num_tokens = loss[1].clone().detach().to(torch.int)
@@ -1057,6 +1069,7 @@ def cross_entroy_loss_func(
 
     # dump metrics
     if batch.get("should_dump_metrics", False):
+        assert not config.training.use_linear_ce, "暂不支持，因为没有 logits"
         metrics.update({"mask": batch["full_loss_mask"].detach().bool().to(device="cpu")})
 
         if config.training.dump_metrics_logprobs_topk > 0:
@@ -1077,6 +1090,71 @@ def cross_entroy_loss_func(
             )
 
     return (loss[0].clone(), local_num_tokens, metrics)
+
+
+def linear_ce_loss(
+    config,
+    linear_ce_input: Dict[str, torch.Tensor],
+    labels: torch.Tensor,
+    loss_mask: torch.Tensor,
+    kl_alpha_mask: torch.Tensor = None,
+    return_src_loss: bool = False,
+    skip_cp_reduce: bool = False,
+    cp_group=None,
+):
+    """Compute linear (fused) cross-entropy loss from hidden states.
+
+    Returns:
+        If ``return_src_loss``: per-token loss ``[b, s]``.
+        Otherwise: ``torch.Tensor`` ``[loss_sum, total_tokens]``.
+    """
+    set_linear_ce_backend(config.training.linear_ce_backend)
+    # [b s] => [s b]
+    labels = labels.transpose(0, 1).contiguous()
+
+    hidden_states = linear_ce_input["hidden_states"]
+    if linear_ce_input['output_layer'].sequence_parallel:
+        hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+            hidden_states,
+            tensor_parallel_output_grad=True,
+        )
+    weight = linear_ce_input["weight"]
+    if weight is None:
+        # 不 shared embedding 时会走到这个分支
+        weight = linear_ce_input["output_layer"].weight
+    loss = linear_cross_entropy(
+        hidden_states,
+        weight,
+        labels,
+        1.0,
+        "none",
+        linear_ce_input['output_layer'].tp_group,
+    )
+
+    # [s b] => [b, s]
+    loss = loss.transpose(0, 1).contiguous()
+    if return_src_loss:
+        return loss
+
+    if kl_alpha_mask is not None:
+        ce_weight = (1 - kl_alpha_mask).view(-1, 1).float()
+        loss = loss * ce_weight
+        loss_mask = loss_mask * (ce_weight != 0)
+
+    losses = loss.view(-1).float()
+    loss_mask = loss_mask.view(-1).float()
+    loss = torch.sum(losses * loss_mask)
+
+    total_tokens = loss_mask.sum()
+    loss = torch.cat([loss.view(1), total_tokens.view(1)])
+
+    # When calculate_per_token_loss=True the pipeline schedule + finalize_model_grads
+    # handle CP gradient aggregation.  Skipping the AVG here keeps each CP rank's
+    # local loss_sum/tokens so finalize_model_grads produces correctly scaled gradients.
+    _cp_group = cp_group if cp_group is not None else mpu.get_context_parallel_group()
+    if not skip_cp_reduce and dist.get_world_size(_cp_group) > 1:
+        torch.distributed.all_reduce(loss, group=_cp_group, op=torch.distributed.ReduceOp.AVG)
+    return loss
 
 
 def logits_kl_loss(
@@ -1345,9 +1423,7 @@ def square_averaging_cross_entroy_loss_func(
     Returns:
         Tensor: ``[B, S]``.
     """
-    logits = loss_input.logits.float()
     batch = loss_input.batch
-    # [b s] => [s b]
     labels = batch["labels"]
     loss_mask = batch["loss_mask"]
     # shape = [b,] 都是一样的
@@ -1355,10 +1431,22 @@ def square_averaging_cross_entroy_loss_func(
     assert square_averaging_weights is not None
     assert square_averaging_weights.requires_grad is False
 
-    losses = ce_loss(config, logits, labels, loss_mask, return_src_loss=True)
+    if loss_input.linear_ce_input is not None:
+        losses = linear_ce_loss(
+            config,
+            loss_input.linear_ce_input,
+            labels,
+            loss_mask,
+            return_src_loss=True,
+        )
+    else:
+        logits = loss_input.logits.float()
+        losses = ce_loss(config, logits, labels, loss_mask, return_src_loss=True)
     loss_weight = loss_mask.sum(dim=-1).float()
-    if config.policy.dist_config.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss_weight, group=mpu.get_context_parallel_group())
+    _cp_group = loss_input.cp_group if loss_input.cp_group is not None else mpu.get_context_parallel_group(
+    )
+    if dist.get_world_size(_cp_group) > 1:
+        torch.distributed.all_reduce(loss_weight, group=_cp_group)
     loss_weight = 1 / torch.clamp_min(loss_weight.sqrt(), 1)
     loss_weight = torch.where(
         loss_mask == 1, loss_weight.unsqueeze(1),
@@ -1369,8 +1457,8 @@ def square_averaging_cross_entroy_loss_func(
     # losses.sum() 包括了 mbs 序列之和，计算 loss 时应该求 mean
     # 所以 square_averaging_weights 直接多个求 sum 就可以了
     loss = losses.sum().view(1).clone() / square_averaging_weights.sum().view(1)
-    if config.policy.dist_config.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+    if (not loss_input.skip_cp_loss_reduce and dist.get_world_size(_cp_group) > 1):
+        torch.distributed.all_reduce(loss, group=_cp_group)
     #TODO: check loss nan or not
 
     reporting_loss = loss.clone().detach()

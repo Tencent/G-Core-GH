@@ -24,6 +24,10 @@ from gpatch_v4.utils import (
 )
 
 
+ORIGIN_PPO_STEP_KEY = "_origin_ppo_step"
+ORIGIN_MICROBATCH_IDX_KEY = "_origin_microbatch_idx"
+
+
 @dataclass
 class GenerateResult:
     """Result of a single rollout collection step.
@@ -38,6 +42,16 @@ class GenerateResult:
 
     dp_refs: List = field(default_factory=list)
     num_aborted_samples: int = 0
+
+
+@dataclass
+class QueuedRolloutBatch:
+    """Controller-internal queue item with ordering metadata."""
+
+    rollout_batch: Dict[str, List[Any]]
+    ppo_step: int
+    microbatch_idx: int
+    sample_idx: int
 
 
 # TODO 挪到 rollout 目录下
@@ -82,9 +96,11 @@ class RolloutController:
     that are round-robin scheduled on cluster nodes.
 
     Completed microbatches are deposited into a queue and consumed by
-    :meth:`collect_rollout_step` in first-finished order. BT RM is called
-    in batch after collection because its interface requires batched
-    issue → batched collect.
+    :meth:`collect_rollout_step` in first-finished order by default.  When
+    ``training.rollout_ordered_collection`` is enabled, collection waits
+    for the requested original PPO step and emits microbatches in original
+    order.  BT RM is called in batch after collection because its interface
+    requires batched issue → batched collect.
 
     Parameters
     ----------
@@ -118,6 +134,7 @@ class RolloutController:
 
         # Streaming pipeline state
         self._ready_queue: asyncio.Queue = asyncio.Queue()
+        self._ordered_ready: Dict[int, Dict[int, List[QueuedRolloutBatch]]] = {}
         self._inflight_tasks: List[asyncio.Task] = []
 
     async def setup(self, train_actors: Optional[List] = None):
@@ -233,11 +250,13 @@ class RolloutController:
     #  Shared rollout batch helpers
     # ------------------------------------------------------------------ #
 
-    def read_and_clean_batches(self, num_mb: int) -> List[Dict[str, Any]]:
+    def read_and_clean_batches(self, num_mb: int, ppo_step: int) -> List[Dict[str, Any]]:
         """Read rollout microbatches and strip attrs not needed by sampler."""
         batches = self.data_source.get_batch(num_mb)
         for rbi, bd in enumerate(batches):
             self._assign_unique_id(bd, rbi)
+            if self.training_config.rollout_ordered_collection:
+                self._tag_rollout_origin(bd, ppo_step, rbi)
         return [
             self.apply_sampling_rollout_attr.remove_rollout_attr_before_sampling(bd)
             for bd in batches
@@ -281,6 +300,8 @@ class RolloutController:
         assert check_rollout_batches(rbs), "rbs format error before split"
 
         rbs = self.apply_sampling_rollout_attr.add_back_rollout_attr_after_sampling(rbs)
+        if self.training_config.rollout_ordered_collection:
+            self._validate_and_drop_rollout_origin_attrs(rbs, ppo_step, num_expected)
         self.apply_sampling_rollout_attr.clear_data_cache()
         return GenerateResult(dp_refs=self._split_train_data_by_dp(rbs))
 
@@ -350,7 +371,7 @@ class RolloutController:
             cur_ppo_step = ppo_step + step_offset
             step_sample_idx_base = curr_sample_idx + step_offset * num_mb
 
-            cleaned_batches = self.read_and_clean_batches(num_mb)
+            cleaned_batches = self.read_and_clean_batches(num_mb, cur_ppo_step)
             per_agent_batches, per_agent_indices, per_agent_microbatch_indices = (
                 self.partition_batches(
                     cleaned_batches,
@@ -365,6 +386,7 @@ class RolloutController:
                         agent_actors,
                         per_agent_batches,
                         per_agent_indices,
+                        per_agent_microbatch_indices,
                         cur_ppo_step,
                     )
                 )
@@ -422,7 +444,14 @@ class RolloutController:
                 cleaned_data, ppo_step, microbatch_idx, sample_idx
             )
             for rb in rb_list:
-                await self._ready_queue.put(rb)
+                await self._ready_queue.put(
+                    QueuedRolloutBatch(
+                        rollout_batch=rb,
+                        ppo_step=ppo_step,
+                        microbatch_idx=microbatch_idx,
+                        sample_idx=sample_idx,
+                    )
+                )
         except Exception as e:
             traceback.print_exc()
             await self._ready_queue.put(e)
@@ -433,6 +462,7 @@ class RolloutController:
         agents: List,
         per_agent_batches: List[List[Dict[str, Any]]],
         per_agent_indices: List[List[int]],
+        per_agent_microbatch_indices: List[List[int]],
         ppo_step: int,
     ):
         """Dispatch a batch of microbatches to all agents and enqueue results.
@@ -454,12 +484,35 @@ class RolloutController:
                         agents,
                         per_agent_batches,
                         per_agent_indices,
+                        strict=True,
                     )
                 ]
             )
-            for agent_rbs in agent_results:
-                for rb in agent_rbs:
-                    await self._ready_queue.put(rb)
+            for agent_rbs, sample_indices, microbatch_indices in zip(
+                agent_results,
+                per_agent_indices,
+                per_agent_microbatch_indices,
+                strict=True,
+            ):
+                assert len(agent_rbs) == len(microbatch_indices) * self.rb_multiplier, (
+                    "agent returned an unexpected number of rollout batches: "
+                    f"{len(agent_rbs)=}, {len(microbatch_indices)=}, "
+                    f"{self.rb_multiplier=}"
+                )
+                result_idx = 0
+                for sample_idx, microbatch_idx in zip(
+                    sample_indices, microbatch_indices, strict=True
+                ):
+                    for _ in range(self.rb_multiplier):
+                        await self._ready_queue.put(
+                            QueuedRolloutBatch(
+                                rollout_batch=agent_rbs[result_idx],
+                                ppo_step=ppo_step,
+                                microbatch_idx=microbatch_idx,
+                                sample_idx=sample_idx,
+                            )
+                        )
+                        result_idx += 1
         except Exception as e:
             traceback.print_exc()
             await self._ready_queue.put(e)
@@ -468,9 +521,11 @@ class RolloutController:
     async def collect_rollout_step(self, ppo_step: int) -> GenerateResult:
         """Collect the next complete PPO step worth of microbatches.
 
-        Drains ``num_microbatches`` items from the ready queue (in
-        first-finished order), restores cached rollout attrs, and splits
-        by DP rank.
+        Drains ``num_microbatches * rb_multiplier`` items from the ready
+        queue, restores cached rollout attrs, and splits by DP rank.
+        Default collection preserves first-finished queue order.  With
+        ``training.rollout_ordered_collection=True``, later PPO steps are
+        buffered until the requested original ``ppo_step`` is complete.
 
         Parameters
         ----------
@@ -490,16 +545,90 @@ class RolloutController:
         num_mb = self._num_microbatches
         num_collect = num_mb * self.rb_multiplier
 
-        rbs = []
-        for _ in range(num_collect):
-            rb = await self._ready_queue.get()
-            if isinstance(rb, Exception):
-                raise rb
-            rbs.append(rb)
+        if self.training_config.rollout_ordered_collection:
+            rbs = await self.collect_ordered_rollout_batches(ppo_step, num_mb)
+        else:
+            rbs = await self.collect_first_finished_rollout_batches(num_collect)
 
         result = await self.finalize_rollout_batches(rbs, ppo_step, num_collect)
         self._sample_idx += num_mb
         return result
+
+    async def collect_first_finished_rollout_batches(
+        self, num_collect: int
+    ) -> List[Dict[str, List[Any]]]:
+        """Collect rollout batches in queue arrival order."""
+        rbs = []
+        for _ in range(num_collect):
+            item = await self._ready_queue.get()
+            if isinstance(item, Exception):
+                raise item
+            assert isinstance(item, QueuedRolloutBatch), (
+                f"unexpected ready queue item type: {type(item)}"
+            )
+            rbs.append(item.rollout_batch)
+        return rbs
+
+    async def collect_ordered_rollout_batches(
+        self, ppo_step: int, num_mb: int
+    ) -> List[Dict[str, List[Any]]]:
+        """Collect rollout batches for ``ppo_step`` in original order."""
+        self._assert_no_stale_ordered_steps(ppo_step)
+
+        while not self._ordered_step_complete(ppo_step, num_mb):
+            item = await self._ready_queue.get()
+            if isinstance(item, Exception):
+                raise item
+            assert isinstance(item, QueuedRolloutBatch), (
+                f"unexpected ready queue item type: {type(item)}"
+            )
+            assert item.ppo_step >= ppo_step, (
+                f"ordered collection saw stale ppo_step {item.ppo_step} "
+                f"while collecting {ppo_step}"
+            )
+            self._buffer_ordered_rollout_batch(item)
+
+        step_buf = self._ordered_ready.pop(ppo_step)
+        rbs = []
+        for microbatch_idx in range(num_mb):
+            items = step_buf.pop(microbatch_idx)
+            assert len(items) == self.rb_multiplier, (
+                f"expected {self.rb_multiplier} rollout batches for "
+                f"{ppo_step=} {microbatch_idx=}, got {len(items)}"
+            )
+            rbs.extend(item.rollout_batch for item in items)
+        assert not step_buf, f"unexpected leftover microbatches for {ppo_step=}: {step_buf}"
+        return rbs
+
+    def _buffer_ordered_rollout_batch(self, item: QueuedRolloutBatch) -> None:
+        """Buffer a queued rollout item by original PPO step and microbatch."""
+        step_buf = self._ordered_ready.setdefault(item.ppo_step, {})
+        microbatch_buf = step_buf.setdefault(item.microbatch_idx, [])
+        microbatch_buf.append(item)
+        assert len(microbatch_buf) <= self.rb_multiplier, (
+            f"too many rollout batches for ppo_step={item.ppo_step} "
+            f"microbatch_idx={item.microbatch_idx}: "
+            f"{len(microbatch_buf)} > {self.rb_multiplier}"
+        )
+
+    def _ordered_step_complete(self, ppo_step: int, num_mb: int) -> bool:
+        """Return whether all microbatches for ``ppo_step`` are buffered."""
+        step_buf = self._ordered_ready.get(ppo_step)
+        if step_buf is None:
+            return False
+        for microbatch_idx in range(num_mb):
+            items = step_buf.get(microbatch_idx)
+            if items is None or len(items) != self.rb_multiplier:
+                return False
+        return True
+
+    def _assert_no_stale_ordered_steps(self, ppo_step: int) -> None:
+        """Fail loudly if ordered collection skipped an older PPO step."""
+        stale_steps = [step for step in self._ordered_ready if step < ppo_step]
+        assert not stale_steps, (
+            f"ordered collection has stale buffered steps before {ppo_step}: "
+            f"{sorted(stale_steps)}"
+        )
 
     async def wait_all_inflight(self):
         """Wait for all inflight pipeline tasks to complete.
@@ -601,6 +730,71 @@ class RolloutController:
             ts = datetime.now().strftime("%Y%m%d%H%M%S%f")
             unique_id_list = [f"ctrl_rbi_{rbi}_batch_id_{bid}_{ts}" for bid in range(batch_size)]
             batched_data["unique_id"] = unique_id_list
+
+    def _tag_rollout_origin(
+        self,
+        batched_data: Dict[str, Any],
+        ppo_step: int,
+        microbatch_idx: int,
+    ) -> None:
+        """Attach controller provenance attrs via the rollout attr cache."""
+        assert "unique_id" in batched_data
+        batch_size = len(batched_data["unique_id"])
+        assert ORIGIN_PPO_STEP_KEY not in batched_data
+        assert ORIGIN_MICROBATCH_IDX_KEY not in batched_data
+
+        if "cache_keys" in batched_data:
+            cache_keys = list(batched_data["cache_keys"])
+        else:
+            cache_keys = []
+        for key in (ORIGIN_PPO_STEP_KEY, ORIGIN_MICROBATCH_IDX_KEY):
+            assert key not in cache_keys
+            cache_keys.append(key)
+        batched_data["cache_keys"] = cache_keys
+        batched_data[ORIGIN_PPO_STEP_KEY] = [ppo_step] * batch_size
+        batched_data[ORIGIN_MICROBATCH_IDX_KEY] = [microbatch_idx] * batch_size
+
+    def _validate_and_drop_rollout_origin_attrs(
+        self,
+        rbs: List[Dict[str, List[Any]]],
+        ppo_step: int,
+        num_expected: int,
+    ) -> None:
+        """Validate sample-level provenance, then remove internal attrs."""
+        assert len(rbs) == num_expected, (
+            f"expected {num_expected} rollout batches, got {len(rbs)}"
+        )
+        collected_microbatch_indices = []
+        for rb in rbs:
+            assert ORIGIN_PPO_STEP_KEY in rb
+            assert ORIGIN_MICROBATCH_IDX_KEY in rb
+            if self.training_config.rollout_ordered_collection:
+                for origin_step in rb[ORIGIN_PPO_STEP_KEY]:
+                    assert origin_step == ppo_step, (
+                        f"ordered collection mixed rollout origin ppo_step "
+                        f"{origin_step} into collect ppo_step {ppo_step}"
+                    )
+                origin_microbatch_indices = rb[ORIGIN_MICROBATCH_IDX_KEY]
+                assert origin_microbatch_indices, "origin microbatch index list is empty"
+                origin_microbatch_idx = origin_microbatch_indices[0]
+                for idx in origin_microbatch_indices:
+                    assert idx == origin_microbatch_idx, (
+                        f"one rollout batch contains mixed origin microbatch indices: "
+                        f"{origin_microbatch_indices}"
+                    )
+                collected_microbatch_indices.append(origin_microbatch_idx)
+            del rb[ORIGIN_PPO_STEP_KEY]
+            del rb[ORIGIN_MICROBATCH_IDX_KEY]
+        if self.training_config.rollout_ordered_collection:
+            expected_microbatch_indices = [
+                microbatch_idx
+                for microbatch_idx in range(self._num_microbatches)
+                for _ in range(self.rb_multiplier)
+            ]
+            assert collected_microbatch_indices == expected_microbatch_indices, (
+                f"ordered collection returned microbatches in wrong order: "
+                f"{collected_microbatch_indices=} {expected_microbatch_indices=}"
+            )
 
     def _split_train_data_by_dp(self, rbs: List[Dict[str, List[Any]]]) -> List[ray.ObjectRef]:
         """Split rollout batches across DP ranks and ``ray.put`` each shard.

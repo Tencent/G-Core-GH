@@ -16,7 +16,11 @@ from types import SimpleNamespace
 from typing import Any, Dict, List
 
 from gpatch_v4.rollout_generator.async_rollout.rollout_controller import (
+    GenerateResult,
     RolloutController,
+    QueuedRolloutBatch,
+    ORIGIN_MICROBATCH_IDX_KEY,
+    ORIGIN_PPO_STEP_KEY,
 )
 
 
@@ -30,8 +34,11 @@ def _make_bare_controller() -> RolloutController:
     """
     rc = object.__new__(RolloutController)
     rc._ready_queue = asyncio.Queue()
+    rc._ordered_ready = {}
     rc._inflight_tasks = []
     rc.use_colocate = False
+    rc.rb_multiplier = 1
+    rc.training_config = SimpleNamespace(rollout_ordered_collection=False)
     return rc
 
 
@@ -73,6 +80,29 @@ class _RecordingRemote:
 class _RecordingActor:
     def __init__(self):
         self.agent_loop = _RecordingRemote()
+
+
+class _DelayedRecordingRemote:
+    """Return rollout batches after configurable delays to scramble finish order."""
+    def __init__(self, delays):
+        self.delays = delays
+        self.calls: List = []
+
+    def remote(self, cleaned_data, ppo_step, microbatch_idx, sample_idx):
+        async def _coro():
+            self.calls.append((ppo_step, microbatch_idx, sample_idx))
+            await asyncio.sleep(self.delays[(ppo_step, microbatch_idx)])
+            return [{
+                "tokens": [[sample_idx]],
+                "source_order": [(ppo_step, microbatch_idx, sample_idx)],
+            }]
+
+        return _coro()
+
+
+class _DelayedRecordingActor:
+    def __init__(self, delays):
+        self.agent_loop = _DelayedRecordingRemote(delays)
 
 
 class _FakeDataSource:
@@ -120,8 +150,16 @@ class DispatchToActorTest(unittest.IsolatedAsyncioTestCase):
         assert rc._ready_queue.qsize() == 2
         first = await rc._ready_queue.get()
         second = await rc._ready_queue.get()
-        assert first is rb_a
-        assert second is rb_b
+        assert isinstance(first, QueuedRolloutBatch)
+        assert isinstance(second, QueuedRolloutBatch)
+        assert first.rollout_batch is rb_a
+        assert second.rollout_batch is rb_b
+        assert first.ppo_step == 0
+        assert second.ppo_step == 0
+        assert first.microbatch_idx == 0
+        assert second.microbatch_idx == 0
+        assert first.sample_idx == 0
+        assert second.sample_idx == 0
 
     async def test_failure_enqueues_exception_and_reraises(self):
         """Regression test: on agent_loop failure the queue must receive
@@ -178,11 +216,16 @@ def _make_fire_controller(num_mb: int, num_actors: int) -> RolloutController:
     rc._num_microbatches = num_mb
     rc._next_fire_sample_idx = 0
     rc._next_fire_actor_idx = 0
+    rc._sample_idx = 0
+    rc.rb_multiplier = 1
     rc.data_source = _FakeDataSource()
     rc.apply_sampling_rollout_attr = _NoopRolloutAttr()
     rc.agent_loop_actors = [_RecordingActor() for _ in range(num_actors)]
     rc.config = SimpleNamespace(placement_type="disaggregated")
-    rc.training_config = SimpleNamespace(single_controller=True)
+    rc.training_config = SimpleNamespace(
+        single_controller=True,
+        rollout_ordered_collection=False,
+    )
     return rc
 
 
@@ -219,6 +262,7 @@ def _make_colocate_fire_controller(num_mb: int, num_actors: int) -> RolloutContr
     rc._next_fire_sample_idx = 0
     rc._next_fire_actor_idx = 0
     rc._sample_idx = 0
+    rc.rb_multiplier = 1
     rc.data_source = _FakeDataSource()
     rc.apply_sampling_rollout_attr = _NoopRolloutAttr()
     rc.agent_loop_actors = [_RecordingColocateActor() for _ in range(num_actors)]
@@ -226,6 +270,7 @@ def _make_colocate_fire_controller(num_mb: int, num_actors: int) -> RolloutContr
     rc.training_config = SimpleNamespace(
         single_controller=True,
         rollout_max_staleness=0,
+        rollout_ordered_collection=False,
     )
     return rc
 
@@ -302,8 +347,260 @@ class ColocateFireBookkeepingTest(unittest.IsolatedAsyncioTestCase):
         assert calls[1][0] == (0, 0, [], True)
         assert calls[2][0] == (0, 0, [], True)
         assert rc._ready_queue.qsize() == 1
+        item = await rc._ready_queue.get()
+        assert isinstance(item, QueuedRolloutBatch)
+        assert item.ppo_step == 0
+        assert item.microbatch_idx == 0
+        assert item.sample_idx == 0
+        assert item.rollout_batch["tokens"] == [[0]]
         assert rc._next_fire_sample_idx == 1
         assert rc._next_fire_actor_idx == 1
+
+
+def _make_collect_controller(
+    num_mb: int,
+    rb_multiplier: int = 1,
+    ordered: bool = False,
+) -> RolloutController:
+    """Create a controller skeleton for collect-only tests."""
+    rc = _make_bare_controller()
+    rc._num_microbatches = num_mb
+    rc.rb_multiplier = rb_multiplier
+    rc._sample_idx = 0
+    rc.training_config = SimpleNamespace(rollout_ordered_collection=ordered)
+
+    async def _finalize_rollout_batches(rbs, ppo_step, num_expected):
+        return GenerateResult(dp_refs=rbs)
+
+    rc.finalize_rollout_batches = _finalize_rollout_batches
+    return rc
+
+
+async def _put_queued(
+    rc: RolloutController,
+    label: str,
+    ppo_step: int,
+    microbatch_idx: int,
+    sample_idx: int,
+):
+    rb = {"tokens": [[label]]}
+    await rc._ready_queue.put(
+        QueuedRolloutBatch(
+            rollout_batch=rb,
+            ppo_step=ppo_step,
+            microbatch_idx=microbatch_idx,
+            sample_idx=sample_idx,
+        )
+    )
+    return rb
+
+
+class CollectOrderingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_default_collect_preserves_first_finished_queue_order(self):
+        rc = _make_collect_controller(num_mb=2, ordered=False)
+        rb_step1 = await _put_queued(rc, "step1_mb0", ppo_step=1, microbatch_idx=0, sample_idx=2)
+        rb_step0 = await _put_queued(rc, "step0_mb0", ppo_step=0, microbatch_idx=0, sample_idx=0)
+
+        result = await rc.collect_rollout_step(0)
+
+        assert result.dp_refs == [rb_step1, rb_step0]
+        assert rc._sample_idx == 2
+
+    async def test_ordered_collect_buffers_later_step(self):
+        rc = _make_collect_controller(num_mb=2, ordered=True)
+        rb10 = await _put_queued(rc, "step1_mb0", ppo_step=1, microbatch_idx=0, sample_idx=2)
+        rb11 = await _put_queued(rc, "step1_mb1", ppo_step=1, microbatch_idx=1, sample_idx=3)
+        rb01 = await _put_queued(rc, "step0_mb1", ppo_step=0, microbatch_idx=1, sample_idx=1)
+        rb00 = await _put_queued(rc, "step0_mb0", ppo_step=0, microbatch_idx=0, sample_idx=0)
+
+        result0 = await rc.collect_rollout_step(0)
+        result1 = await rc.collect_rollout_step(1)
+
+        assert result0.dp_refs == [rb00, rb01]
+        assert result1.dp_refs == [rb10, rb11]
+        assert rc._ordered_ready == {}
+        assert rc._sample_idx == 4
+
+    async def test_ordered_collect_preserves_microbatch_order(self):
+        rc = _make_collect_controller(num_mb=3, ordered=True)
+        rb2 = await _put_queued(rc, "mb2", ppo_step=0, microbatch_idx=2, sample_idx=2)
+        rb0 = await _put_queued(rc, "mb0", ppo_step=0, microbatch_idx=0, sample_idx=0)
+        rb1 = await _put_queued(rc, "mb1", ppo_step=0, microbatch_idx=1, sample_idx=1)
+
+        result = await rc.collect_rollout_step(0)
+
+        assert result.dp_refs == [rb0, rb1, rb2]
+
+    async def test_ordered_collect_returns_original_sample_index_order(self):
+        """Ordered collection must restore the original rollout-batch order.
+
+        Completion order is intentionally scrambled across steps and
+        microbatches.  The returned sequence should match the original
+        fire-side metadata for the requested PPO step.
+        """
+        rc = _make_collect_controller(num_mb=3, ordered=True)
+
+        queued = [
+            (1, 0, 3),
+            (0, 2, 2),
+            (1, 1, 4),
+            (0, 0, 0),
+            (0, 1, 1),
+        ]
+        for ppo_step, microbatch_idx, sample_idx in queued:
+            rb = {
+                "tokens": [[f"step{ppo_step}_mb{microbatch_idx}"]],
+                "source_order": [(ppo_step, microbatch_idx, sample_idx)],
+            }
+            await rc._ready_queue.put(
+                QueuedRolloutBatch(
+                    rollout_batch=rb,
+                    ppo_step=ppo_step,
+                    microbatch_idx=microbatch_idx,
+                    sample_idx=sample_idx,
+                )
+            )
+
+        result = await rc.collect_rollout_step(0)
+
+        assert [rb["source_order"][0] for rb in result.dp_refs] == [
+            (0, 0, 0),
+            (0, 1, 1),
+            (0, 2, 2),
+        ]
+
+    async def test_fire_dispatch_then_ordered_collect_restores_original_order(self):
+        """End-to-end controller path: fire creates metadata, collect orders it.
+
+        This goes through ``fire_generation_requests`` and
+        ``dispatch_single_item_to_agent`` instead of hand-filling the queue,
+        proving the production metadata path is sufficient for ordered
+        collection even when later microbatches finish earlier.
+        """
+        delays = {
+            (0, 0): 0.04,
+            (0, 1): 0.03,
+            (0, 2): 0.02,
+            (1, 0): 0.00,
+            (1, 1): 0.01,
+            (1, 2): 0.00,
+        }
+        rc = _make_fire_controller(num_mb=3, num_actors=1)
+        rc.training_config.rollout_ordered_collection = True
+        rc.agent_loop_actors = [_DelayedRecordingActor(delays)]
+
+        async def _finalize_rollout_batches(rbs, ppo_step, num_expected):
+            return GenerateResult(dp_refs=rbs)
+
+        rc.finalize_rollout_batches = _finalize_rollout_batches
+
+        await rc.fire_generation_requests(epoch=0, ppo_step=0, num_ppo_steps=1)
+        await rc.fire_generation_requests(epoch=0, ppo_step=1, num_ppo_steps=1)
+        await rc.wait_all_inflight()
+
+        result0 = await rc.collect_rollout_step(0)
+        result1 = await rc.collect_rollout_step(1)
+
+        assert [rb["source_order"][0] for rb in result0.dp_refs] == [
+            (0, 0, 0),
+            (0, 1, 1),
+            (0, 2, 2),
+        ]
+        assert [rb["source_order"][0] for rb in result1.dp_refs] == [
+            (1, 0, 3),
+            (1, 1, 4),
+            (1, 2, 5),
+        ]
+
+    async def test_ordered_collect_handles_rb_multiplier_chunks(self):
+        rc = _make_collect_controller(num_mb=2, rb_multiplier=2, ordered=True)
+        rb1a = await _put_queued(rc, "mb1_a", ppo_step=0, microbatch_idx=1, sample_idx=1)
+        rb0a = await _put_queued(rc, "mb0_a", ppo_step=0, microbatch_idx=0, sample_idx=0)
+        rb1b = await _put_queued(rc, "mb1_b", ppo_step=0, microbatch_idx=1, sample_idx=1)
+        rb0b = await _put_queued(rc, "mb0_b", ppo_step=0, microbatch_idx=0, sample_idx=0)
+
+        result = await rc.collect_rollout_step(0)
+
+        assert result.dp_refs == [rb0a, rb0b, rb1a, rb1b]
+        assert rc._sample_idx == 2
+
+    async def test_ordered_collect_raises_queued_exception(self):
+        rc = _make_collect_controller(num_mb=1, ordered=True)
+        boom = RuntimeError("rollout failed")
+        await rc._ready_queue.put(boom)
+
+        with self.assertRaises(RuntimeError) as cm:
+            await rc.collect_rollout_step(0)
+        assert cm.exception is boom
+
+    async def test_ordered_origin_provenance_asserts_and_drops_internal_keys(self):
+        rc = _make_collect_controller(num_mb=1, ordered=True)
+        rb = {
+            "tokens": [[0], [1]],
+            ORIGIN_PPO_STEP_KEY: [3, 3],
+            ORIGIN_MICROBATCH_IDX_KEY: [0, 0],
+        }
+
+        rc._validate_and_drop_rollout_origin_attrs([rb], ppo_step=3, num_expected=1)
+
+        assert ORIGIN_PPO_STEP_KEY not in rb
+        assert ORIGIN_MICROBATCH_IDX_KEY not in rb
+
+        bad_rb = {
+            "tokens": [[0]],
+            ORIGIN_PPO_STEP_KEY: [4],
+            ORIGIN_MICROBATCH_IDX_KEY: [0],
+        }
+        with self.assertRaises(AssertionError):
+            rc._validate_and_drop_rollout_origin_attrs([bad_rb], ppo_step=3, num_expected=1)
+
+    async def test_ordered_origin_provenance_asserts_microbatch_order(self):
+        rc = _make_collect_controller(num_mb=2, ordered=True)
+        rbs = [
+            {
+                "tokens": [[0]],
+                ORIGIN_PPO_STEP_KEY: [3],
+                ORIGIN_MICROBATCH_IDX_KEY: [1],
+            },
+            {
+                "tokens": [[1]],
+                ORIGIN_PPO_STEP_KEY: [3],
+                ORIGIN_MICROBATCH_IDX_KEY: [0],
+            },
+        ]
+
+        with self.assertRaises(AssertionError):
+            rc._validate_and_drop_rollout_origin_attrs(rbs, ppo_step=3, num_expected=2)
+
+    async def test_colocate_dispatch_wraps_rb_multiplier_chunks(self):
+        rc = _make_colocate_fire_controller(num_mb=2, num_actors=1)
+        rc.rb_multiplier = 2
+        actor = rc.agent_loop_actors[0]
+        actor.agent_loop = _FakeRemote(result=[
+            {"tokens": [["mb0_a"]]},
+            {"tokens": [["mb0_b"]]},
+            {"tokens": [["mb1_a"]]},
+            {"tokens": [["mb1_b"]]},
+        ])
+
+        await rc.dispatch_batches_to_agents(
+            agents=[actor],
+            per_agent_batches=[[{"prompt": ["p0"]}, {"prompt": ["p1"]}]],
+            per_agent_indices=[[10, 11]],
+            per_agent_microbatch_indices=[[0, 1]],
+            ppo_step=5,
+        )
+
+        items = [await rc._ready_queue.get() for _ in range(4)]
+        assert [item.ppo_step for item in items] == [5, 5, 5, 5]
+        assert [item.microbatch_idx for item in items] == [0, 0, 1, 1]
+        assert [item.sample_idx for item in items] == [10, 10, 11, 11]
+        assert [item.rollout_batch["tokens"][0][0] for item in items] == [
+            "mb0_a",
+            "mb0_b",
+            "mb1_a",
+            "mb1_b",
+        ]
 
     async def test_colocate_rejects_overlapping_fire(self):
         rc = _make_colocate_fire_controller(num_mb=2, num_actors=2)

@@ -45,6 +45,7 @@ from gpatch_v4.models.deepseek_v4.router_replay import (
     capture_routing_decisions,
     router_replay_ctx,
 )
+from gpatch_v4.orches.placement_group import _create_placement_group
 
 HF_MODEL_PATH = "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
 NUM_GPUS = 32
@@ -83,7 +84,8 @@ def _compute_global_param_norms(model, ep_group):
 
 
 def _run_fwd_bwd(model, input_ids, tokenizer, rank, world_size, tag,
-                 ep_group=None, ep_fsdp_mesh=None, cp_group=None):
+                 ep_group=None, ep_fsdp_mesh=None, cp_group=None,
+                 memory_only: bool = False, label_ids=None):
     """前向 + 反向 + optimizer step，返回诊断 dict。"""
     model.train()
     assert model.device.type == "cuda", f"expected cuda, got {model.device}"
@@ -95,7 +97,7 @@ def _run_fwd_bwd(model, input_ids, tokenizer, rank, world_size, tag,
     cp_rank = dist.get_rank(cp_group) if cp_group is not None else 0
     s_full = input_ids.shape[1]
 
-    full_labels = input_ids.clone()
+    full_labels = label_ids.clone() if label_ids is not None else input_ids.clone()
     full_labels[full_labels == tokenizer.pad_token_id] = -100
     # 预先 shift labels，避免 CP 切分时边界丢 token
     full_labels = torch.roll(full_labels, shifts=-1, dims=-1)
@@ -132,6 +134,26 @@ def _run_fwd_bwd(model, input_ids, tokenizer, rank, world_size, tag,
         dist.all_reduce(reported_loss, group=cp_group)
     # CP 梯度修正由 apply_hp 的 set_gradient_divide_factor 处理，无需 loss * cp_size
     loss.backward()
+    torch.cuda.synchronize()
+    mem_after_bwd = torch.cuda.memory_allocated() / 1024**3
+    mem_peak_fwd_bwd = torch.cuda.max_memory_allocated() / 1024**3
+    print(
+        f"[{tag}] rank {rank}: fwd+bwd peak={mem_peak_fwd_bwd:.2f} GiB, "
+        f"after_bwd={mem_after_bwd:.2f} GiB, loss={reported_loss.item():.4f}"
+    )
+    if memory_only:
+        result = {
+            "rank": rank,
+            "loss": reported_loss.item(),
+            "mem_after_shard_gib": mem_after_shard,
+            "mem_after_bwd_gib": mem_after_bwd,
+            "mem_peak_fwd_bwd_gib": mem_peak_fwd_bwd,
+            "mem_peak_gib": mem_peak_fwd_bwd,
+        }
+        del model, outputs
+        torch.cuda.empty_cache()
+        dist.destroy_process_group()
+        return result
     logits = logits.detach()
 
     if cp_size > 1:
@@ -187,7 +209,6 @@ def _run_fwd_bwd(model, input_ids, tokenizer, rank, world_size, tag,
                 break
     assert any_nonzero_delta, "optimizer.step() did not change any parameter"
 
-    mem_after_bwd = torch.cuda.memory_allocated() / 1024**3
     mem_peak = torch.cuda.max_memory_allocated() / 1024**3
     print(
         f"[{tag}] rank {rank}: logits.shape={list(logits.shape)} "
@@ -213,6 +234,7 @@ def _run_fwd_bwd(model, input_ids, tokenizer, rank, world_size, tag,
         "param_norms_after": norms_after,
         "mem_after_shard_gib": mem_after_shard,
         "mem_after_bwd_gib": mem_after_bwd,
+        "mem_peak_fwd_bwd_gib": mem_peak_fwd_bwd,
         "mem_peak_gib": mem_peak,
     }
 
@@ -329,6 +351,11 @@ def _ep_cp_worker(
     cp_size: int,
     seq_len: int = SEQ_LEN,
     replay_indices: "list[torch.Tensor] | None" = None,
+    attn_backend: str = "fused",
+    indexer_backend: str = "fused",
+    ep_backend: str = "eager",
+    memory_only: bool = False,
+    input_mode: str = "random",
 ):
     """EP+CP 实现：双正交 mesh (ep_fsdp, ep) × (dp, cp)。
 
@@ -368,11 +395,28 @@ def _ep_cp_worker(
 
     # cp-pair 内共享 seed，与 baseline rank r//cp_size 对应
     rng = torch.Generator().manual_seed(42 + rank // cp_size)
-    full_input_ids = torch.randint(
-        0, tokenizer.vocab_size, (1, seq_len), generator=rng
-    ).cuda()
+    if input_mode == "random":
+        full_input_ids = torch.randint(
+            0, tokenizer.vocab_size, (1, seq_len), generator=rng
+        ).cuda()
+        label_ids = None
+    elif input_mode == "all_pad":
+        full_input_ids = torch.full(
+            (1, seq_len), tokenizer.pad_token_id, dtype=torch.long,
+            device="cuda",
+        )
+        label_token_id = 1 if tokenizer.pad_token_id == 0 else 0
+        label_ids = torch.full_like(full_input_ids, label_token_id)
+    else:
+        raise ValueError(f"unknown input_mode: {input_mode}")
 
-    tag = f"ep{ep_size}_cp{cp_size}" if replay_indices is None else f"ep{ep_size}_cp{cp_size}_replay"
+    tag = (
+        f"ep{ep_size}_cp{cp_size}_{input_mode}"
+        if replay_indices is None
+        else f"ep{ep_size}_cp{cp_size}_{input_mode}_replay"
+    )
+    if ep_backend != "eager":
+        tag += f"_{ep_backend}"
     print(f"[{tag}] rank {rank}: loading {hf_model_path} via meta-device ...")
     _t_load_start = time.time()
 
@@ -393,7 +437,15 @@ def _ep_cp_worker(
     finally:
         torch.set_default_dtype(prev_dtype)
 
-    model = apply_hp(model, ep_2d_mesh, cp_mesh=cp_mesh, amp_fp32=False)
+    model = apply_hp(
+        model,
+        ep_2d_mesh,
+        cp_mesh=cp_mesh,
+        amp_fp32=False,
+        attn_backend=attn_backend,
+        indexer_backend=indexer_backend,
+        ep_backend=ep_backend,
+    )
     # recompute 时 CP 通信（SWA-ring / compressor）会在 backward 重新执行，NCCL 配对有效
     model.gradient_checkpointing_enable()
     _t_apply_hp_done = time.time()
@@ -427,6 +479,8 @@ def _ep_cp_worker(
             model, full_input_ids, tokenizer, rank, world_size, tag,
             ep_group=model._ep_group, ep_fsdp_mesh=model._ep_fsdp_mesh,
             cp_group=model._cp_group,
+            memory_only=memory_only,
+            label_ids=label_ids,
         )
     result["load_seconds"] = load_seconds
     result["apply_hp_seconds"] = apply_hp_seconds
@@ -460,31 +514,34 @@ class TestFsdpVsEpCp(unittest.TestCase):
         pg: "ray.util.placement_group.PlacementGroup",
         master_port: int,
         *,
+        seq_len: int = SEQ_LEN,
         record_routing: bool = False,
     ) -> list[dict]:
-        """启动 baseline workers（纯 FSDP）。"""
+        pg_obj, bundle_indices = pg
         master_addr = ray.get(
             _get_node_ip.options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg, placement_group_bundle_index=0,
+                    placement_group=pg_obj, placement_group_bundle_index=bundle_indices[0],
                 )
             ).remote()
         )
-        futures = [
-            _baseline_worker.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg, placement_group_bundle_index=r,
+        futures = []
+        for r in range(world_size):
+            futures.append(
+                _baseline_worker.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg_obj, placement_group_bundle_index=bundle_indices[r],
+                    )
+                ).remote(
+                    HF_MODEL_PATH,
+                    rank=r,
+                    world_size=world_size,
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    seq_len=seq_len,
+                    record_routing=record_routing,
                 )
-            ).remote(
-                HF_MODEL_PATH,
-                rank=r,
-                world_size=world_size,
-                master_addr=master_addr,
-                master_port=master_port,
-                record_routing=record_routing,
             )
-            for r in range(world_size)
-        ]
         return ray.get(futures)
 
     def _run_ep_cp(
@@ -495,37 +552,51 @@ class TestFsdpVsEpCp(unittest.TestCase):
         ep_size: int,
         cp_size: int,
         *,
+        seq_len: int = SEQ_LEN,
         replay_indices_per_rank: "list[list[torch.Tensor]] | None" = None,
+        attn_backend: str = "fused",
+        indexer_backend: str = "fused",
+        ep_backend: str = "eager",
+        memory_only: bool = False,
+        input_mode: str = "random",
     ) -> list[dict]:
         """启动 EP+CP workers。"""
+        pg_obj, bundle_indices = pg
         master_addr = ray.get(
             _get_node_ip.options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg, placement_group_bundle_index=0,
+                    placement_group=pg_obj, placement_group_bundle_index=bundle_indices[0],
                 )
             ).remote()
         )
-        futures = [
-            _ep_cp_worker.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg, placement_group_bundle_index=r,
+        futures = []
+        for r in range(world_size):
+            futures.append(
+                _ep_cp_worker.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg_obj, placement_group_bundle_index=bundle_indices[r],
+                    )
+                ).remote(
+                    HF_MODEL_PATH,
+                    rank=r,
+                    world_size=world_size,
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    ep_size=ep_size,
+                    cp_size=cp_size,
+                    seq_len=seq_len,
+                    replay_indices=(
+                        replay_indices_per_rank[r]
+                        if replay_indices_per_rank is not None
+                        else None
+                    ),
+                    attn_backend=attn_backend,
+                    indexer_backend=indexer_backend,
+                    ep_backend=ep_backend,
+                    memory_only=memory_only,
+                    input_mode=input_mode,
                 )
-            ).remote(
-                HF_MODEL_PATH,
-                rank=r,
-                world_size=world_size,
-                master_addr=master_addr,
-                master_port=master_port,
-                ep_size=ep_size,
-                cp_size=cp_size,
-                replay_indices=(
-                    replay_indices_per_rank[r]
-                    if replay_indices_per_rank is not None
-                    else None
-                ),
             )
-            for r in range(world_size)
-        ]
         return ray.get(futures)
 
     def _assert_results(
@@ -683,26 +754,25 @@ class TestFsdpVsEpCp(unittest.TestCase):
 
         print("\nPASSED")
 
-    def test_fsdp_vs_ep_cp(
+    def _fsdp_vs_ep_cp_impl(
         self,
+        seq_len: int = SEQ_LEN,
+        attn_backend: str = "fused",
+        indexer_backend: str = "fused",
         baseline_world_size: int = NUM_GPUS // 2,
         epcp_world_size: int = NUM_GPUS,
         ep_size: int = 4,
         cp_size: int = 2,
         master_port_base: int = 12500,
         rtol: float = 0.02,
+        ep_backend: str = "eager",
     ):
-        """EP+CP vs baseline（含 router replay）。
-
-        baseline 16 ranks 纯 FSDP，EP+CP 32 ranks (ep=4, cp=2)。
-        CP 路径 rtol=0.02（SWA ring + compressor 的 bf16 累积噪声）。
-        """
         assert os.path.isdir(HF_MODEL_PATH), (
             f"model dir not found: {HF_MODEL_PATH}; "
             f"download DeepSeek-V4-Flash into hf-hub/ first"
         )
-        assert SEQ_LEN % cp_size == 0, (
-            f"SEQ_LEN ({SEQ_LEN}) must be divisible by cp_size ({cp_size})"
+        assert seq_len % cp_size == 0, (
+            f"seq_len ({seq_len}) must be divisible by cp_size ({cp_size})"
         )
         assert epcp_world_size == baseline_world_size * cp_size, (
             f"epcp_world_size ({epcp_world_size}) must equal "
@@ -714,24 +784,19 @@ class TestFsdpVsEpCp(unittest.TestCase):
             f"ep_size ({ep_size})"
         )
 
-        # 分配足够 GPU bundle（EP+CP 比 baseline 需要更多）
-        pg = placement_group(
-            [{"GPU": 1, "CPU": 1}] * epcp_world_size, strategy="PACK",
-        )
-        ray.get(pg.ready())
+        pg = _create_placement_group(epcp_world_size)
 
-        # --- 运行 baseline + 录制路由 ---
         print("=" * 60)
         print(
             f"Running baseline + routing capture "
-            f"(baseline_world_size={baseline_world_size}) ..."
+            f"(baseline_world_size={baseline_world_size}, seq_len={seq_len}) ..."
         )
         baseline_results = self._run_baseline(
             baseline_world_size, pg, master_port_base,
+            seq_len=seq_len,
             record_routing=True,
         )
 
-        # 构建 EP+CP rank → baseline rank 的 replay 映射
         replay_indices_per_rank = [
             baseline_results[r // cp_size]["recorded_routing"]
             for r in range(epcp_world_size)
@@ -742,22 +807,164 @@ class TestFsdpVsEpCp(unittest.TestCase):
                 f"{len(replay_indices_per_rank[r])} TopKRouter layers of routing indices"
             )
 
-        # --- 运行 EP+CP + replay ---
         print("=" * 60)
         print(
             f"Running EP+CP + router replay (ep_size={ep_size}, "
-            f"cp_size={cp_size}, epcp_world_size={epcp_world_size}) ..."
+            f"cp_size={cp_size}, attn={attn_backend}, seq_len={seq_len}) ..."
         )
         ep_results = self._run_ep_cp(
             epcp_world_size, pg, master_port_base + 1,
             ep_size=ep_size, cp_size=cp_size,
+            seq_len=seq_len,
             replay_indices_per_rank=replay_indices_per_rank,
+            attn_backend=attn_backend,
+            indexer_backend=indexer_backend,
+            ep_backend=ep_backend,
         )
 
-        remove_placement_group(pg)
+        remove_placement_group(pg[0])
 
-        # 有 replay 后 per-param 容差应在 ~5% 以内（只剩 attention bf16 噪声）
         self._assert_results(
             baseline_results, ep_results,
-            f"ep{ep_size}_cp{cp_size}_replay", cp_size, rtol,
+            f"ep{ep_size}_cp{cp_size}_{attn_backend}_{ep_backend}_s{seq_len}", cp_size, rtol,
         )
+
+    def test_fsdp_vs_ep_cp(self):
+        """EP+CP fused attn vs baseline, seq_len=256."""
+        self._fsdp_vs_ep_cp_impl(seq_len=256, attn_backend="fused", indexer_backend="fused")
+
+    def test_fsdp_vs_ep_cp_eager(self):
+        """EP+CP eager attn + fused indexer vs baseline, seq_len=256."""
+        self._fsdp_vs_ep_cp_impl(seq_len=256, attn_backend="eager", indexer_backend="eager", ep_backend="eager",
+                                  master_port_base=12600)
+
+    def test_fsdp_vs_ep_cp_s512(self):
+        """EP+CP fused attn vs baseline, seq_len=512."""
+        self._fsdp_vs_ep_cp_impl(
+            seq_len=512,
+            attn_backend="fused",
+            indexer_backend="fused",
+            ep_backend="deepep",
+            master_port_base=12700,
+        )
+
+    def test_fsdp_vs_ep_cp_s1024(self):
+        """EP+CP fused attn vs baseline, seq_len=1024."""
+        self._fsdp_vs_ep_cp_impl(
+            seq_len=1024,
+            attn_backend="fused",
+            indexer_backend="fused",
+            ep_backend="deepep",
+            master_port_base=12800,
+        )
+
+    def test_cp_memory_scaling(
+        self,
+        ep_size: int = 8,
+        master_port_base: int = 13000,
+    ):
+        """验证 cp_size 增大时 peak 显存单调下降。
+
+        固定 ep_size=8, seq_len=4096, world_size=32，扫 cp_size ∈ {2,4,8,16,32}。
+        seq_len=4096 保证最大 cp_size=32 时 s_local=128 满足 HCA compress_ratio=128 整除约束。
+        """
+        assert os.path.isdir(HF_MODEL_PATH), (
+            f"model dir not found: {HF_MODEL_PATH}"
+        )
+        world_size = NUM_GPUS
+        seq_len = 64 * 1024
+        cp_sizes = [4, 8, 16, 32]
+        input_modes = ["random", "all_pad"]
+
+        summaries = {}
+
+        for mode_i, input_mode in enumerate(input_modes):
+            summary = {}
+            summaries[input_mode] = summary
+            for i, cp_size in enumerate(cp_sizes):
+                s_local = seq_len // cp_size
+                assert s_local % 128 == 0, (
+                    f"s_local={s_local} (seq_len={seq_len}/cp_size={cp_size}) "
+                    f"not divisible by 128 (HCA compress_ratio)"
+                )
+                assert world_size % cp_size == 0
+                assert world_size % ep_size == 0
+
+                pg = placement_group(
+                    [{"GPU": 1, "CPU": 1}] * world_size, strategy="PACK",
+                )
+                ray.get(pg.ready())
+
+                print("=" * 60)
+                print(
+                    f"[mem-scaling] mode={input_mode}, cp_size={cp_size}, "
+                    f"ep_size={ep_size}, seq_len={seq_len}, "
+                    f"s_local={s_local}, world_size={world_size}"
+                )
+
+                results = self._run_ep_cp(
+                    world_size, pg, master_port_base + mode_i * 100 + i,
+                    ep_size=ep_size, cp_size=cp_size,
+                    seq_len=seq_len,
+                    memory_only=True,
+                    input_mode=input_mode,
+                )
+
+                remove_placement_group(pg)
+
+                peaks = [r["mem_peak_fwd_bwd_gib"] for r in results]
+                after_shard = [r["mem_after_shard_gib"] for r in results]
+                avg_peak = sum(peaks) / len(peaks)
+                max_peak = max(peaks)
+                avg_shard = sum(after_shard) / len(after_shard)
+                loss = results[0]["loss"]
+
+                summary[cp_size] = {
+                    "avg_peak": avg_peak,
+                    "max_peak": max_peak,
+                    "avg_shard": avg_shard,
+                    "loss": loss,
+                }
+                print(
+                    f"[mem-scaling] mode={input_mode} cp={cp_size}: "
+                    f"fwd_bwd_peak avg={avg_peak:.2f}G max={max_peak:.2f}G "
+                    f"shard={avg_shard:.2f}G loss={loss:.4f}"
+                )
+
+        # 汇总表
+        for input_mode, summary in summaries.items():
+            print("\n" + "=" * 60)
+            print(
+                f"CP Memory Scaling Summary ({input_mode}) "
+                f"(ep={ep_size}, seq_len={seq_len}, layers={NUM_LAYERS}, ws={world_size})"
+            )
+            print("=" * 60)
+            header = (
+                f"{'cp':>4s} {'s_local':>8s} "
+                f"{'peak_avg':>10s} {'peak_max':>10s} {'shard':>8s} "
+                f"{'vs_base':>7s} {'loss':>10s}"
+            )
+            print(header)
+            print("-" * len(header))
+            base_peak = summary[cp_sizes[0]]["avg_peak"]
+            for cp_size in cp_sizes:
+                s = summary[cp_size]
+                ratio = s["avg_peak"] / base_peak
+                print(
+                    f"{cp_size:>4d} {seq_len // cp_size:>8d} "
+                    f"{s['avg_peak']:>9.2f}G {s['max_peak']:>9.2f}G "
+                    f"{s['avg_shard']:>7.2f}G "
+                    f"{ratio:>6.2f}x {s['loss']:>10.4f}"
+                )
+            print("=" * 60)
+
+            prev_peak = None
+            for cp_size in cp_sizes:
+                cur_peak = summary[cp_size]["avg_peak"]
+                if prev_peak is not None:
+                    self.assertLess(
+                        cur_peak, prev_peak,
+                        f"{input_mode}: peak mem did not decrease: cp={cp_size} "
+                        f"({cur_peak:.2f}G) >= previous ({prev_peak:.2f}G)",
+                    )
+                prev_peak = cur_peak

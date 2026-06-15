@@ -118,7 +118,7 @@ def myfa_mask_fwd(
 
                 # alpha
                 for i in T.Parallel(BLOCK_Q):
-                    alpha[i] = T.exp((m_prev[i] - m[i]))
+                    alpha[i] = T.exp(m_prev[i] - m[i])
 
                 # exp(s)
                 for i, j in T.Parallel(BLOCK_Q, BLOCK_K):

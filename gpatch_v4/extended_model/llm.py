@@ -607,6 +607,9 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
             packed_seq_params=packed_seq_params,
         )
 
+        # Store cp_group in batch so the loss function can use it for CP reduction.
+        batch["cp_group"] = cp_group
+
         return batch, fwd_kwargs
 
     @override

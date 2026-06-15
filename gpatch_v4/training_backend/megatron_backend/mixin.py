@@ -172,6 +172,16 @@ class BridgeUtilsMixin:
 
     def build_bridge(self, hf_model_path, override_transformer_config=None):
         cache_hf_metadata_files(hf_model_path, self.checkpoint_config.save_ckpt_path)
+        if self.training_config.use_linear_ce:
+            if override_transformer_config is None:
+                override_transformer_config = {}
+            override_transformer_config['cross_entropy_loss_fusion'] = True
+            override_transformer_config['cross_entropy_fusion_impl'] = 'linear'
+            logging_rank0(
+                "use_linear_ce enabled: inject cross_entropy_loss_fusion=True, "
+                "cross_entropy_fusion_impl='linear' into override_transformer_config"
+            )
+
         if self.config.training.build_from_mbridge:
             return self.build_mbridge(hf_model_path, override_transformer_config)
         else:
@@ -1699,23 +1709,31 @@ class ForwardStepMixin(RouterReplayMixin):
                 vocab_size=self.vocab_size,
             )
 
+            fp32_output = not self.training_config.use_linear_ce
             if not self.policy_config.ppo_pack_seq:
-                parallel_logits = model(**fwd_kwargs)
+                model_output = model(**fwd_kwargs, fp32_output=fp32_output)
             else:
-                parallel_logits = gptmodel_pack_foward(unwrapped_model, batch, fwd_kwargs)
+                assert not self.training_config.use_linear_ce, "暂不支持"
+                model_output = gptmodel_pack_foward(unwrapped_model, batch, fwd_kwargs)
 
-            if isinstance(parallel_logits, tuple):
-                parallel_logits = parallel_logits[0]
-            assert isinstance(parallel_logits, torch.Tensor)
+            if isinstance(model_output, tuple):
+                model_output = model_output[0]
+            if self.training_config.use_linear_ce and mpu.is_pipeline_last_stage():
+                assert isinstance(model_output, dict)
+                assert model_output["hidden_states"].dtype == torch.bfloat16
+            else:
+                assert isinstance(model_output, torch.Tensor)
 
-            def loss_func(parallel_logits):
+            def loss_func(model_output):
                 loss_fn = get_policy_loss_fn(self.training_config.loss_func)
                 batch["should_dump_metrics"] = self.should_dump_metrics
                 loss_input = FinetuneLossInput(
-                    logits=parallel_logits,
+                    logits=model_output if isinstance(model_output, torch.Tensor) else None,
                     batch=batch,
                     unwrapped_model=unwrapped_model,
                     skip_cp_loss_reduce=self.calc_per_token_loss,
+                    linear_ce_input=model_output if isinstance(model_output, dict) else None,
+                    cp_group=batch.get("cp_group", None),
                 )
                 result = loss_fn(self.config, loss_input)
                 if microbatch_loss_reweight is not None:
@@ -1726,7 +1744,7 @@ class ForwardStepMixin(RouterReplayMixin):
                 batch.pop("should_dump_metrics", None)
                 return result
 
-            return parallel_logits, loss_func
+            return model_output, loss_func
 
         return partial(fwd_output_and_loss_func, seq_length, microbatch_loss_reweight)
 

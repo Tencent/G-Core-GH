@@ -94,6 +94,12 @@ def _build_and_load(
 
     model = apply_hp(model, ep_2d_mesh, cp_mesh=None, amp_fp32=False)
     model.gradient_checkpointing_enable()
+    for _bi, _blk in enumerate(model.mtp.layers):
+        assert _blk.gradient_checkpointing, (
+            f"MTP block {_bi} gradient_checkpointing not enabled after "
+            f"gradient_checkpointing_enable(); "
+            f"DeepseekV4MTPBlock must inherit GradientCheckpointingLayer"
+        )
     model.load_checkpoint_hp(hf_model_path)
     return model
 

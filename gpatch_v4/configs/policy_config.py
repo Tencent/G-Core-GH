@@ -22,6 +22,10 @@ class BasePolicyConfig(MappingProtocol):
         Reference model checkpoint (for KL computation).
     attn_implementation : str
         FSDP2 backend: ``"flash_attention_2"`` / ``"sdpa"`` / ``"eager"``.
+    ep_backend : str
+        DeepSeek-V4 expert dispatch backend: ``"eager"`` / ``"deepep"``.
+    deepep_num_sms : int
+        Number of SMs assigned to DeepEP kernels.
     rollout_gen_type : str or None
         ``"base"`` / ``"replay"`` / ``"dynamic_sampling"``.
     forward_only_mbs : int
@@ -57,6 +61,13 @@ class BasePolicyConfig(MappingProtocol):
     attn_implementation: str = field(
         default="flash_attention_2",
         metadata={"help": "fsdp Attention implementation.: flash_attention_2, sdpa, eager"}
+    )
+    indexer_backend: str = field(
+        default="eager", metadata={"help": "DSV4 indexer backend: eager, fused"}
+    )
+    ep_backend: str = field(default="eager", metadata={"help": "DSV4 EP backend: eager, deepep"})
+    deepep_num_sms: int = field(
+        default=24, metadata={"help": "Number of SMs used by DeepEP kernels"}
     )
 
     rollout_gen_type: Optional[str] = field(

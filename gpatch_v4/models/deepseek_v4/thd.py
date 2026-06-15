@@ -149,7 +149,9 @@ class PackedSeqParams:
         assert (self.cu_seqlens_q[1:] >= self.cu_seqlens_q[:-1]).all().item()
         assert (self.cu_seqlens_q_padded[1:] >= self.cu_seqlens_q_padded[:-1]).all().item()
         assert (self.cu_seqlens_q <= self.cu_seqlens_q_padded).all().item()
-        assert int((self.cu_seqlens_q_padded[1:] - self.cu_seqlens_q_padded[:-1]).max()) == self.max_seqlen_q
+        assert int(
+            (self.cu_seqlens_q_padded[1:] - self.cu_seqlens_q_padded[:-1]).max()
+        ) == self.max_seqlen_q
         assert int(self.cu_seqlens_q_padded[-1]) == self.total_seqlen
 
 
@@ -220,11 +222,11 @@ class _PerMLayout:
         windows.
     """
 
-    causal_threshold_per_token: torch.Tensor            # used: HCA / Indexer future-causal gate
-    seg_id_per_wnd: torch.Tensor                        # used: HCA/Indexer cross_seg_mask + Indexer top-k seg-membership check
-    wnd_pos_ids: torch.Tensor                           # used: HCA compressor RoPE positions (no CP prefix)
-    wnd_pos_ids_with_prefix: torch.Tensor               # used: CSA/Indexer compressor RoPE positions (with CP prefix)
-    pad_token_mask_with_prefix: torch.Tensor            # used: CSA/Indexer pad-token gate -inf
+    causal_threshold_per_token: torch.Tensor  # used: HCA / Indexer future-causal gate
+    seg_id_per_wnd: torch.Tensor  # used: HCA/Indexer cross_seg_mask + Indexer top-k seg-membership check
+    wnd_pos_ids: torch.Tensor  # used: HCA compressor RoPE positions (no CP prefix)
+    wnd_pos_ids_with_prefix: torch.Tensor  # used: CSA/Indexer compressor RoPE positions (with CP prefix)
+    pad_token_mask_with_prefix: torch.Tensor  # used: CSA/Indexer pad-token gate -inf
     first_of_seg_window_mask_with_prefix: torch.Tensor  # used: CSA/Indexer first-of-seg Ca slot zero+gate
 
 
@@ -247,10 +249,20 @@ class _PackedSeqLayout:
     seg_id_per_token_full : Tensor
         Shape ``[T]`` long, **always global** (``cp_slice_layout`` does
         NOT slice this field). Same content as ``seg_id_per_token``
-        before CP slicing; kept as a separate field so attention's CP
-        path can take a per-rank slice with arbitrary ``swa_prefix_len``
-        (which depends on the layer's ``sliding_window``, not on ``m``,
-        and isn't known until layer-time).
+        before CP slicing. Prefer :attr:`seg_id_per_token_with_prefix`
+        for SWA kv-side cross-seg gate when the layout was CP-sliced with
+        ``sliding_window``.
+
+    seg_id_per_token_with_prefix : Tensor
+        Shape ``[T]`` long (global); after :func:`cp_slice_layout` shape
+        ``[s_local + l_swa_prefix]`` where ``l_swa_prefix = 0`` on rank
+        0 and ``sliding_window - 1`` on rank > 0. Seg id per token in
+        the SWA kv buffer view (``swa_ring_kv`` prefix + local kv).
+
+        Example (W=4, cp_size=2, s_local=4, rank=1)::
+
+            seg_id_per_token_with_prefix = seg_id_full[0:7]
+            # kv buffer slots [0..6] = prefix [0..2] ++ local [3..6]
 
     pad_token_mask : Tensor
         Shape ``[T]`` bool. ``True`` at pad slots, ``False`` at effective
@@ -267,12 +279,18 @@ class _PackedSeqLayout:
         One bundle per ``m`` in ``sorted(set(config.compress_rates.values()))``;
         see :class:`_PerMLayout`. Default V4 ``compress_rates = {4, 128}``
         ⇒ keys ``{4, 128}``.
+
+    sliding_window : int
+        From ``config.sliding_window``; used by :func:`cp_slice_layout` for
+        ``seg_id_per_token_with_prefix`` SW prefix length.
     """
 
-    seg_id_per_token: torch.Tensor       # used: modeling cross_seg_mask（HCA / Indexer 各 1 处）
-    seg_id_per_token_full: torch.Tensor  # used: attention CP path cross-seg gate；cp_slice_layout 不切（保持全局 [T]），attention 按 swa_prefix_len 自切
-    pad_token_mask: torch.Tensor         # used: _per_m_layout 内部作 pad_token_mask_with_prefix 来源
+    seg_id_per_token: torch.Tensor  # used: modeling cross_seg_mask（HCA / Indexer 各 1 处）
+    seg_id_per_token_full: torch.Tensor  # used: build_cp_causal_mask 等仍读全局 [T] 的路径
+    seg_id_per_token_with_prefix: torch.Tensor  # used: fused SWA kv-side cross-seg gate
+    pad_token_mask: torch.Tensor  # used: _per_m_layout 内部作 pad_token_mask_with_prefix 来源
     per_m: dict[int, _PerMLayout]
+    sliding_window: int
 
 
 # Public alias for cross-module type hints; the underscore prefix is kept on
@@ -339,7 +357,9 @@ def _per_m_layout(
     for i in range(n_segs):
         seg_start = cu_seqlens_q_padded[i]
         seg_end = cu_seqlens_q_padded[i + 1]
-        pos_ids[seg_start:seg_end] = torch.arange(seg_end - seg_start, dtype=torch.long, device=device)
+        pos_ids[seg_start:seg_end] = torch.arange(
+            seg_end - seg_start, dtype=torch.long, device=device
+        )
     wnd_pos_ids = pos_ids[::m]
     wnd_pos_ids_with_prefix = pos_ids[::m]
 
@@ -366,8 +386,7 @@ def make_packed_seq_layout(
         ``max_seqlen_q`` / ``total_seqlen``.
 
     config : DeepseekV4Config
-        Used only to read ``compress_rates`` (a ``dict[str, int]``) for the
-        per-``m`` bundle keys.
+        Used to read ``compress_rates`` and ``sliding_window``.
 
     Returns
     -------
@@ -404,8 +423,10 @@ def make_packed_seq_layout(
     return _PackedSeqLayout(
         seg_id_per_token=seg_id_per_token,
         seg_id_per_token_full=seg_id_per_token,
+        seg_id_per_token_with_prefix=seg_id_per_token,
         pad_token_mask=pad_token_mask,
         per_m=per_m,
+        sliding_window=config.sliding_window,
     )
 
 
@@ -436,6 +457,9 @@ def cp_slice_layout(
         │ seg_id_per_token                              │ ✅ slice             │ [s_local]                   │
         ├───────────────────────────────────────────────┼──────────────────────┼─────────────────────────────┤
         │ seg_id_per_token_full                         │ ❌ stay global       │ [T]                         │
+        ├───────────────────────────────────────────────┼──────────────────────┼─────────────────────────────┤
+        │ seg_id_per_token_with_prefix                  │ ✅ slice with SW     │ [s_local + l_swa_prefix]    │
+        │                                               │    prefix            │                             │
         ├───────────────────────────────────────────────┼──────────────────────┼─────────────────────────────┤
         │ pad_token_mask                                │ ✅ slice             │ [s_local]                   │
         ├───────────────────────────────────────────────┼──────────────────────┼─────────────────────────────┤
@@ -483,6 +507,9 @@ def cp_slice_layout(
     s_local = total_seqlen // cp_size
     start = cp_rank * s_local
     sl = slice(start, start + s_local)
+    sliding_window = layout.sliding_window
+    l_swa_prefix = 0 if cp_rank == 0 else sliding_window - 1
+    sl_swa_with_prefix = slice(start - l_swa_prefix, start + s_local)
 
     new_per_m: dict[int, _PerMLayout] = {}
     for m, per_m in layout.per_m.items():
@@ -500,21 +527,21 @@ def cp_slice_layout(
         new_per_m[m] = dataclasses.replace(
             per_m,
             causal_threshold_per_token=per_m.causal_threshold_per_token[sl],
-            wnd_pos_ids=per_m.wnd_pos_ids[sl_wnd],                                        # HCA RoPE
-            wnd_pos_ids_with_prefix=per_m.wnd_pos_ids_with_prefix[sl_wnd_with_prefix],    # CSA/Indexer RoPE
+            wnd_pos_ids=per_m.wnd_pos_ids[sl_wnd],  # HCA RoPE
+            wnd_pos_ids_with_prefix=per_m.
+            wnd_pos_ids_with_prefix[sl_wnd_with_prefix],  # CSA/Indexer RoPE
             pad_token_mask_with_prefix=per_m.pad_token_mask_with_prefix[sl_with_prefix],
-            first_of_seg_window_mask_with_prefix=per_m.first_of_seg_window_mask_with_prefix[sl_wnd_with_prefix],
+            first_of_seg_window_mask_with_prefix=per_m.
+            first_of_seg_window_mask_with_prefix[sl_wnd_with_prefix],
         )
 
     return _PackedSeqLayout(
-        # Per-token q-side fields: slice to s_local (no prefix).
         seg_id_per_token=layout.seg_id_per_token[sl],
-        # ``seg_id_per_token_full`` stays global so attention's CP path
-        # can take a per-rank slice with arbitrary ``swa_prefix_len``
-        # (depends on the layer's sliding_window, not on m).
         seg_id_per_token_full=layout.seg_id_per_token_full,
+        seg_id_per_token_with_prefix=layout.seg_id_per_token_with_prefix[sl_swa_with_prefix],
         pad_token_mask=layout.pad_token_mask[sl],
         per_m=new_per_m,
+        sliding_window=layout.sliding_window,
     )
 
 
@@ -529,6 +556,7 @@ def pack_sequences(
     *,
     config: "DeepseekV4Config",
     pad_to_multiple_of: int,
+    cp_size: int = 1,
     pad_token_id: int = 0,
     label_ignore_index: int = -100,
     device: torch.device | None = None,
@@ -537,12 +565,8 @@ def pack_sequences(
 
     Each segment of length ``s_i`` is right-padded with ``pad_token_id`` to
     the next multiple of ``pad_to_multiple_of`` (call it ``s_i_padded``).
-    Position ids are seg-local (each segment counts from 0, including the
-    pad tail) and returned **alongside** :class:`PackedSeqParams` rather
-    than inside it, so the caller can cp-slice / device-move them without
-    rebuilding the layout fields. Labels (when provided) get
-    ``label_ignore_index`` at the last effective position of every segment
-    and at every pad position.
+    When ``cp_size > 1``, the last segment is further padded so that
+    ``T_TOTAL`` is a multiple of ``cp_size * pad_to_multiple_of``.
 
     Parameters
     ----------
@@ -553,19 +577,15 @@ def pack_sequences(
         must match the corresponding ``input_ids[i]``.
     config : DeepseekV4Config
         Used to build the per-``m`` layout (read ``compress_rates``).
-        Carrying the layout inside :class:`PackedSeqParams` lets
-        ``cp_chunk_data`` slice both data and layout in one place.
     pad_to_multiple_of : int
         Each segment's padded length is the smallest multiple of this
-        value that's ``>= s_i``. Caller passes ``max(config.compress_rates.values())``
-        (V4-Flash default = 128).
+        value that's ``>= s_i``.
+    cp_size : int
+        Context-parallelism world size. ``T_TOTAL`` is guaranteed to be
+        a multiple of ``cp_size * pad_to_multiple_of``.
     pad_token_id : int
-        Token id used for pad slots in ``input_ids_packed``. Default 0.
     label_ignore_index : int
-        Value used to mask segment-final tokens and pad tokens in
-        ``labels_packed``. Default -100.
     device : torch.device | None
-        Output device; defaults to ``input_ids[0].device``.
 
     Returns
     -------
@@ -576,8 +596,6 @@ def pack_sequences(
     labels_packed : Tensor | None
         Shape ``[1, T]`` long, or ``None`` if ``labels`` is ``None``.
     psp : PackedSeqParams
-        Holds ``cu_seqlens_q`` / ``cu_seqlens_q_padded`` / ``max_seqlen_q`` /
-        ``total_seqlen``.
     """
     if len(input_ids) == 0:
         raise ValueError("input_ids must be a non-empty list")
@@ -588,6 +606,8 @@ def pack_sequences(
 
     if device is None:
         device = input_ids[0].device
+
+    total_align = cp_size * pad_to_multiple_of
 
     seqlens: list[int] = []
     padded_seqlens: list[int] = []
@@ -613,6 +633,11 @@ def pack_sequences(
         s_padded = ((s + pad_to_multiple_of - 1) // pad_to_multiple_of) * pad_to_multiple_of
         seqlens.append(s)
         padded_seqlens.append(s_padded)
+
+    T = sum(padded_seqlens)
+    if T % total_align != 0:
+        extra = total_align - (T % total_align)
+        padded_seqlens[-1] += extra
 
     T = sum(padded_seqlens)
     n_segs = len(seqlens)
