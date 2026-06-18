@@ -16,6 +16,12 @@ from transformers import AutoModelForCausalLM
 from megatron.core import mpu
 from megatron.core.utils import divide
 
+from gpatch_v4.core.mappings import (
+    all_gather_from_context_parallel_region,
+    all_gather_from_context_parallel_region_no_zigzag,
+)
+from gpatch_v4.extended_model import DeepseekV4PrepareDataForwardLLM
+
 try:
     from gpatch_v4.models.deepseek_v4 import DeepseekV4ForCausalLM, apply_hp
 except ImportError:
@@ -417,9 +423,23 @@ class ForwardStepMixin:
         clear_memory()
         return logprobs
 
+    def _all_gather_cp_aware(self, local_tensor: torch.Tensor, gather_dim: int = 1) -> torch.Tensor:
+        """All-gather across CP ranks, dispatching the correct pattern.
+
+        DSv4 models use contiguous non-zigzag split; legacy models use
+        mirror-pair zigzag.
+        """
+        cp_size = mpu.get_context_parallel_world_size()
+        if cp_size <= 1:
+            return local_tensor
+        if isinstance(self.prepare_data, DeepseekV4PrepareDataForwardLLM):
+            return all_gather_from_context_parallel_region_no_zigzag(local_tensor, gather_dim)
+        else:
+            return all_gather_from_context_parallel_region(local_tensor, gather_dim)
+
     def gather_log_probs_packed(
         self,
-        shifted_logits: torch.Tensor,
+        logits: torch.Tensor,
         input_ids: torch.Tensor,
         allow_compile: bool,
         cu_seqlens: torch.Tensor | float | None = None,
@@ -436,20 +456,25 @@ class ForwardStepMixin:
             ``[B, S-1]`` target log-probs.
         """
         # Handle batch dimension - logits should be [batch_size, seq_len, vocab_size]
-        assert shifted_logits.dim() == 3
+        assert logits.dim() == 3
         assert input_ids.dim() == 2
         assert cu_seqlens is None, "cu_seqlens is not supported"
 
         if temperature is not None:
-            shifted_logits = shifted_logits.div(temperature)
+            logits = logits.div(temperature)
 
-        targets = input_ids[:, 1:].to(device=shifted_logits.device)
-        assert shifted_logits.shape[:2
-                                   ] == targets.shape, f"{shifted_logits.shape=} {targets.shape=}"
+        targets = input_ids.roll(shifts=-1, dims=-1)
+        local_targets = self.prepare_data._rl_train_cp_chunk_single_data(targets)
+        # targets = input_ids[:, 1:].to(device=shifted_logits.device)
+
+        assert logits.shape[:2] == local_targets.shape, f"{logits.shape=} {local_targets.shape=}"
 
         # Gather log probs for targets
         selective_log_softmax = selective_log_softmax_compiled if allow_compile else selective_log_softmax_raw
-        return selective_log_softmax(shifted_logits, targets)
+        curr_log_probs = selective_log_softmax(logits, local_targets)
+        curr_log_probs = self._all_gather_cp_aware(curr_log_probs)
+
+        return curr_log_probs[:, :-1].contiguous()
 
     def get_logprob_and_entropy(
         self,
@@ -471,11 +496,12 @@ class ForwardStepMixin:
             log_probs: ``[B, S-1]``.
             entropy: ``[B, S-1]``.
         """
-        shifted_logits = logits[:, :-1, :]
+        # shifted_logits = logits[:, :-1, :]
         log_probs = self.gather_log_probs_packed(
-            shifted_logits, target_tokens, allow_compile=allow_compile, temperature=temperature
+            logits, target_tokens, allow_compile=allow_compile, temperature=temperature
         )
         if return_entropy:
+            shifted_logits = logits[:, :-1, :]
             log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
             probs = torch.softmax(shifted_logits, dim=-1)
             entropy = -(probs * log_probs_full).sum(dim=-1)

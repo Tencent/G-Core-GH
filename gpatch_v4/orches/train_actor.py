@@ -14,11 +14,26 @@ import gpatch_v4.core.device  # noqa: F401  # ensure device backend is initializ
 import torch.distributed as dist
 from transformers import AutoConfig
 
+from gpatch_v4.orches.flashinfer_cudart_fix import (
+    patch_ctypes_for_cudart_stub,
+)
 import gpatch_v4.utils.common_utils as common_utils
+from gpatch_v4.core.parallel_state import enable_deterministic_mode_env
 from gpatch_v4.orches.base_actor import RayBaseActor
 from gpatch_v4.orches.utils import get_local_gpu_id
 from gpatch_v4.utils import monkey_patch_torch_dist
 from gpatch_v4.utils.logging_utils import setup_gpatch_logging
+
+# 先加一个魔法，解决 sglang / vllm 的 libcudart 问题
+with patch_ctypes_for_cudart_stub():
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM
+    except Exception:
+        pass
+    try:
+        import sglang.srt.entrypoints.engine
+    except Exception:
+        pass
 
 
 class BaseActor(RayBaseActor):
@@ -103,6 +118,9 @@ class BaseActor(RayBaseActor):
                                       'policy') and not hasattr(self.config, 'training')
         if not infer_only_mode and self.config.training.offload_process_group:
             monkey_patch_torch_dist()
+
+        if not infer_only_mode and self.config.training.apply_deterministic_mode:
+            enable_deterministic_mode_env()
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(f"cuda:{local_rank}")

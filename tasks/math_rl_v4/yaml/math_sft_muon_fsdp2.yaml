@@ -1,0 +1,62 @@
+# @package _global_
+
+training:
+  training_backend: fsdp2
+  use_fast_tokenizer: True
+  train_gbs: 256
+  train_mbs: 1
+  seq_length: 4096
+  data_parallel_random_init: False
+  save_interval: 5000
+  num_train_epoches: 1
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+
+policy:
+  dist_config:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+  model_arch: "qwen2"
+  without_ref: True
+  hf_model_path: "hf-hub/Qwen/Qwen2.5-Math-1.5B"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen2.5-Math-1.5B"
+
+checkpoint:
+  load_ckpt_path: load_sft_ckpt
+  save_ckpt_path: save_qwen_2_5_1_5b_sft_muon
+  save_total_limit: 5
+  save_retain_interval: 5000
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+  override_tokenizer_special_token:
+    eos_token: "<|im_end|>"
+# 注意，如果训练的事 base model, 那么有必要设置 override_tokenizer_special_token 的 eos_token 位置，否则保存下来的 eos_token 会很混乱
+
+optimizer:
+  optimizer_type: "muon"
+  lr: 2.0e-5
+  lr_warmup_steps: 200
+  lr_decay_style: "cosine"
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  # fsdp2 muon 基于 moonlight https://github.com/MoonshotAI/Moonlight 的naive实现，只有以下4个超参
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_num_ns_steps: 5
+  muon_extra_scale_factor: 0.2
+
+data:
+  data_pathes:
+    - "hf-hub/AI-MO/NuminaMath-CoT-jsonl/train/"
+  py_path: "tasks/math_rl_v4/finetune_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+debug:
+  save_first_rollout_data: False
+  experimental_pad_to_max_length: False

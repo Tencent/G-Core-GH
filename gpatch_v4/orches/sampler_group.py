@@ -152,9 +152,22 @@ class RaySamplerGroup:
             for ep_idx in range(num_engines):
                 actor = self._actor_handlers[sampler_idx][ep_idx]
                 tp_rank = (ep_idx * num_gpus_per_engine) % num_gpus_per_cluster
-                start = ep_idx * num_gpus_per_engine
                 tp_size = dist_config.tensor_model_parallel_size
+                # Only vLLM consumes ``pg_bundle_indices`` via
+                # ``VLLM_RAY_BUNDLE_INDICES``. Keep non-vLLM behavior unchanged.
+                if self.config.sampler.backend == "vllm" and tp_size > num_gpus_per_engine:
+                    # For cross-node TP, engines in the same cluster must share
+                    # one full TP bundle set; sliding by engine index can produce
+                    # partial bundle lists for tail engines.
+                    cluster_idx = ep_idx // num_engines_per_cluster
+                    start = cluster_idx * num_gpus_per_cluster
+                else:
+                    start = ep_idx * num_gpus_per_engine
                 engine_pg_bundles = list(self._reordered_bundle_indices[start:start + tp_size])
+                assert len(engine_pg_bundles) == tp_size, (
+                    f"sampler engine {ep_idx} expects {tp_size} TP bundles, got "
+                    f"{len(engine_pg_bundles)} (start={start})"
+                )
                 fut = actor.init_infer_engine.remote(
                     self.config,
                     addr_and_ports[ep_idx]['dist_init_addr'],

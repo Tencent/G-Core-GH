@@ -12,6 +12,7 @@ training:
   comput_attn_mask: False
   sort_batched: False
   auto_load_from_save_ckpt: True
+  attention_backend: flash
 
 policy:
   dist_config:

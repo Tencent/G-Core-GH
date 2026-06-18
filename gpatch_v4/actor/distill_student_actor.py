@@ -184,9 +184,8 @@ class DistillStudentActor(GrpoTrainActor):
 
         # G-OPD top-K: ref 在 student topk_ids 上 gather
         need_ref_topk_gather = (
-            self.config.ppo.log_prob_top_k > 0
-            and self.config.ppo.advantage_type == "g_opd"
-            and not self.config.policy.without_ref
+            self.config.ppo.log_prob_top_k > 0 and self.config.ppo.advantage_type == "g_opd" and
+            not self.config.policy.without_ref
         )
 
         timers("compute_logps", log_level=0).start(barrier=True)
@@ -445,6 +444,10 @@ class DistillStudentActor(GrpoTrainActor):
 
         cpu_barrier()
         if ppo_step % training_config.save_interval != 0:
+            if self.config.placement_type != "disaggregated":
+                for sampler_idx in range(self.sampler_client.num_samplers):
+                    await self.sampler_client.sleep(sampler_idx)
+                cpu_barrier()
             self.policy_engine.onload_model()
             self.policy_engine.onload_optimizer()
             await self.save_checkpoint(ppo_step)

@@ -97,6 +97,7 @@ class PolicyLossInput:
     parallel_logits: Optional[torch.Tensor] = None
     sample_mask: Optional[torch.Tensor] = None
     global_retention_ratio: Optional[torch.Tensor] = None
+    entropy_aux_figures: Optional[torch.Tensor] = None
     teacher_log_probs: Optional[torch.Tensor] = None
     dumped_topk_logprobs: Optional[torch.Tensor] = None
     dumped_topk_token_ids: Optional[torch.Tensor] = None
@@ -162,6 +163,167 @@ def register_custom_loss_fn(name: str, py_path: str, fn_name: str):
     LOSS_FUNC_REGISTRY[name] = fn
 
 
+def compute_entropy_regularization_loss(
+    ppo_config,
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    pg_losses1: torch.Tensor,
+    pg_losses2: torch.Tensor,
+    entropy_aux_figures: Optional[torch.Tensor] = None,
+    rollout_log_probs: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict]:
+    """Entropy regularization via clip-cov or kl-cov.
+
+    Modifies the per-token policy gradient losses to control entropy collapse.
+    ref: https://arxiv.org/abs/2505.22617
+
+    Parameters
+    ----------
+    ppo_config : PpoConfig
+        PPO configuration containing regularization hyperparameters.
+    old_log_prob : torch.Tensor
+        Previous policy log-probabilities, shape ``[B, S]``.
+    log_prob : torch.Tensor
+        Current policy log-probabilities, shape ``[B, S]``.
+    advantages : torch.Tensor
+        Per-token advantages, shape ``[B, S]``.
+    response_mask : torch.Tensor
+        Binary mask for valid response tokens, shape ``[B, S]``.
+    pg_losses1 : torch.Tensor
+        Unclipped surrogate loss ``-advantages * ratios``, shape ``[B, S]``.
+    pg_losses2 : torch.Tensor
+        Clipped surrogate loss ``-advantages * ratios_clamped``, shape ``[B, S]``.
+    entropy_aux_figures : torch.Tensor, optional
+        Global covariance figures ``[mean_adv, mean_logp, kl_cov_tau]`` (shape
+        ``(3,)``) precomputed at collation across the global train_gbs / DP. When
+        present and ``ppo_entropy_global_cov`` is on, the covariance is centered
+        on the global means and kl-cov selects ``cov > kl_cov_tau`` (exact global
+        top-rho%). When None, the per-micro-batch behavior is used.
+    rollout_log_probs : torch.Tensor, optional
+        Sampler log-probs, used as the covariance log-prob in the global path
+        when ``skip_prev_logps`` (prev_log_probs is unavailable then).
+
+    Returns
+    -------
+    pg_losses : torch.Tensor
+        Modified per-token losses after entropy regularization, shape ``[B, S]``.
+    metrics : dict
+        Regularization-specific metrics for logging.
+    """
+    reg_type = ppo_config.ppo_entropy_regularization_type
+    assert reg_type in ("clip-cov", "kl-cov"), \
+        f"ppo_entropy_regularization_type must be 'clip-cov' or 'kl-cov', got '{reg_type}'"
+
+    # Global covariance: center on global means (and, for kl-cov, select via the
+    # global top-rho% threshold) using the same log-prob space as collation.
+    use_global = ppo_config.ppo_entropy_global_cov and entropy_aux_figures is not None
+    if use_global:
+        cov_log_prob = rollout_log_probs if ppo_config.skip_prev_logps else old_log_prob
+        assert cov_log_prob is not None, (
+            "global entropy cov requires rollout_log_probs (skip_prev_logps) "
+            "or prev_log_probs as the covariance log-prob"
+        )
+        cov_log_prob = cov_log_prob.detach()
+        global_mean_adv = entropy_aux_figures[0]
+        global_mean_logp = entropy_aux_figures[1]
+        kl_cov_tau = entropy_aux_figures[2]
+
+    metrics = {}
+    cov_for_metrics = None
+    pg_losses = None
+
+    if reg_type == "clip-cov":
+        corr = torch.ones_like(advantages)
+        clip_by_origin = (pg_losses2 > pg_losses1) & (response_mask > 0)
+        if use_global:
+            cov_all = (advantages - global_mean_adv) * (cov_log_prob - global_mean_logp)
+        else:
+            cov_all = (
+                (advantages - masked_mean(advantages, response_mask)) *
+                (log_prob - masked_mean(log_prob.detach(), response_mask))
+            )
+        cov_for_metrics = cov_all[response_mask > 0].clone().detach()
+        cov_all[response_mask == 0] = -torch.inf
+        cov_all[clip_by_origin] = -torch.inf
+        clip_num = max(int(ppo_config.ppo_clip_cov_ratio * response_mask.sum().item()), 1)
+        top_k_idx = (
+            (cov_all < ppo_config.ppo_clip_cov_ub) & (cov_all > ppo_config.ppo_clip_cov_lb) &
+            (response_mask > 0)
+        )
+        top_k_idx = torch.nonzero(top_k_idx)
+        if len(top_k_idx) > 0:
+            perm = torch.randperm(len(top_k_idx))
+            top_k_idx = top_k_idx[perm[:min(clip_num, len(top_k_idx))]]
+        else:
+            top_k_idx = torch.empty((0, 2), device=cov_all.device, dtype=torch.long)
+        corr[top_k_idx[:, 0], top_k_idx[:, 1]] = 0
+        pg_clipfrac = masked_mean((corr == 0).float(), response_mask)
+        pg_losses = torch.maximum(pg_losses1, pg_losses2) * corr
+        metrics["clip_cov_frac"] = pg_clipfrac
+
+    elif reg_type == "kl-cov":
+        clip_max_loss = torch.maximum(pg_losses1, pg_losses2)  # NOTE: avoid loss collapse
+        negative_approx_kl = log_prob - old_log_prob
+        if ppo_config.ppo_logps_ratio_clamp is not None:  # NOTE: avoid kl collapse
+            negative_approx_kl = torch.clamp(
+                negative_approx_kl,
+                min=-ppo_config.ppo_logps_ratio_clamp,
+                max=ppo_config.ppo_logps_ratio_clamp
+            )
+        abs_kl = negative_approx_kl.abs()
+        pg_losses_kl = clip_max_loss + ppo_config.ppo_kl_cov_coef * abs_kl
+        pg_losses = clip_max_loss.clone()
+
+        if use_global:
+            # Exact global top-rho%: select tokens whose globally-centered cov
+            # exceeds the global threshold tau (tau = +inf disables selection).
+            cov = (advantages - global_mean_adv) * (cov_log_prob - global_mean_logp)
+            select = (cov > kl_cov_tau) & (response_mask > 0)
+            cov_for_metrics = cov[response_mask > 0].clone().detach()
+            pg_losses[select] = pg_losses_kl[select]
+        else:
+            all_valid = response_mask > 0
+            all_valid_idx = torch.nonzero(all_valid.reshape(-1), as_tuple=True)[0]
+            all_valid_adv = advantages[all_valid].detach().reshape(-1)
+            all_valid_logp = log_prob[all_valid].detach().reshape(-1)
+            k = min(ppo_config.ppo_kl_cov_ratio, len(all_valid_adv))
+            if k != 0:
+                cov_lst_all = (
+                    (all_valid_adv - all_valid_adv.mean()) *
+                    (all_valid_logp - all_valid_logp.mean())
+                )
+                cov_for_metrics = cov_lst_all.clone().detach()
+                k_percent_nums = max(1, int(len(cov_lst_all) * ppo_config.ppo_kl_cov_ratio))
+                large_cov_idxs = torch.topk(cov_lst_all, k_percent_nums, largest=True).indices
+
+                if len(large_cov_idxs) != 0:
+                    large_cov_idxs = all_valid_idx[large_cov_idxs]
+                    pg_losses[large_cov_idxs // advantages.shape[1], large_cov_idxs %
+                              advantages.shape[1]] = pg_losses_kl[large_cov_idxs //
+                                                                  advantages.shape[1],
+                                                                  large_cov_idxs %
+                                                                  advantages.shape[1]]
+        ppo_kl_abs = masked_mean(negative_approx_kl.abs(), response_mask)
+        metrics["ppo_abs_kl"] = ppo_kl_abs
+
+    if cov_for_metrics is not None and len(cov_for_metrics) > 0:
+        # choose quantiles according to Table 1, https://arxiv.org/abs/2505.22617
+        p50, p80, p98, p99_8, p99_98 = torch.quantile(
+            cov_for_metrics,
+            torch.tensor([0.5, 0.8, 0.98, 0.998, 0.9998], device=cov_for_metrics.device),
+            interpolation='linear',
+        )
+        metrics["cov_p50"] = p50
+        metrics["cov_p80"] = p80
+        metrics["cov_p98"] = p98
+        metrics["cov_p99_8"] = p99_8
+        metrics["cov_p99_98"] = p99_98
+
+    return pg_losses, metrics
+
+
 @register_loss("grpo")
 def grpo_loss_func(config, loss_input: PolicyLossInput):
     ppo_config = config.ppo
@@ -206,7 +368,23 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
 
     loss1 = -advantages * ratios
     loss2 = -advantages * ratios_clamped
-    clip_max_loss = torch.maximum(loss1, loss2)
+
+    entropy_reg_metrics = {}
+    if ppo_config.ppo_entropy_regularization_type is not None:
+        clip_max_loss, entropy_reg_metrics = compute_entropy_regularization_loss(
+            ppo_config,
+            old_log_prob=prev_log_probs,
+            log_prob=curr_log_probs,
+            advantages=advantages,
+            response_mask=response_mask,
+            pg_losses1=loss1,
+            pg_losses2=loss2,
+            entropy_aux_figures=loss_input.entropy_aux_figures,
+            rollout_log_probs=loss_input.rollout_log_probs,
+        )
+    else:
+        clip_max_loss = torch.maximum(loss1, loss2)
+
     # ref from: https://arxiv.org/pdf/1912.09729
     if ppo_config.ppo_dual_clip_ratio_c is not None:
         loss3 = -advantages * ppo_config.ppo_dual_clip_ratio_c
@@ -300,6 +478,8 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
 
     if extra_metrics:
         metrics.update(extra_metrics)
+    if entropy_reg_metrics:
+        metrics.update(entropy_reg_metrics)
     if sample_mask is not None:
         metrics["valid_sample_ratio"] = masked_mean(
             sample_mask.float().detach(), torch.ones_like(sample_mask, dtype=torch.float)
@@ -396,7 +576,22 @@ def opd_loss_func(config, loss_input: PolicyLossInput):
 
     loss1 = -advantages * ratios
     loss2 = -advantages * ratios_clamped
-    clip_max_loss = torch.maximum(loss1, loss2)
+
+    entropy_reg_metrics = {}
+    if ppo_config.ppo_entropy_regularization_type is not None:
+        clip_max_loss, entropy_reg_metrics = compute_entropy_regularization_loss(
+            ppo_config,
+            old_log_prob=prev_log_probs,
+            log_prob=curr_log_probs,
+            advantages=advantages,
+            response_mask=response_mask,
+            pg_losses1=loss1,
+            pg_losses2=loss2,
+            entropy_aux_figures=loss_input.entropy_aux_figures,
+            rollout_log_probs=loss_input.rollout_log_probs,
+        )
+    else:
+        clip_max_loss = torch.maximum(loss1, loss2)
 
     if ppo_config.ppo_dual_clip_ratio_c is not None:
         loss3 = -advantages * ppo_config.ppo_dual_clip_ratio_c
@@ -492,6 +687,8 @@ def opd_loss_func(config, loss_input: PolicyLossInput):
 
     if extra_metrics:
         metrics.update(extra_metrics)
+    if entropy_reg_metrics:
+        metrics.update(entropy_reg_metrics)
     reduce_metrics_across_data_parallel_group(metrics)
 
     return (bwd_loss, metrics)
@@ -563,7 +760,22 @@ def gspo_loss_func(config, loss_input: PolicyLossInput):
 
     loss1 = -advantages * ratios
     loss2 = -advantages * ratios_clamped
-    clip_max_loss = torch.maximum(loss1, loss2)
+
+    entropy_reg_metrics = {}
+    if ppo_config.ppo_entropy_regularization_type is not None:
+        clip_max_loss, entropy_reg_metrics = compute_entropy_regularization_loss(
+            ppo_config,
+            old_log_prob=prev_log_probs,
+            log_prob=curr_log_probs,
+            advantages=advantages,
+            response_mask=response_mask,
+            pg_losses1=loss1,
+            pg_losses2=loss2,
+            entropy_aux_figures=loss_input.entropy_aux_figures,
+            rollout_log_probs=loss_input.rollout_log_probs,
+        )
+    else:
+        clip_max_loss = torch.maximum(loss1, loss2)
 
     # Dual-clip PPO: https://arxiv.org/pdf/1912.09729
     if ppo_config.ppo_dual_clip_ratio_c is not None:
@@ -682,6 +894,8 @@ def gspo_loss_func(config, loss_input: PolicyLossInput):
     }
     if extra_metrics:
         metrics.update(extra_metrics)
+    if entropy_reg_metrics:
+        metrics.update(entropy_reg_metrics)
     if sample_mask is not None:
         metrics["valid_sample_ratio"] = masked_mean(
             sample_mask.float().detach(), torch.ones_like(sample_mask, dtype=torch.float)
@@ -849,7 +1063,22 @@ def fipo_loss_func(config, loss_input: PolicyLossInput):
 
     loss1 = -weighted_advantages * ratios
     loss2 = -weighted_advantages * ratios_clamped
-    clip_max_loss = torch.maximum(loss1, loss2)
+
+    entropy_reg_metrics = {}
+    if ppo_config.ppo_entropy_regularization_type is not None:
+        clip_max_loss, entropy_reg_metrics = compute_entropy_regularization_loss(
+            ppo_config,
+            old_log_prob=prev_log_probs,
+            log_prob=curr_log_probs,
+            advantages=advantages,  # use original advantages for covariance
+            response_mask=response_mask,
+            pg_losses1=loss1,
+            pg_losses2=loss2,
+            entropy_aux_figures=loss_input.entropy_aux_figures,
+            rollout_log_probs=loss_input.rollout_log_probs,
+        )
+    else:
+        clip_max_loss = torch.maximum(loss1, loss2)
 
     # Dual-clip PPO: https://arxiv.org/pdf/1912.09729
     loss3 = -weighted_advantages * ppo_config.ppo_dual_clip_ratio_c
@@ -963,6 +1192,8 @@ def fipo_loss_func(config, loss_input: PolicyLossInput):
     }
     if extra_metrics:
         metrics.update(extra_metrics)
+    if entropy_reg_metrics:
+        metrics.update(entropy_reg_metrics)
     reduce_metrics_across_data_parallel_group(metrics)
 
     return (bwd_loss, metrics)

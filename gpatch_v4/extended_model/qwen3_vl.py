@@ -243,6 +243,10 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         if "global_retention_ratio" in batches[0]:
             global_retention_ratio = batches[0]["global_retention_ratio"].cuda()
 
+        entropy_aux_figures = None
+        if "entropy_aux_figures" in batches[0]:
+            entropy_aux_figures = batches[0]["entropy_aux_figures"].cuda()
+
         # 这里有一个 padding iamge，对齐 DataCollatorForQwen2Vl
         image_input_mask = None
         cp_img_num, images_padded, vision_data, vision_grid_thw = None, None, None, None
@@ -287,6 +291,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             "mtp_loss_mask": mtp_loss_mask,
             "sample_mask": sample_mask,
             "global_retention_ratio": global_retention_ratio,
+            "entropy_aux_figures": entropy_aux_figures,
             "audio_feature": audio_feature,
         }
         if mpu.is_pipeline_last_stage():
@@ -297,6 +302,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 keys_to_cuda.append("sample_mask")
             if batch["global_retention_ratio"] is not None:
                 keys_to_cuda.append("global_retention_ratio")
+            if batch["entropy_aux_figures"] is not None:
+                keys_to_cuda.append("entropy_aux_figures")
             for k in keys_to_cuda:
                 batch[k] = batch[k].cuda(non_blocking=non_blocking)
 
@@ -675,6 +682,13 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         assert len(batches) == 1, "sft_train_with_dynamic_cp only supports one batch"
         batch = batches[0]
         assert "local_cp_size" in batch
+
+        # 0. Lazy transfer: move tensors to GPU on demand (they may reside on
+        #    CPU to reduce peak memory when GBS is large).
+        dev = torch.cuda.current_device()
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor) and not v.is_cuda:
+                batch[k] = v.to(dev, non_blocking=True)
 
         # 1. get cp_group
         lcp = batch.get("local_cp_size")

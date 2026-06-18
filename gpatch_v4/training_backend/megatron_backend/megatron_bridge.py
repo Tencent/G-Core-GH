@@ -7,15 +7,11 @@ from megatron.core.utils import get_model_config
 
 try:
     from megatron.bridge import AutoBridge
-    from megatron.bridge.models.conversion.param_mapping import AutoMapping
-    from megatron.bridge.peft.canonical_lora import CanonicalLoRA
-    from megatron.bridge.peft.dora import DoRA
-    from megatron.bridge.peft.lora import LoRA, VLMLoRA
-except ImportError:
+except ImportError as e:
     print(
         "Megatron-Bridge package not found. Please install Megatron-Bridge with `pip install megatron-bridge`"
     )
-    raise
+    raise e
 
 
 def _ensure_model_list(model):
@@ -143,8 +139,4 @@ __all__ = [
     "make_value_model",
     "freeze_multimodal",
     "freeze_moe_router",
-    "LoRA",
-    "VLMLoRA",
-    "DoRA",
-    "CanonicalLoRA",
 ]

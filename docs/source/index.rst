@@ -23,6 +23,7 @@ G-Core is a scalable, simple, efficient, and production ready RL training librar
    developer_guide.md
    dump_metrics_v4.md
    logging.md
+   lora-peft.md
 
 .. toctree::
    :maxdepth: 1

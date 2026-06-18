@@ -42,6 +42,7 @@ def _collect_supported_moe_models() -> None:
     _try_append("vllm.model_executor.models.qwen3_next", "Qwen3NextForCausalLM")
     _try_append("vllm.model_executor.models.kimi_vl", "KimiVLForConditionalGeneration")
     _try_append("vllm.model_executor.models.qwen3_5", "Qwen3_5MoeForCausalLM")
+    _try_append("vllm.model_executor.models.deepseek_v4", "DeepseekV4ForCausalLM")
 
 
 def patch_vllm_moe_model_weight_loader(model) -> None:
@@ -63,6 +64,11 @@ def patch_vllm_moe_model_weight_loader(model) -> None:
     try:
         from vllm.model_executor.models.mixtral import MixtralForCausalLM
         mlp_attr_mapping[MixtralForCausalLM] = "block_sparse_moe"
+    except Exception:
+        pass
+    try:
+        from vllm.model_executor.models.deepseek_v4 import DeepseekV4ForCausalLM
+        mlp_attr_mapping[DeepseekV4ForCausalLM] = "ffn"
     except Exception:
         pass
     default_mlp_attr = "mlp"
@@ -95,3 +101,7 @@ def patch_vllm_moe_model_weight_loader(model) -> None:
         for name, param in mlp.named_parameters():
             if "w13_weight" in name or "w2_weight" in name:
                 param.weight_loader = experts.weight_loader
+            if "weight_scale" in name:
+                param.weight_loader = experts.weight_loader
+                if getattr(param, "quant_method", None) is None:
+                    param.quant_method = "block"

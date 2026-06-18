@@ -260,6 +260,53 @@ def all_gather_from_context_parallel_region(
     return _AllGatherToContextParallelRegion.apply(local_tensor, gather_dim, bwd_op)
 
 
+class _NoZigzagAllGatherToCPRegion(torch.autograd.Function):
+    """All-gather across CP ranks with contiguous rank-order concat (dsv4 / non-zigzag).
+
+    Inverse of :func:`gpatch_v4.models.deepseek_v4.cp.cp_chunk_data`.
+    No block interleaving — rank r's chunk goes straight to positions
+    ``[r * local_s, (r+1) * local_s]`` of the output.
+    """
+    @staticmethod
+    def forward(ctx, input_, gather_dim, bwd_op):
+        assert gather_dim in [0, 1] and input_.dim() > gather_dim
+        cp_size = get_context_parallel_world_size()
+
+        gathered_list = [torch.zeros_like(input_) for _ in range(cp_size)]
+        torch.distributed.all_gather(gathered_list, input_, group=get_context_parallel_group())
+
+        output = torch.cat(gathered_list, dim=gather_dim)
+
+        ctx.cp_size = cp_size
+        ctx.gather_dim = gather_dim
+        ctx.cp_group = get_context_parallel_group()
+        ctx.bwd_op = bwd_op
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        gather_dim = ctx.gather_dim
+        cp_size = ctx.cp_size
+        cp_group = ctx.cp_group
+        bwd_op = ctx.bwd_op
+
+        chunk_size = grad_output.shape[gather_dim] // cp_size
+        split_tensors = torch.split(grad_output, chunk_size, dim=gather_dim)
+        grad_list = [t.contiguous() for t in split_tensors]
+
+        local_grad = torch.empty_like(grad_list[0])
+        torch.distributed.reduce_scatter(local_grad, grad_list, op=bwd_op, group=cp_group)
+
+        return local_grad, None, None
+
+
+def all_gather_from_context_parallel_region_no_zigzag(
+    local_tensor, gather_dim=1, bwd_op=torch.distributed.ReduceOp.AVG
+):
+    return _NoZigzagAllGatherToCPRegion.apply(local_tensor, gather_dim, bwd_op)
+
+
 def gather_from_any_dim(input_, gather_dim=1, tensor_parallel_output_grad=True, comm_group=None):
     return _GatherFromAnyDim.apply(input_, gather_dim, tensor_parallel_output_grad, comm_group)
 

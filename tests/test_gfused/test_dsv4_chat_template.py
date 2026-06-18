@@ -6,7 +6,7 @@ against the *official* DeepSeek-V4 tokenizer encoder shipped inside each
 checkpoint (``encoding/encoding_dsv4.py::encode_messages``).
 
 The template under test is imported as ``DSV4_CHAT_TEMPLATE`` from
-``tasks.math_dsv4.finetune_dataset`` (single source of truth). For each
+``gpatch_v4.models.deepseek_v4.chat_template`` (single source of truth). For each
 ckpt and each conversation fixture we render via HF
 ``apply_chat_template`` and compare the resulting token-id sequence
 against the oracle's encoded string fed through the same tokenizer. We
@@ -30,14 +30,19 @@ from typing import List, Optional
 
 # ---------------------------------------------------------------------------
 # Single source of truth: load ``DSV4_CHAT_TEMPLATE`` directly from
-# ``tasks/math_dsv4/dsv4_chat_template.py`` via importlib (the ``tasks/``
-# tree has no ``__init__.py``, so a normal ``from tasks.math_dsv4 import``
-# does not work).
+# ``gpatch_v4/models/deepseek_v4/chat_template.py`` via importlib so the
+# test does not import ``gpatch_v4.models.deepseek_v4`` package ``__init__``.
 # ---------------------------------------------------------------------------
 def _load_chat_template_constant() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.abspath(os.path.join(here, "..", ".."))
-    path = os.path.join(repo_root, "tasks", "math_dsv4", "dsv4_chat_template.py")
+    path = os.path.join(
+        repo_root,
+        "gpatch_v4",
+        "models",
+        "deepseek_v4",
+        "chat_template.py",
+    )
     if not os.path.isfile(path):
         raise unittest.SkipTest(f"chat template module missing: {path}")
     spec = importlib.util.spec_from_file_location("_dsv4_chat_template", path)

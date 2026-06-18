@@ -23,6 +23,7 @@ from gpatch_v4.training_backend.megatron_backend.checkpoint import (
     get_latest_checkpoint_folder,
     load_checkpoint,
 )
+from gpatch_v4.training_backend.megatron_backend.mcore_peft import is_peft_enabled
 from gpatch_v4.training_backend.megatron_backend.mcore_swap_impl import McoreSwapImpl
 from gpatch_v4.training_backend.megatron_backend.megatron_utils import unwrap_model
 from gpatch_v4.training_backend.megatron_backend.mixin import (
@@ -89,6 +90,7 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                 override_transformer_config=self.policy_config.override_transformer_config
             )
         self.is_critic_model = is_critic_model
+        self.peft = None
         if not self.policy_config.without_ref:
             # disable moe router replay for ref model
             with self.disable_moe_router_replay():
@@ -103,16 +105,16 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
     def setup_ref_model(self):
         save_latest_step = get_latest_checkpoint_folder(self.checkpoint_config.save_ref_ckpt_path)
         load_latest_step = get_latest_checkpoint_folder(self.checkpoint_config.load_ref_ckpt_path)
-        load_weights_from_mbridge = save_latest_step is None and load_latest_step is None
+        load_weights_from_bridge = save_latest_step is None and load_latest_step is None
 
         self.ref_model, self.ref_mcore_config = self.get_model_from_bridge(
             self.ref_bridge,
             self.policy_config.ref_hf_model_path,
-            load_weights_from_mbridge=load_weights_from_mbridge,
+            load_weights_from_bridge=load_weights_from_bridge,
             model_type=f"ref model",
             wrap_with_ddp=False,
         )
-        if not load_weights_from_mbridge:
+        if not load_weights_from_bridge:
             # 如果不用 mbrige 转出来权重
             #TODO: 从 load_ref_ckpt_path or load_ref_ckpt_path 加载
             raise NotImplementedError("Not implemented yet")
@@ -133,13 +135,15 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                 self.setup_ref_model()
 
         load_latest_step = get_latest_checkpoint_folder(self.checkpoint_config.load_ckpt_path)
-        load_weights_from_mbridge = load_latest_step is None
+        has_peft = is_peft_enabled(self.policy_config)
+        # PEFT checkpoints store adapters only; base weights always come from HF.
+        load_hf_base_weights = load_latest_step is None or has_peft
         ctx = self.disable_moe_router_replay() if self.is_critic_model else nullcontext()
         with ctx:
             self.model, self.mcore_config = self.get_model_from_bridge(
                 self.bridge,
                 self.policy_config.hf_model_path,
-                load_weights_from_mbridge=load_weights_from_mbridge,
+                load_weights_from_bridge=load_hf_base_weights,
                 model_type=f"policy model",
                 wrap_with_ddp=self.policy_config.wrap_with_ddp,
                 build_value_model=self.is_critic_model,
@@ -167,7 +171,8 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             return prev_ppo_step
 
         optimizer, optimizer_scheduler = get_optimizer_and_scheduler(self.config, self.model)
-        if load_weights_from_mbridge:
+        if load_latest_step is None:
+            prev_ppo_step = 0
             self.optimizer, self.optimizer_scheduler = optimizer, optimizer_scheduler
         else:
             prev_ppo_step = load_checkpoint(
@@ -176,7 +181,8 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                 optimizer,
                 optimizer_scheduler,
                 load_latest_step,
-                bridge=self.bridge
+                bridge=self.bridge,
+                peft=self.peft,
             )
             self.optimizer, self.optimizer_scheduler = optimizer, optimizer_scheduler
 

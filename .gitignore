@@ -37,3 +37,4 @@ outputs
 pyrightconfig.json
 # Don't index SpecStory auto-save files, but allow explicit context inclusion via @ references
 .specstory/**
+.cursorindexingignore

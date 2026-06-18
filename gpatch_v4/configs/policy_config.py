@@ -4,6 +4,7 @@ from typing import Any, List, Optional
 
 from gpatch_v4.configs.client_config import ClientConfig
 from gpatch_v4.configs.dist_config import DistConfig
+from gpatch_v4.configs.lora_config import LoRAConfig
 from gpatch_v4.configs.utils import MappingProtocol
 
 
@@ -121,6 +122,10 @@ class BasePolicyConfig(MappingProtocol):
         metadata={"help": "Delay DDP wrapping until after mbridge load_weights."},
     )
     override_transformer_config: dict[str, Any] = field(default_factory=dict)
+    lora: LoRAConfig = field(
+        default_factory=LoRAConfig,
+        metadata={"help": "LoRA/PEFT config (rank=0 disables)"},
+    )
     # TODO: 其它算法也加上这个功能
     offload_process_group: bool = field(
         default=False,
@@ -151,6 +156,8 @@ class BasePolicyConfig(MappingProtocol):
     def __post_init__(self):
         if isinstance(self.dist_config, dict):
             self.dist_config = DistConfig(**self.dist_config)
+        if isinstance(self.lora, dict):
+            self.lora = LoRAConfig(**self.lora)
         if self.dist_config.dynamic_context_parallel:
             assert self.override_transformer_config.get(
                 "calculate_per_token_loss", False

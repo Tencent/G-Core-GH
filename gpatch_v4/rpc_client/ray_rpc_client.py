@@ -49,7 +49,7 @@ class RayRpcClient(RpcClient):
     ) -> Dict[str, Any]:
         if hasattr(target_ep, action):
             func = getattr(target_ep, action)
-            ret = await func.remote(data)
+            ret = await func.remote(req_dict=data)
             return ret
         else:
             raise NotImplementedError(f"error func name {action}")
@@ -75,4 +75,4 @@ class RayRpcClient(RpcClient):
         ray.ObjectRef
         """
         func = getattr(target_ep, action)
-        return func.remote(data)
+        return func.remote(req_dict=data)

@@ -5,6 +5,7 @@ from torch.distributed.tensor import DTensor
 from transformers import AutoConfig, AutoTokenizer
 from typing_extensions import override
 
+from megatron.core import mpu
 from megatron.core.utils import divide
 
 from gpatch_v4.extended_model import PrepareDataForwardFactory
@@ -24,6 +25,7 @@ from gpatch_v4.training_backend.fsdp2_backend.optimizer import (
     setup_lr_scheduler,
     setup_optimizer,
 )
+from gpatch_v4.training_backend.fsdp2_backend.weight_exportor import get_weight_exportor
 from gpatch_v4.training_backend.loss_factory import PolicyLossInput, get_policy_loss_fn
 from gpatch_v4.utils import (
     cache_hf_metadata_files,
@@ -77,6 +79,9 @@ class Fsdp2EngineLm(
 
         if not self.policy_config.without_ref:
             self.setup_ref_model(init_context)
+        else:
+            self.ref_model = None
+            self.get_swap_state().ref_model = False
 
         log(f"creating model from {self.policy_config.hf_model_path}", rank=0)
         self.model = self.get_fsdp2_model(init_context, self.policy_config.hf_model_path)
@@ -102,18 +107,21 @@ class Fsdp2EngineLm(
         return latest_saved_step
 
     def export_weights(self):
-        """Yield ``(name, param)`` for weight synchronization.
+        """Yield ``(name, tensor)`` for weight synchronization.
 
-        FSDP2 wraps params as DTensors (sharded across DP ranks). We call
-        ``full_tensor()`` per-DTensor so only one full param is materialised
-        at a time. Tensors stay on GPU so IPC can use CUDA IPC handles
-        (CPU tensors trigger Python multiprocessing FD sharing which fails
-        across Ray actors due to authkey mismatch).
+        Arch-specific exporters (see :mod:`weight_exportor`) may rename,
+        gather EP shards, and quantize — e.g. DSV4 disk keys for vLLM.
+        The default path calls ``full_tensor()`` on each DTensor parameter.
+        Tensors stay on GPU for CUDA IPC across Ray actors.
         """
+        weight_exportor = get_weight_exportor(self.config.policy.model_arch)
+        if weight_exportor is not None:
+            yield from weight_exportor(self.model)
+            return
+
         for name, param in self.model.named_parameters():
             assert isinstance(param, DTensor)
-            full_param = param.full_tensor()
-            yield name, full_param
+            yield name, param.full_tensor().detach()
 
     @override
     def compute_log_probs(
@@ -151,19 +159,21 @@ class Fsdp2EngineLm(
                 logits = self.model(**fwd_kwargs).logits.float()
                 target = batch_data["target"]
 
-                shifted_logits = logits[:, :-1, :].contiguous()
-                targets = target[:, 1:].to(shifted_logits.device)
-                log_softmax = shifted_logits.log_softmax(dim=-1)
-                curr_log_probs = torch.gather(log_softmax, dim=-1,
-                                              index=targets.unsqueeze(-1)).squeeze(-1)
-
-                probs = shifted_logits.softmax(dim=-1)
-                entropy = -(probs * log_softmax).sum(dim=-1)
+                # CP-aware logprobs
+                curr_log_probs = self.gather_log_probs_packed(logits, target, allow_compile=True)
                 response_mask = batch_data["mask"]
+
+                # Entropy: compute on all positions per rank, then all-gather
+                probs = logits.softmax(dim=-1)
+                entropy = -(probs * logits.log_softmax(dim=-1)).sum(dim=-1)
+                entropy = self._all_gather_cp_aware(entropy)
+                entropy = entropy[:, :-1]
                 scaled_entropy = masked_mean(entropy, response_mask)
 
+                advantages = batch_data["advantages"]
+
                 loss_input = PolicyLossInput(
-                    advantages=batch_data["advantages"],
+                    advantages=advantages,
                     prev_log_probs=batch_data["prev_log_probs"],
                     ref_log_probs=batch_data["ref_log_probs"],
                     curr_log_probs=curr_log_probs,
@@ -188,14 +198,32 @@ class Fsdp2EngineLm(
             extend_value_to_dict(metrics, {"policy/seq_length": seq_length})
 
         clear_memory()
-        for k, v in metrics.items():
-            if isinstance(v, list):
-                metrics[k] = [
-                    x.detach().cpu().item() if isinstance(x, torch.Tensor) else x for x in v
-                ]
-            elif isinstance(v, torch.Tensor):
-                metrics[k] = v.detach().cpu().item()
-        return metrics
+        reduced_metrics = {}
+        for key, val in metrics.items():
+            if isinstance(val, list):
+                if len(val) == 0:
+                    continue
+                if all(isinstance(x, torch.Tensor) for x in val):
+                    stacked = torch.stack([x.detach() for x in val])
+                    if stacked.dim() == 2 and stacked.shape[1] == 2:
+                        # Token-level metrics are represented as [sum, count].
+                        # Aggregate across local micro-batches, then across DP ranks.
+                        sum_and_count = stacked.sum(dim=0)
+                        torch.distributed.all_reduce(sum_and_count, group=self.dp_group)
+                        reduced_metrics[key] = (sum_and_count[0] /
+                                                sum_and_count[1].clamp(min=1)).cpu().item()
+                    else:
+                        reduced_metrics[key] = stacked.float().mean().cpu().item()
+                else:
+                    scalar_values = [
+                        x.detach().cpu().item() if isinstance(x, torch.Tensor) else x for x in val
+                    ]
+                    reduced_metrics[key] = sum(scalar_values) / len(scalar_values)
+            elif isinstance(val, torch.Tensor):
+                reduced_metrics[key] = val.detach().cpu().item()
+            else:
+                reduced_metrics[key] = val
+        return reduced_metrics
 
     @override
     def finetune_step(self, batch: List[Dict[str, Any]], num_microbatches: int, step: int):

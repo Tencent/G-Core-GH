@@ -172,6 +172,7 @@ class GrpoSamplerActor(BaseActor, TokenizerMixin):
         )
         self.build_tokenizer()
         self.tokenizer = self.sampler_tokenizers[idx]
+        self.post_process_tokenizer_template(self.tokenizer, self.model_arch)
         self.load_hf_config()
         self.post_init(self.idx)
 
@@ -291,7 +292,7 @@ class GrpoSamplerActor(BaseActor, TokenizerMixin):
         return {"ret": ret}
 
     async def finalize_weights_update(self, req_dict=None):
-        """Run ``process_weights_after_loading`` once per full weight update.
+        """Finalize one full checkpoint-format weight update on every worker.
 
         Transport-agnostic finalize -- serves both the bucketed-IPC and
         NCCL-distributed paths; the trainer calls this exactly once after
@@ -301,6 +302,17 @@ class GrpoSamplerActor(BaseActor, TokenizerMixin):
             return {"ret": True}
         with perf_time("finalize_weight_update", rank=0):
             await self.infer_engine.finalize_weights_update()
+        return {"ret": True}
+
+    async def start_weights_update(self, req_dict=None):
+        """Prepare vLLM workers to receive checkpoint-format weights.
+
+        Must be called once before the first bucket of a multi-bucket update.
+        """
+        if not self._is_master_node:
+            return {"ret": True}
+        with perf_time("start_weight_update", rank=0):
+            await self.infer_engine.start_weights_update()
         return {"ret": True}
 
     def get_gpu_uuids(self):

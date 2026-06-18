@@ -36,6 +36,7 @@ from gpatch_v4.core.parallel_state import (
     initlize_parallel_state,
     is_last_rank,
     is_mp_and_cp_head,
+    preserve_rng_state,
 )
 from gpatch_v4.core.smart_pad_helper import (
     DPBalanceHelper,
@@ -338,7 +339,8 @@ class GrpoTrainActor(
         self.prev_ppo_step = self.policy_engine.setup_model_and_get_optimizer()
         logging_rank0(f"finished setup_model_and_optimizer at {self.prev_ppo_step} ...")
         if self.prev_ppo_step > 0:
-            self.build_dataset_and_dataloader(self.prev_ppo_step)
+            with preserve_rng_state():
+                self.build_dataset_and_dataloader(self.prev_ppo_step)
             logging_rank0(f"dataloader rebuilt from {self.prev_ppo_step}.")
 
     async def save_checkpoint(self, step):
@@ -614,7 +616,8 @@ class GrpoTrainActor(
             src_dp = [torch.tensor(mpu.get_data_parallel_rank())] * ll
             data["src_dp"] = src_dp
 
-        if getattr(self.config.policy, 'balance_dp_seqlen', False):
+        balance_dp_seqlen = self.config.policy.balance_dp_seqlen
+        if balance_dp_seqlen:
             rebalanced_batches, restore_info = DPBalanceHelper.rebalance_for_compute_log_probs(
                 rollout_batches,
                 samples_per_batch,
@@ -632,14 +635,6 @@ class GrpoTrainActor(
         cpu_barrier()
         timers("compute_logps").stop()
 
-        if external_reward_task is not None:
-            reward_updates = await external_reward_task
-            reward_updates = BroadcastUtils.broadcast_rollout_batch(reward_updates)
-            for rb, updates in zip(rollout_batches, reward_updates):
-                rb.update(updates)
-        cpu_barrier()
-        timers("external_reward").stop()
-
         if not self.config.policy.without_ref:
             for rb, ref_logps in zip(rollout_batches, ref_logprobs):
                 rb["ref_logprobs"] = ref_logps
@@ -652,13 +647,21 @@ class GrpoTrainActor(
             for rb, prev_logps in zip(rollout_batches, prev_logprobs, strict=True):
                 rb["logprobs"] = prev_logps
 
-        if getattr(self.config.policy, 'balance_dp_seqlen', False):
+        if balance_dp_seqlen:
             rollout_batches = DPBalanceHelper.restore_log_probs_to_original_batches(
                 origin_rollout_batches,
                 rollout_batches,
                 restore_info,
                 without_ref=self.config.policy.without_ref,
             )
+
+        if external_reward_task is not None:
+            reward_updates = await external_reward_task
+            reward_updates = BroadcastUtils.broadcast_rollout_batch(reward_updates)
+            for rb, updates in zip(rollout_batches, reward_updates, strict=True):
+                rb.update(updates)
+        cpu_barrier()
+        timers("external_reward").stop()
 
         clear_memory()
         logging_memory_usage_details("memory tracking after compute_log_probs", rank=0)
@@ -756,37 +759,50 @@ class GrpoTrainActor(
         # len(rollout_batches) == rollout_NB
         # v = rollout_batches[0][k]
         # len(v) == rollout_MBS * keep_n
-        rollout_batches, metrics = await self.rollout(epoch_i, ppo_step_i, rollout_nb)
+        if self.config.debug.skip_rollout_load_from_disk:
+            load_path = self.config.debug.load_rollout_path
+            load_step = self.config.debug.load_rollout_step
+            # CP ranks under the same DP share identical rollout data.
+            # Map file name by dp_rank so CP>1 can reuse CP=1 saved files.
+            file_rank = mpu.get_data_parallel_rank()
+            rb_path = os.path.join(load_path, f"rollout_batches_{load_step}_{file_rank}.pt")
+            m_path = os.path.join(load_path, f"rollout_metrics_{load_step}_{file_rank}.pt")
+            logging_rank0(f"[DEBUG] load rollout from {rb_path}, {m_path}")
+            rollout_batches = torch.load(rb_path, weights_only=False)
+            metrics = torch.load(m_path, weights_only=False)
+            self.policy_engine.onload_model()
+        else:
+            rollout_batches, metrics = await self.rollout(epoch_i, ppo_step_i, rollout_nb)
 
-        # post-filter: filter after logprobs/advantage computation
-        filter_stage = (training_config.filter_sampling_stage if keep_n != repeat_n else None)
-        if filter_stage == "post":
-            samples_before = len(rollout_batches[0][next(iter(rollout_batches[0]))])
-            original_metrics = {k + "_original": v for k, v in metrics.items()}
-            strategy = training_config.sampling_keeping_strategy
-            filter_sampling_fn = FilterSamplingRegistry.get(strategy)
-            rollout_batches = filter_sampling_fn(self.config, rollout_batches, repeat_n, keep_n)
-            samples_after = len(rollout_batches[0][next(iter(rollout_batches[0]))])
-            logging_rank0(
-                f"[filter] stage=post applied, strategy={strategy}, "
-                f"samples_per_batch: {samples_before} -> {samples_after}, "
-                f"recomputing metrics on filtered set"
-            )
-            rollout_metrics = self.compute_rollout_metrics(rollout_batches)
-            ppo_data_metrics = self.compute_ppo_global_statistics(rollout_batches)
-            metrics = rollout_metrics | ppo_data_metrics | original_metrics
+            # post-filter: filter after logprobs/advantage computation
+            filter_stage = (training_config.filter_sampling_stage if keep_n != repeat_n else None)
+            if filter_stage == "post":
+                samples_before = len(rollout_batches[0][next(iter(rollout_batches[0]))])
+                original_metrics = {k + "_original": v for k, v in metrics.items()}
+                strategy = training_config.sampling_keeping_strategy
+                filter_sampling_fn = FilterSamplingRegistry.get(strategy)
+                rollout_batches = filter_sampling_fn(self.config, rollout_batches, repeat_n, keep_n)
+                samples_after = len(rollout_batches[0][next(iter(rollout_batches[0]))])
+                logging_rank0(
+                    f"[filter] stage=post applied, strategy={strategy}, "
+                    f"samples_per_batch: {samples_before} -> {samples_after}, "
+                    f"recomputing metrics on filtered set"
+                )
+                rollout_metrics = self.compute_rollout_metrics(rollout_batches)
+                ppo_data_metrics = self.compute_ppo_global_statistics(rollout_batches)
+                metrics = rollout_metrics | ppo_data_metrics | original_metrics
 
-        if self.config.debug.save_every_rollout_data or (
-            self.config.debug.save_first_rollout_data and ppo_step_i == 0
-        ):
-            save_data(
-                rollout_batches, "debug-tmp",
-                f"rollout_batches_{ppo_step_i}_{torch.distributed.get_rank()}.pt"
-            )
-            save_data(
-                metrics, "debug-tmp",
-                f"rollout_metrics_{ppo_step_i}_{torch.distributed.get_rank()}.pt"
-            )
+            if self.config.debug.save_every_rollout_data or (
+                self.config.debug.save_first_rollout_data and ppo_step_i == 0
+            ):
+                save_data(
+                    rollout_batches, "debug-tmp",
+                    f"rollout_batches_{ppo_step_i}_{torch.distributed.get_rank()}.pt"
+                )
+                save_data(
+                    metrics, "debug-tmp",
+                    f"rollout_metrics_{ppo_step_i}_{torch.distributed.get_rank()}.pt"
+                )
 
         assert len(rollout_batches) == rollout_nb, f'{len(rollout_batches)=} {rollout_nb=}'
         assert len(next(iter(rollout_batches[0].values()))) == rollout_mbs * keep_n
@@ -912,7 +928,7 @@ class GrpoTrainActor(
 
         await self.update_weights()
         cpu_barrier()
-
+        exit_flag = False
         ret_metrics = []
 
         for epoch in range(init_epoch, training_config.num_train_epoches):
@@ -955,6 +971,13 @@ class GrpoTrainActor(
 
                 cpu_barrier()
 
+                if ppo_step == training_config.exit_step:
+                    exit_flag = True
+                    break
+
+            if exit_flag:
+                break
+
         if self.compact_thread is not None:
             self.compact_thread.join()
 
@@ -963,6 +986,10 @@ class GrpoTrainActor(
         # save final ckpt
         cpu_barrier()
         if ppo_step % training_config.save_interval != 0:
+            if self.config.placement_type != "disaggregated":
+                for sampler_idx in range(self.sampler_client.num_samplers):
+                    await self.sampler_client.sleep(sampler_idx)
+                cpu_barrier()
             self.policy_engine.onload_model()
             self.policy_engine.onload_optimizer()
             await self.save_checkpoint(ppo_step)

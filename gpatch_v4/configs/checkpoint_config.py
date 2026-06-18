@@ -117,6 +117,16 @@ class CheckpointConfig(MappingProtocol):
                 "Whether to skip saving model weights to the checkpoint. "
                 "When enabled, model weights will be loaded from HF format via bridge during load_checkpoint."
                 "mcore_v0.13.1 not support skip_save_mcore_model=True, case metadata['distrib_optim_sharding_type'] != 'dp_reshardable' "
+                "注意：这个东西会导致断点续训时精度有损失，对训练影响很小，但导致确定性计算(apply_deterministic_mode)不准确"
+        }
+    )
+    save_merged_lora_weights: bool = field(
+        default=True,
+        metadata={
+            "help":
+                "When LoRA is active, additionally save merged (base+adapter) weights to "
+                "{export_dir}_merge for deployment. The unmerged base weights are always "
+                "saved to export_dir for checkpoint resume."
         }
     )
 

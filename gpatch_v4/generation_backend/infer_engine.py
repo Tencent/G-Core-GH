@@ -368,7 +368,7 @@ class InferEngine:
             from vllm.engine.arg_utils import AsyncEngineArgs
             from vllm.v1.engine.async_llm import AsyncLLM
 
-            from gpatch_v4.generation_backend.flashinfer_cudart_fix import (
+            from gpatch_v4.orches.flashinfer_cudart_fix import (
                 build_compilation_config_patch,
             )
             from gpatch_v4.generation_backend.vllm_engine import VllmEngine

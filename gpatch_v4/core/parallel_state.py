@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+from contextlib import contextmanager
 from datetime import timedelta
 from functools import partial
 
@@ -66,13 +67,50 @@ def set_random_seed(config, data_parallel_random_init: bool = False):
         tensor_parallel.model_parallel_cuda_manual_seed(seed)
 
 
-def enable_deterministic_mode():
-    """Enable deterministic mode for training."""
-    os.environ["NCCL_DETERMINISTIC"] = "1"
-    os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
+def _disable_flash_attn_3():
+    """Disable Flash Attention 3 in TransformerEngine.
 
-    os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    FA3's deterministic backward is broken (dQ accumulation uses
+    non-deterministic global atomics on Hopper). Monkey-patch TE's
+    FlashAttentionUtils to prevent FA3 selection at runtime, forcing
+    fallback to FA2 which has correct deterministic backward (>= 2.4.1).
+
+    Must be called AFTER TE is imported (module-level imports already
+    triggered by megatron.core), but BEFORE the first forward pass.
+
+    注意：升级 TE 后，这里不一定能用
+    """
+    try:
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            FlashAttentionUtils,
+        )
+        was_installed = FlashAttentionUtils.v3_is_installed
+        FlashAttentionUtils.v3_is_installed = False
+        FlashAttentionUtils.set_flash_attention_3_params = staticmethod(lambda: None)
+        if was_installed:
+            logging.info(
+                "Disabled FA3 (v%s) for deterministic mode, falling back to FA2 (v%s)",
+                FlashAttentionUtils.fa3_version,
+                FlashAttentionUtils.version,
+            )
+    except ImportError:
+        pass
+
+
+def enable_deterministic_mode():
+    """Enable deterministic mode for training.
+
+    IMPORTANT: NCCL env vars (NCCL_DETERMINISTIC, NCCL_ALGO) must be set
+    **before** any NCCL communicators are created. Call
+    ``enable_deterministic_mode_env()`` early (before
+    ``torch.distributed.init_process_group``), then call this function
+    afterward to set the remaining torch-level flags.
+    """
+    enable_deterministic_mode_env()
+
+    if os.environ.get("GPATCH_DISABLE_FA3") == "1":
+        _disable_flash_attn_3()
+
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -81,6 +119,46 @@ def enable_deterministic_mode():
         os.environ["CUBLAS_WORKSPACE_CONFIG"],
         os.environ.get("NCCL_ALGO", "unset"),
     )
+
+
+def enable_deterministic_mode_env():
+    """Set environment variables required for deterministic execution.
+
+    Must be called **before** ``torch.distributed.init_process_group()`` so
+    that NCCL communicators are created with deterministic settings.
+    Idempotent — safe to call more than once.
+    """
+    os.environ["NCCL_DETERMINISTIC"] = "1"
+    os.environ["NCCL_ALGO"] = "Ring"
+    os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
+    os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+
+@contextmanager
+def preserve_rng_state():
+    """Context manager that saves and restores all RNG states.
+
+    Useful when an operation (e.g. rebuilding a dataloader) may consume
+    or reset the global RNG, but the caller needs the RNG to stay
+    exactly where it was (e.g. after restoring from a checkpoint).
+    """
+    state = {
+        "random": random.getstate(),
+        "np": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": (torch.cuda.get_rng_state() if torch.cuda.is_available() else None),
+        "rng_tracker": tensor_parallel.get_cuda_rng_tracker().get_states(),
+    }
+    try:
+        yield
+    finally:
+        random.setstate(state["random"])
+        np.random.set_state(state["np"])
+        torch.set_rng_state(state["torch_cpu"])
+        if state["torch_cuda"] is not None:
+            torch.cuda.set_rng_state(state["torch_cuda"])
+        tensor_parallel.get_cuda_rng_tracker().set_states(state["rng_tracker"])
 
 
 def initlize_parallel_state(config, dist_config):
@@ -108,7 +186,7 @@ def initlize_parallel_state(config, dist_config):
     )
     if hasattr(config, 'training'):
         set_random_seed(config, data_parallel_random_init=config.training.data_parallel_random_init)
-        if getattr(config.training, "apply_deterministic_mode", False):
+        if config.training.apply_deterministic_mode:
             enable_deterministic_mode()
     else:
         set_random_seed(config, False)

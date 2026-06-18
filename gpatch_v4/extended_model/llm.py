@@ -114,6 +114,24 @@ class SamplerGenerateFuncLLM(SamplerGenerateFunc):
 
 
 class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
+    def _rl_train_cp_chunk_data(
+        self,
+        tokens: torch.Tensor,
+        position_ids: None | torch.Tensor,
+        attention_mask: None | torch.Tensor,
+    ):
+        tokens = get_tensor_on_this_cp_rank(tokens, 1, key_name="tokens")
+        attention_mask = get_tensor_on_this_cp_rank(attention_mask, 2, key_name="attention_mask")
+        position_ids = get_tensor_on_this_cp_rank(position_ids, 1, key_name="position_ids")
+        return tokens, position_ids, attention_mask
+
+    def _rl_train_cp_chunk_single_data(
+        self,
+        data: torch.Tensor,
+    ):
+        local_data = get_tensor_on_this_cp_rank(data, 1, key_name="target")
+        return local_data
+
     @override
     def model_forward_only(
         self,
@@ -148,11 +166,9 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
             attention_mask = attention_mask.expand(tokens.size(0), -1, -1, -1)
 
         if dist.get_world_size(mpu.get_context_parallel_group()) > 1:
-            tokens = get_tensor_on_this_cp_rank(tokens, 1, key_name="tokens")
-            attention_mask = get_tensor_on_this_cp_rank(
-                attention_mask, 2, key_name="attention_mask"
+            tokens, position_ids, attention_mask = self._rl_train_cp_chunk_data(
+                tokens, position_ids, attention_mask
             )
-            position_ids = get_tensor_on_this_cp_rank(position_ids, 1, key_name="position_ids")
 
         model_fwd_args["input_ids"] = tokens
         model_fwd_args["position_ids"] = position_ids
@@ -227,11 +243,9 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         )
 
         if dist.get_world_size(mpu.get_context_parallel_group()) > 1 and not ppo_pack_seq:
-            tokens = get_tensor_on_this_cp_rank(tokens, 1, key_name="tokens")
-            attention_mask = get_tensor_on_this_cp_rank(
-                attention_mask, 2, key_name="attention_mask"
+            tokens, position_ids, attention_mask = self._rl_train_cp_chunk_data(
+                tokens, position_ids, attention_mask
             )
-            position_ids = get_tensor_on_this_cp_rank(position_ids, 1, key_name="position_ids")
 
         batch = {
             "tokens": tokens,
@@ -258,6 +272,9 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         if "global_retention_ratio" in batches[0]:
             batch['global_retention_ratio'] = batches[0]['global_retention_ratio'].cuda()
 
+        if "entropy_aux_figures" in batches[0]:
+            batch['entropy_aux_figures'] = batches[0]['entropy_aux_figures'].cuda()
+
         required_keys = set()
         if mpu.get_pipeline_model_parallel_world_size() == 1:
             required_keys.update(batch.keys())
@@ -271,7 +288,8 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                 required_keys.update(
                     (
                         "tokens", "advantages", "mask", "prev_log_probs", "ref_log_probs",
-                        "rollout_log_probs", 'target', 'sample_mask', 'global_retention_ratio'
+                        "rollout_log_probs", 'target', 'sample_mask', 'global_retention_ratio',
+                        'entropy_aux_figures'
                     )
                 )
                 # mtp requires positon_ids and labels
@@ -547,6 +565,13 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         assert len(batches) == 1, "sft_train_with_dynamic_cp only supports one batch"
         batch = batches[0]
         assert "local_cp_size" in batch
+
+        # 0. Lazy transfer: move tensors to GPU on demand (they may reside on
+        #    CPU to reduce peak memory when GBS is large).
+        dev = torch.cuda.current_device()
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor) and not v.is_cuda:
+                batch[k] = v.to(dev, non_blocking=True)
 
         # 1. get cp_group
         lcp = batch.get("local_cp_size")

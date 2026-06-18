@@ -1,0 +1,71 @@
+# @package _global_
+# Base config for LoRA mbridge integration tests.
+# lora.type and policy.dist_config.tensor_model_parallel_size are
+# overridden per test case in the Python test file.
+
+training:
+  training_backend: mcore
+  use_fast_tokenizer: True
+  train_gbs: 32
+  train_mbs: 1
+  seq_length: 4096
+  data_parallel_random_init: False
+  save_interval: 1
+  num_train_epoches: 1
+  comput_attn_mask: False
+  sort_batched: False
+  build_from_mbridge: True
+  attention_backend: flash
+
+policy:
+  dist_config:
+    nnodes: 1
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    dynamic_context_parallel: True
+    max_seqlen_per_dp_cp_rank: 4096
+    min_dynamic_context_parallel_size: 1
+  model_arch: "qwen2"
+  without_ref: True
+  hf_model_path: "hf-hub/Qwen/Qwen2.5-Math-1.5B"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen2.5-Math-1.5B"
+  override_transformer_config:
+    calculate_per_token_loss: true
+  lora:
+    rank: 128
+    alpha: 256
+    type: "lora"
+    dropout: 0.0
+
+checkpoint:
+  load_ckpt_path: test_lora_mbridge_ckpt
+  save_ckpt_path: test_lora_mbridge_ckpt
+  save_total_limit: 2
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+  override_tokenizer_special_token:
+    eos_token: "<|im_end|>"
+# 注意，如果训练的事 base model, 那么有必要设置 override_tokenizer_special_token 的 eos_token 位置，否则保存下来的 eos_token 会很混乱
+
+optimizer:
+  lr: 2.0e-4
+  lr_warmup_steps: 0
+  lr_decay_style: "constant"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "tests/test_gpatch_v4/test_data/sft"
+  py_path: "tasks/math_rl_v4/finetune_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+debug:
+  save_first_rollout_data: False
+  trainer_return_ppo_step_metrics: True

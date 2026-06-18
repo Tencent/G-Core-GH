@@ -169,6 +169,23 @@ class OptimizerConfig(MappingProtocol):
         default=None,
         metadata={"help": "Override optimizer config"},
     )
+    muon_momentum: float = field(
+        default=0.95,
+        metadata={"help": "Muon SGD momentum coefficient"},
+    )
+    muon_nesterov: bool = field(
+        default=True,
+        metadata={"help": "Use Nesterov momentum in Muon"},
+    )
+    muon_num_ns_steps: int = field(
+        default=5,
+        metadata={"help": "Newton-Schulz iteration steps for Muon"},
+    )
+    muon_extra_scale_factor: float = field(
+        default=0.2,
+        metadata={"help": "Extra scale factor applied to Muon per-parameter lr, "
+                 "validated in Moonlight paper Table 8"},
+    )
     report_post_clip_grad_norm: bool = field(
         default=False,
         metadata={

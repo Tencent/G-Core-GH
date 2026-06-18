@@ -68,6 +68,10 @@ from gpatch_v4.training_backend.megatron_backend.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
+from gpatch_v4.training_backend.megatron_backend.mcore_peft import (
+    apply_peft_pre_wrap_hook,
+    get_peft_cls,
+)
 from gpatch_v4.training_backend.megatron_backend.megatron_utils import (
     get_model_config,
     unwrap_model,
@@ -102,6 +106,7 @@ from gpatch_v4.utils.training_utils import (
     expand_rollout_batches,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_opd_topk_logprobs,
+    from_parallel_logits_to_token_prob_and_rank,
     from_parallel_logits_to_topk_logprobs,
     get_batches_max_seqlen,
     get_iterator_k_split_list,
@@ -110,6 +115,7 @@ from gpatch_v4.utils.training_utils import (
     get_tensor_on_this_cp_rank,
     masked_mean,
     update_square_averaging_token_len,
+    get_im_end_metrics_token_id,
 )
 
 
@@ -158,6 +164,8 @@ def log_freeze_status(model, *args, **kwargs):
             rank=0,
         )
 
+    return model
+
 
 class BridgeUtilsMixin:
     def get_hf_mtp_num_layers(self, hf_config):
@@ -181,6 +189,11 @@ class BridgeUtilsMixin:
                 "use_linear_ce enabled: inject cross_entropy_loss_fusion=True, "
                 "cross_entropy_fusion_impl='linear' into override_transformer_config"
             )
+
+        if self.config.training.apply_deterministic_mode:
+            if override_transformer_config is None:
+                override_transformer_config = {}
+            override_transformer_config['deterministic_mode'] = True
 
         if self.config.training.build_from_mbridge:
             return self.build_mbridge(hf_model_path, override_transformer_config)
@@ -248,19 +261,19 @@ class BridgeUtilsMixin:
         self,
         bridge,
         hf_model_path,
-        load_weights_from_mbridge=False,
+        load_weights_from_bridge=False,
         model_type="model",
         wrap_with_ddp=True,
         build_value_model=False,
     ):
         if self.config.training.build_from_mbridge:
             return self.get_model_from_mbridge(
-                bridge, hf_model_path, load_weights_from_mbridge, model_type, wrap_with_ddp,
+                bridge, hf_model_path, load_weights_from_bridge, model_type, wrap_with_ddp,
                 build_value_model
             )
         else:
             return self.get_model_from_megatron_bridge(
-                bridge, hf_model_path, load_weights_from_mbridge, model_type, wrap_with_ddp,
+                bridge, hf_model_path, load_weights_from_bridge, model_type, wrap_with_ddp,
                 build_value_model
             )
 
@@ -337,12 +350,11 @@ class BridgeUtilsMixin:
         self,
         bridge,
         hf_model_path,
-        load_weights_from_mbridge=False,
+        load_weights_from_bridge=False,
         model_type="model",
         wrap_with_ddp=True,
         build_value_model=False,
     ):
-        from gpatch_v4.training_backend.megatron_backend.mcore_peft import get_peft_cls
         from gpatch_v4.training_backend.megatron_backend.megatron_bridge import (
             freeze_moe_router,
             freeze_multimodal,
@@ -380,17 +392,25 @@ class BridgeUtilsMixin:
             )
         post_model_creation_callbacks.append(log_freeze_status)
 
-        peft_cls = get_peft_cls(
-            config=self.config,
+        self.peft = get_peft_cls(
+            policy_config=self.policy_config,
             bridge=bridge,
             provider=self.provider,
-            dtype=self.provider.params_dtype
+            dtype=self.provider.params_dtype,
         )
-        if peft_cls is not None:
-            #TODO： LORA
-            pass
         for callback in post_model_creation_callbacks:
             self.provider.register_pre_wrap_hook(callback)
+        if self.peft is not None:
+            self.provider.register_pre_wrap_hook(
+                partial(
+                    apply_peft_pre_wrap_hook,
+                    peft=self.peft,
+                    use_mbridge=False,
+                    check_lora_all_coverage=self.policy_config.lora.check_lora_all_coverage,
+                    verify_weight_consistency=self.policy_config.lora.verify_weight_consistency,
+                )
+            )
+
         ddp_config = None
         if wrap_with_ddp:
             from megatron.bridge.training.config import DistributedDataParallelConfig
@@ -406,12 +426,15 @@ class BridgeUtilsMixin:
 
             tf_config = get_model_config(model[0] if isinstance(model, list) else model)
 
-            if load_weights_from_mbridge:
+            if load_weights_from_bridge:
                 logging_rank0(f"loading {model_type} weights from megatron_bridge {hf_model_path=}")
                 allowed_mismatched_params = []
                 bridge.load_hf_weights(
                     model, hf_model_path, allowed_mismatched_params=allowed_mismatched_params
                 )
+
+            if self.peft is not None:
+                self.peft.set_params_to_save(model)
 
         return model, tf_config
 
@@ -491,7 +514,7 @@ class BridgeUtilsMixin:
         self,
         bridge,
         hf_model_path,
-        load_weights_from_mbridge=False,
+        load_weights_from_bridge=False,
         model_type="model",
         wrap_with_ddp=True,
         build_value_model=False,
@@ -529,21 +552,43 @@ class BridgeUtilsMixin:
             )
         post_model_creation_callbacks.append(log_freeze_status)
 
+        self.peft = get_peft_cls(
+            policy_config=self.policy_config,
+            bridge=bridge,
+            provider=None,
+            dtype=None,
+            use_mbridge=True,
+        )
+
         with profile_memory_and_time(f"get {model_type} from mbridge", rank=0):
             post_wrap_with_ddp = (
-                wrap_with_ddp and self.policy_config.post_wrap_with_ddp and
-                load_weights_from_mbridge
+                wrap_with_ddp and self.policy_config.post_wrap_with_ddp and load_weights_from_bridge
             )
+            # When PEFT is enabled, always defer DDP wrapping so we can
+            # load base weights first, then inject adapters, then wrap.
+            post_wrap_with_ddp = post_wrap_with_ddp or (self.peft is not None and wrap_with_ddp)
             model = bridge.get_model(
                 bf16=True,
                 wrap_with_ddp=wrap_with_ddp and not post_wrap_with_ddp,
                 **kwargs,
             )
-            if load_weights_from_mbridge:
+            if load_weights_from_bridge:
                 logging_rank0(f"loading {model_type} weights from mbridge {hf_model_path=}")
                 bridge.load_weights(model, hf_model_path, memory_efficient=True)
             else:
                 bridge.safetensor_io = bridge._get_safetensor_io(hf_model_path)
+
+            if self.peft is not None:
+
+                for model_chunk in model:
+                    apply_peft_pre_wrap_hook(
+                        model_chunk,
+                        peft=self.peft,
+                        use_mbridge=True,
+                        check_lora_all_coverage=self.policy_config.lora.check_lora_all_coverage,
+                        verify_weight_consistency=self.policy_config.lora.verify_weight_consistency,
+                    )
+
             if post_wrap_with_ddp:
                 model = self.wrap_mbridge_model_with_ddp(model)
         return model, bridge.config
@@ -569,6 +614,7 @@ class CheckpointMixin:
             global_step,
             self.bridge,
             override_tokenizer_special_token=override_tokenizer_special_token,
+            peft=getattr(self, "peft", None),
         )
 
     def convert_to_hf_checkpoint(self):
@@ -583,7 +629,7 @@ class CheckpointMixin:
         self.model, tf_config = self.get_model_from_mbridge(
             self.bridge,
             self.policy_config.hf_model_path,
-            load_weights_from_mbridge=False,
+            load_weights_from_bridge=False,
             model_type=f"policy model",
             wrap_with_ddp=self.policy_config.wrap_with_ddp,
         )
@@ -718,6 +764,48 @@ class ForwardStepMixin(RouterReplayMixin):
         """Whether per-token gradient normalization is enabled."""
         model = self.model[0] if isinstance(self.model, list) else self.model
         return get_model_config(model).calculate_per_token_loss
+
+    def get_im_end_metrics(
+        self,
+        parallel_logits: torch.Tensor,
+        target: torch.Tensor,
+        response_mask: torch.Tensor,
+        *,
+        ignore_cp: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        if not self.config.training.im_end_metrics_enable:
+            return {}
+
+        im_end_token_id = get_im_end_metrics_token_id(self.tokenizer)
+        im_end_prob, im_end_rank = from_parallel_logits_to_token_prob_and_rank(
+            vocab_parallel_logits=parallel_logits,
+            token_id=im_end_token_id,
+            ignore_cp=ignore_cp,
+        )
+        im_end_prob = im_end_prob[:, :-1].contiguous()
+        im_end_rank = im_end_rank[:, :-1].contiguous()
+
+        mask_bool = response_mask.to(device=im_end_prob.device).bool()
+        target_ids = target.roll(shifts=-1, dims=-1)[:, :-1].to(device=im_end_prob.device)
+        nl_mask = mask_bool & (target_ids != im_end_token_id)
+
+        metrics = {}
+        metric_values = {
+            "p_mean": im_end_prob,
+            "p_top1": (im_end_rank < 1).to(torch.float32),
+            "p_top5": (im_end_rank < 5).to(torch.float32),
+            "p_top50": (im_end_rank < 50).to(torch.float32),
+        }
+        mask_float = mask_bool.to(torch.float32)
+        nl_mask_float = nl_mask.to(torch.float32)
+        for suffix, values in metric_values.items():
+            metrics[f"eos/im_end/{suffix}"] = torch.stack(
+                [(values * mask_float).sum(), mask_float.sum()]
+            )
+            metrics[f"eos/im_end/{suffix}_NL"] = torch.stack(
+                [(values * nl_mask_float).sum(), nl_mask_float.sum()]
+            )
+        return metrics
 
     def _aggregate_metrics(
         self,
@@ -1023,7 +1111,10 @@ class ForwardStepMixin(RouterReplayMixin):
 
     @torch.no_grad()
     def smart_pad_compute_logprobs(
-        self, model, batches_list: List[Dict[str, Any]], batch_log_str: str
+        self,
+        model,
+        batches_list: List[Dict[str, Any]],
+        batch_log_str: str,
     ):
         """Compute logprobs using smart pad to group samples by seqlen.
 
@@ -1273,6 +1364,13 @@ class ForwardStepMixin(RouterReplayMixin):
                             ignore_cp=self.policy_config.ppo_pack_seq,
                         )[:, :-1].contiguous()
 
+                    im_end_metrics = self.get_im_end_metrics(
+                        parallel_logits=parallel_logits_clone,
+                        target=target,
+                        response_mask=mask,
+                        ignore_cp=self.policy_config.ppo_pack_seq,
+                    )
+
                     scaled_entropy, per_token_entropy = vocab_parallel_entropy(
                         parallel_logits_clone, mask, ignore_cp=self.policy_config.ppo_pack_seq
                     )
@@ -1303,6 +1401,7 @@ class ForwardStepMixin(RouterReplayMixin):
                         parallel_logits=parallel_logits,
                         sample_mask=batch.get("sample_mask", None),
                         global_retention_ratio=batch.get("global_retention_ratio", None),
+                        entropy_aux_figures=batch.get("entropy_aux_figures", None),
                         teacher_log_probs=teacher_log_probs,
                         dumped_topk_logprobs=dumped_topk_logprobs,
                         dumped_topk_token_ids=dumped_topk_token_ids,
@@ -1313,6 +1412,7 @@ class ForwardStepMixin(RouterReplayMixin):
 
                     policy_loss_fn = get_policy_loss_fn(self.ppo_config.loss_func)
                     bwd_loss, metrics_dict = policy_loss_fn(self.config, loss_input)
+                    metrics_dict.update(im_end_metrics)
 
                     if self.calc_per_token_loss:
                         total_tokens = mask.sum()
@@ -1393,6 +1493,7 @@ class ForwardStepMixin(RouterReplayMixin):
 
                 sample_mask_tensor = batch.get("sample_mask")
                 global_retention_ratio_tensor = batch.get("global_retention_ratio")
+                entropy_aux_figures_tensor = batch.get("entropy_aux_figures")
 
                 loss_input = PolicyLossInput(
                     advantages=advantages,
@@ -1406,6 +1507,7 @@ class ForwardStepMixin(RouterReplayMixin):
                     parallel_logits=parallel_logits,
                     sample_mask=sample_mask_tensor,
                     global_retention_ratio=global_retention_ratio_tensor,
+                    entropy_aux_figures=entropy_aux_figures_tensor,
                     teacher_log_probs=None,
                     dumped_topk_logprobs=None,
                     dumped_topk_token_ids=None,
@@ -1667,9 +1769,11 @@ class ForwardStepMixin(RouterReplayMixin):
             if is_last_rank():
                 metrics = {"policy/seq_length": seq_length}
                 for key, val in token_level_accumulated.items():
-                    metrics[f"policy/{key}"] = (val[0] / val[1].clamp(min=1)).cpu().item()
+                    metric_key = key if key.startswith("eos/") else f"policy/{key}"
+                    metrics[metric_key] = (val[0] / val[1].clamp(min=1)).cpu().item()
                 for key, val in scalar_accumulated.items():
-                    metrics[f"policy/{key}"] = val.cpu().item()
+                    metric_key = key if key.startswith("eos/") else f"policy/{key}"
+                    metrics[metric_key] = val.cpu().item()
 
         aux_metrics = self._collect_aux_metrics(
             dynamic_num_microbatches if enable_dynamic_mbs else num_microbatches

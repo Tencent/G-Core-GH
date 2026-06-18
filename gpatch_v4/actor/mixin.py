@@ -33,11 +33,16 @@ from gpatch_v4.utils import (
     average_losses_across_data_parallel_group,
     check_rollout_batches,
     cpu_dict,
+    get_tokenizer_template,
     log,
     logging_memory_usage,
+    logging_memory_usage_details,
     logging_rank0,
     masked_global_statistics_list,
+    masked_global_topk_threshold,
     masked_mean_list,
+    n_times_clear_memory,
+    pad_or_truncate_last_dim,
     save_data,
     sync_cuda_and_get_time,
 )
@@ -140,6 +145,10 @@ class TokenizerMixin:
                 )
                 gen_rm_tokenizers.append(gen_rm_tokenizer)
             self.gen_rm_tokenizers = gen_rm_tokenizers
+
+    def post_process_tokenizer_template(self, tokenizer, model_arch):
+        if tokenizer.chat_template is None:
+            tokenizer.chat_template = get_tokenizer_template(model_arch)
 
 
 class T2iTokenizerMixin:
@@ -348,6 +357,9 @@ class OffloadManager:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if not self.early_swap:
             self.model_engine.offload_model()
+        logging_memory_usage_details(f"memory tracking before clear memory", rank=0)
+        n_times_clear_memory(3)
+        logging_memory_usage_details(f"memory tracking after clear memory", rank=0)
 
 
 class OnloadManager:
@@ -636,6 +648,12 @@ class RlTrainerMixin:
                     )
             # 把sample mask为0的样本的mask置为0
             sample_mask = rollout_batch.get("sample_mask", None)
+            # post check for sample_mask
+            if sample_mask is not None:
+                assert self.config.training.train_mbs == 1, "sample_mask only support train_mbs == 1"
+                assert self.config.policy.dynamic_mbs_target_seqlen is None, "sample_mask only support dynamic_mbs_target_seqlen is None"
+                assert self.config.policy.dynamic_mbs_limit is None, "sample_mask only support dynamic_mbs_limit is None"
+
             valid_indices = []
             if sample_mask is not None:
                 for i, (sm, m) in enumerate(zip(sample_mask, mask, strict=True)):
@@ -737,7 +755,6 @@ class RlTrainerMixin:
                     ]
                 rollout_batch["advantages"] = advantages
 
-            # compute metrics
             # NOTE: this metric is not accumulated globally so it will differ between DP ranks
             if self.config.ppo.ppo_initial_policy_kl_penalty > 0:
                 ppo_rollout_metrics["ppo-metrics/init_policy_kl"] += masked_mean_list(
@@ -834,7 +851,69 @@ class RlTrainerMixin:
                     torch.tensor(retention_value, dtype=ref_dtype) for _ in range(n)
                 ]
 
+        if (
+            self.config.ppo.ppo_entropy_global_cov and
+            self.config.ppo.ppo_entropy_regularization_type in ("clip-cov", "kl-cov")
+        ):
+            self._attach_entropy_aux_figures(rollout_batches, mask_list)
+
         return metrics
+
+    def _attach_entropy_aux_figures(
+        self, rollout_batches: List[Dict[str, List[Any]]], mask_list: List[torch.Tensor]
+    ) -> None:
+        """Compute global covariance figures and attach to each rollout batch.
+
+        Stores a per-sample ``entropy_aux_figures`` tensor of shape ``(3,)`` =
+        ``[global_mean_adv, global_mean_logp, kl_cov_threshold]`` so the loss can
+        center the advantage-logprob covariance on the global (train_gbs,
+        cross-DP) mean and, for kl-cov, select the true global top-rho% via the
+        threshold. The covariance log-prob is ``prev_logp`` (the ``logprobs``
+        field), or ``rollout_log_probs`` when ``skip_prev_logps`` is set.
+
+        Stored per-sample (a list of identical ``(3,)`` tensors) because the
+        downstream batch is a list of per-sample dicts (see
+        :func:`expand_rollout_batch`); this mirrors ``global_retention_ratio``.
+        """
+        ppo = self.config.ppo
+        dp_group = mpu.get_data_parallel_group()
+        logp_key = "rollout_log_probs" if ppo.skip_prev_logps else "logprobs"
+
+        adv_list: List[torch.Tensor] = []
+        logp_list: List[torch.Tensor] = []
+        for rb in rollout_batches:
+            adv_list.extend(rb["advantages"])
+            # Align logp to the response-mask length: rollout_log_probs is one
+            # token longer than the seqlen-1 response convention.
+            for lp, m in zip(rb[logp_key], rb["mask"], strict=True):
+                logp_list.append(pad_or_truncate_last_dim(lp, m.shape[-1], 0))
+
+        mean_adv, _, _, _ = masked_global_statistics_list(
+            adv_list, mask_list, key_name="entropy_cov_adv", group=dp_group
+        )
+        mean_logp, _, _, _ = masked_global_statistics_list(
+            logp_list, mask_list, key_name="entropy_cov_logp", group=dp_group
+        )
+
+        tau = float("inf")
+        if ppo.ppo_entropy_regularization_type == "kl-cov" and ppo.ppo_kl_cov_ratio > 0:
+            device = torch.cuda.current_device()
+            adv_cat = torch.cat([a.view(-1) for a in adv_list]).to(device, torch.float32)
+            logp_cat = torch.cat([l.view(-1) for l in logp_list]).to(device, torch.float32)
+            mask_cat = torch.cat([m.view(-1) for m in mask_list]).to(device)
+            count_t = torch.tensor([mask_cat.sum()], dtype=torch.float32, device=device)
+            torch.distributed.all_reduce(count_t, group=dp_group)
+            n_global = int(count_t.item())
+            if n_global > 0:
+                cov = (adv_cat - mean_adv) * (logp_cat - mean_logp)
+                k_global = max(1, int(ppo.ppo_kl_cov_ratio * n_global))
+                tau = masked_global_topk_threshold(cov, mask_cat, k_global, group=dp_group).item()
+
+        figures = torch.tensor([mean_adv.item(), mean_logp.item(), tau], dtype=torch.float32)
+        for rb in rollout_batches:
+            n = len(rb["mask"])
+            rb["entropy_aux_figures"] = [figures.clone() for _ in range(n)]
+        logging_rank0(f"entropy_aux_figures: {figures}")
 
     async def _debug_update_weight_stage1(self, sampler_idx):
         # debug funcion
@@ -851,6 +930,7 @@ class RlTrainerMixin:
         if self.config.placement_type != "disaggregated":
             await self.sampler_client.sleep(sampler_idx)
             cpu_barrier()
+        logging_memory_usage_details(f"memory tracking after stage1", rank=0)
 
     async def _debug_update_weight_stage2(self, sampler_idx):
         assert self.config.debug.debug_engine_update_weight is True
@@ -861,6 +941,7 @@ class RlTrainerMixin:
         logging_rank0("debug_update replace zeros weights")
         await self.update_weights(replace_zeros=True)
         cpu_barrier()
+
         await self.sampler_client.mark_ppo_step_begin(sampler_idx, 0)
         cpu_barrier()
 
@@ -871,6 +952,7 @@ class RlTrainerMixin:
         if self.config.placement_type != "disaggregated":
             await self.sampler_client.sleep(sampler_idx)
             cpu_barrier()
+        logging_memory_usage_details(f"memory tracking after zero update", rank=0)
 
         self.policy_engine.onload_optimizer()
         self.policy_engine.onload_model()
@@ -878,6 +960,7 @@ class RlTrainerMixin:
         logging_rank0("debug_update replace real weights")
         await self.update_weights()
         cpu_barrier()
+
         await self.sampler_client.mark_ppo_step_begin(sampler_idx, 0)
         cpu_barrier()
         await self.sampler_client.test_generate(sampler_idx)
@@ -887,6 +970,7 @@ class RlTrainerMixin:
         if self.config.placement_type != "disaggregated":
             await self.sampler_client.sleep(sampler_idx)
             cpu_barrier()
+        logging_memory_usage_details(f"memory tracking after real update", rank=0)
 
     async def debug_update_weight(self, stage):
         """Debug helper to exercise the weight-update path.
@@ -1222,10 +1306,11 @@ class FlopsCounterMixin:
             for rbs in expanded_rbs:
                 if self.image_grid_thw_name in rbs and rbs[self.image_grid_thw_name] is not None:
                     image_grid_thw = rbs[self.image_grid_thw_name]
-                    image_seqlen = torch.repeat_interleave(
-                        image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0]
-                    )
-                    images_seqlens.extend(image_seqlen.tolist())
+                    if image_grid_thw.ndim >= 2 and image_grid_thw.shape[0] > 0:
+                        image_seqlen = torch.repeat_interleave(
+                            image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0]
+                        )
+                        images_seqlens.extend(image_seqlen.tolist())
             kwargs = {}
             if len(images_seqlens) > 0:
                 kwargs["images_seqlens"] = images_seqlens

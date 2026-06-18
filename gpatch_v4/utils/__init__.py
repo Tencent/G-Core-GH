@@ -14,6 +14,7 @@ from gpatch_v4.utils.common_utils import (
     logging_memory_usage_details,
     logging_rank0,
     logging_with_rank_and_datetime,
+    n_times_clear_memory,
     perf_time,
     profile_memory_and_time,
     reorder_dict_keys_by_prefix,
@@ -64,4 +65,5 @@ from gpatch_v4.utils.timer_utils import (
     init_timer_singleton,
     record_time_to_metrics,
 )
+from gpatch_v4.utils.tokenizer_utils import get_tokenizer_template
 from gpatch_v4.utils.training_utils import *

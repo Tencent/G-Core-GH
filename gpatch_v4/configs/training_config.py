@@ -85,6 +85,8 @@ class TrainingConfig(MappingProtocol):
     ppo_dump_per_token_entropy : bool
     dump_metrics_logprobs_topk : int
         Dump top-k logprobs ``[b, s, topk]``; ``0`` disables.
+    im_end_metrics_enable : bool
+        Compute EOS probability/top-k diagnostics during actor train forward.
     ppo_dump_moe_topk : int
         Dump top-k MoE experts ``[b, s, topk]``; ``0`` disables.
     check_gbs_consistency : bool
@@ -210,7 +212,6 @@ class TrainingConfig(MappingProtocol):
                 "Whether to build from vanilla bridge. If True, build from mbridge otherwise build from megatron_bridge"
         }
     )
-
     moe_pad_with_random_tokens: bool = field(
         default=False, metadata={"help": "Whether to pad with random tokens"}
     )
@@ -263,6 +264,10 @@ class TrainingConfig(MappingProtocol):
 
     dump_metrics_logprobs_topk: int = field(
         default=0, metadata={"help": "Dump topk logits[b,s,v], choose topk ->[b,s,topk]"}
+    )
+    im_end_metrics_enable: bool = field(
+        default=False,
+        metadata={"help": "Report EOS probability/top-k diagnostics from actor train forward."}
     )
     ppo_dump_moe_topk: int = field(
         default=0,

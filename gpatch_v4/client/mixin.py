@@ -1,23 +1,33 @@
 import asyncio
+import os
 import traceback
 from abc import ABC
 
 import torch
 import torch.distributed as dist
 
+from gpatch_v4.orches.flashinfer_cudart_fix import patch_ctypes_for_cudart_stub
+
 # sglang-native serialization (used only when backend == sglang)
+
 try:
-    from sglang.srt.model_executor.model_runner import FlattenedTensorBucket as SglFlatTensorBucket
-    from sglang.srt.utils import MultiprocessingSerializer as SglSerializer
+    with patch_ctypes_for_cudart_stub():
+        from sglang.srt.model_executor.model_runner import (
+            FlattenedTensorBucket as SglFlatTensorBucket,
+        )
+        from sglang.srt.utils import MultiprocessingSerializer as SglSerializer
     _has_sglang_ipc = True
-except Exception:
+except Exception as e:
     _has_sglang_ipc = False
 
 from gpatch_v4.core.parallel_state import cpu_barrier
-from gpatch_v4.utils import log, logging_rank0, perf_time
+from gpatch_v4.utils import clear_memory, log, logging_rank0, perf_time
+
 # Backend-agnostic serialization (used for vllm; no sglang dependency)
 from gpatch_v4.utils.tensor_ipc import FlattenedTensorBucket as GpatchFlatTensorBucket
-from gpatch_v4.utils.tensor_ipc import serialize_pickle_base64 as _gpatch_serialize_pickle_base64
+from gpatch_v4.utils.tensor_ipc import (
+    serialize_pickle_base64 as _gpatch_serialize_pickle_base64,
+)
 
 
 class UpdateWeightIpcMixin:
@@ -58,6 +68,7 @@ class UpdateWeightIpcMixin:
           workers have different CUDA_VISIBLE_DEVICES and cannot access
           training-side physical GPU devices via IPC handles.
         """
+
         backend = self.infer_backend
         if backend == "sglang" and _has_sglang_ipc:
             bucket = SglFlatTensorBucket(named_tensors=named_tensors)
@@ -67,6 +78,7 @@ class UpdateWeightIpcMixin:
             }
             return SglSerializer.serialize(data, output_str=True)
         else:
+            assert False, "never reach here in sglang backend"
             cpu_tensors = [(n, t.cpu()) for n, t in named_tensors]
             bucket = GpatchFlatTensorBucket(named_tensors=cpu_tensors)
             data = {
@@ -102,6 +114,44 @@ class UpdateWeightIpcMixin:
         )
         return serialized_named_tensors
 
+    async def _dispatch_vllm_start_weights_update(self, sampler_idx: int) -> None:
+        """RPC ``start_weights_update`` to every sampler cluster endpoint."""
+        import ray
+
+        if dist.get_rank() != 0:
+            cpu_barrier()
+            return
+
+        num_clusters = self.svr_cluster_num_per_sampler[sampler_idx]
+        refs = []
+        for ep_i in range(num_clusters):
+            target_ep = self.rpc_client_lst[sampler_idx].get_target_endpoint(
+                sample_idx=None,
+                ep_idx=ep_i,
+            )
+            refs.append(target_ep.start_weights_update.remote({}))
+        ray.get(refs)
+        cpu_barrier()
+
+    async def _dispatch_vllm_finalize_weights_update(self, sampler_idx: int) -> None:
+        """RPC ``finalize_weights_update`` to every sampler cluster endpoint."""
+        import ray
+
+        if dist.get_rank() != 0:
+            cpu_barrier()
+            return
+
+        num_clusters = self.svr_cluster_num_per_sampler[sampler_idx]
+        refs = []
+        for ep_i in range(num_clusters):
+            target_ep = self.rpc_client_lst[sampler_idx].get_target_endpoint(
+                sample_idx=None,
+                ep_idx=ep_i,
+            )
+            refs.append(target_ep.finalize_weights_update.remote({}))
+        ray.get(refs)
+        cpu_barrier()
+
     async def update_weights_by_ipc_handle(self, sampler_idx, model_engine, replace_zeros=False):
         """Stream model weights to the sampler via IPC with pipelining.
 
@@ -124,6 +174,12 @@ class UpdateWeightIpcMixin:
             )
         else:
             assert backend == "vllm", "only sglang and vllm backend are supported"
+            model_arch = self.config.policy.model_arch
+            if model_arch == "deepseek_v4":
+                assert self.update_weight_use_bucketed_ipc, (
+                    "DeepSeek-V4 vLLM update_weights requires bucketed IPC. "
+                    "Please set policy.sampler_client.update_weight_use_bucketed_ipc=True."
+                )
             if self.update_weight_use_bucketed_ipc:
                 return await self._update_weights_by_bucketed_ipc_vllm(
                     sampler_idx, model_engine, replace_zeros
@@ -304,6 +360,8 @@ class UpdateWeightIpcMixin:
         # physical GPU in the sampler cluster before issuing the RPC.
         gpu_uuid = gcore_gpu_uuid(torch.device("cuda", torch.cuda.current_device()))
 
+        await self._dispatch_vllm_start_weights_update(sampler_idx)
+
         names: list = []
         dtype_names: list = []
         shapes: list = []
@@ -336,19 +394,15 @@ class UpdateWeightIpcMixin:
                     for j, entry in enumerate(rank_list):
                         merged[j].update(entry)
 
-                # ``is_last_bucket`` tells the sampler-side extension
-                # (``GCoreVllmWorkerExtension.gcore_update_weights_ipc``) to
-                # run ``process_weights_after_loading`` exactly once, after
-                # the final bucket. This mirrors verl's proven pattern and
-                # avoids vLLM's per-bucket ``initialize/finalize_layerwise_reload``
-                # which corrupts MoE experts that straddle buckets.
+                # Legacy key kept for backward compatibility; finalize is
+                # handled by a separate RPC after all buckets are acked.
                 update_info = {
                     "names": names,
                     "dtype_names": dtype_names,
                     "shapes": shapes,
                     "ipc_handles": merged,
                     "is_checkpoint_format": True,
-                    "is_last_bucket": is_last,
+                    "is_last_bucket": False,
                 }
                 num_clusters = self.svr_cluster_num_per_sampler[sampler_idx]
                 obj_refs = []
@@ -403,6 +457,8 @@ class UpdateWeightIpcMixin:
         torch.cuda.synchronize()
         await update_weight_fn(is_last=True)
 
+        await self._dispatch_vllm_finalize_weights_update(sampler_idx)
+
         log(
             f"native_ipc weight update done, {total_weights_sent} tensors "
             f"across {bucket_count} buckets via vllm IPCWeightTransferEngine",
@@ -435,7 +491,8 @@ class UpdateWeightIpcMixin:
            :meth:`GCoreVllmWorkerExtension.gcore_update_weights_bucketed`.
         4. After draining the final bucket, rank 0 fires one
            :meth:`~GCoreVllmWorkerExtension.gcore_finalize_weights_update`
-           RPC so ``process_weights_after_loading`` runs exactly once.
+           RPC so :func:`gpatch_v4.generation_backend.vllm_weight_reload.finalize_weights_after_reload`
+           runs exactly once.
 
         Notes
         -----
@@ -467,6 +524,8 @@ class UpdateWeightIpcMixin:
 
         builder = FlatIpcBucketBuilder(max_bucket_bytes=max_bucket_bytes)
         weight_generator = model_engine.export_weights()
+
+        await self._dispatch_vllm_start_weights_update(sampler_idx)
 
         total_sent = 0
         bucket_count = 0
@@ -524,6 +583,7 @@ class UpdateWeightIpcMixin:
                     merged_handles: dict = {}
                     for rank_payload in gathered:
                         merged_handles.update(rank_payload[bucket_i]["uuid_handle"])
+                    next_bucket_count = bucket_count + 1
                     req = {
                         "names": base["names"],
                         "key_size": base["key_size"],
@@ -531,6 +591,7 @@ class UpdateWeightIpcMixin:
                         "ipc_handles": merged_handles,
                         "flat_shape": base["flat_shape"],
                         "flat_dtype": base["flat_dtype"],
+                        "bucket_idx": next_bucket_count,
                     }
                     obj_refs = []
                     for ep_i in range(num_clusters):
@@ -541,7 +602,7 @@ class UpdateWeightIpcMixin:
                         obj_refs.append(target_ep.update_weights_bucketed.remote(req))
                     ray.get(obj_refs)
                     total_sent += len(base["names"])
-                    bucket_count += 1
+                    bucket_count = next_bucket_count
                     log(
                         f"bucketed_ipc bucket {bucket_count} dtype={base['flat_dtype']} "
                         f"tensors={len(base['names'])} flat_numel={base['flat_shape'][0]}",
@@ -564,21 +625,26 @@ class UpdateWeightIpcMixin:
             builder.add(name, weight)
             if builder.is_full():
                 await update_weight_fn()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
 
         await update_weight_fn()
 
-        # Post-load finalize once (process_weights_after_loading).
-        if is_rank0:
-            num_clusters = self.svr_cluster_num_per_sampler[sampler_idx]
-            fin_refs = []
-            for ep_i in range(num_clusters):
-                target_ep = self.rpc_client_lst[sampler_idx].get_target_endpoint(
-                    sample_idx=None,
-                    ep_idx=ep_i,
-                )
-                fin_refs.append(target_ep.finalize_weights_update.remote({}))
-            ray.get(fin_refs)
-        cpu_barrier()
+        # ``for``-loop locals keep the last tensor alive until function exit.
+        # Drop them explicitly before clear_memory so allocator segments can
+        # be fully returned when possible.
+        try:
+            del name, param, src, weight
+        except NameError:
+            pass
+
+        # Release GPU tensors held by the weight generator iteration.
+        del weight_generator
+        clear_memory()
+        torch.cuda.ipc_collect()
+
+        # Post-load finalize once (process_weights_after_loading on worker).
+        await self._dispatch_vllm_finalize_weights_update(sampler_idx)
 
         log(
             f"bucketed_ipc weight update done, {total_sent} tensors across "
@@ -649,7 +715,9 @@ class UpdateWeightDistributedMixin:
                 obj_refs.append(target_ep.init_weights_update_group.remote(req_data))
 
             if backend == "vllm":
-                from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+                from vllm.distributed.weight_transfer.nccl_engine import (
+                    NCCLWeightTransferEngine,
+                )
                 self._dist_weight_group = NCCLWeightTransferEngine.trainer_init(
                     {
                         "master_address": master_address,
@@ -784,7 +852,7 @@ class UpdateWeightDistributedMixin:
         * 所有 bucket 发完后 rank0 单独下发一次
           :meth:`VllmEngine.finalize_weights_update` RPC，让 worker
           端统一做 ``process_weights_after_loading`` 一次（避免 MoE
-          expert 跨桶被 ``initialize/finalize_layerwise_reload`` 搞坏）。
+          expert 跨桶被部分 finalize 搞坏）。
 
         Parameters
         ----------
@@ -797,9 +865,23 @@ class UpdateWeightDistributedMixin:
         -------
         bool
         """
+        is_rank0 = dist.get_rank() == 0
+        if is_rank0:
+            import ray
+
+            num_clusters = self.svr_cluster_num_per_sampler[sampler_idx]
+            start_refs = []
+            for ep_i in range(num_clusters):
+                target_ep = self.rpc_client_lst[sampler_idx].get_target_endpoint(
+                    sample_idx=None,
+                    ep_idx=ep_i,
+                )
+                start_refs.append(target_ep.start_weights_update.remote({}))
+            ray.get(start_refs)
+        cpu_barrier()
+
         weight_generator = model_engine.export_weights()
         max_bucket_bytes = self.update_weight_max_size_bytes
-        is_rank0 = dist.get_rank() == 0
         count_buckets = 0
 
         buffer = []
@@ -826,6 +908,7 @@ class UpdateWeightDistributedMixin:
                 buffer = []
                 buffer_size = 0
                 cpu_barrier()
+                torch.cuda.empty_cache()
 
         if buffer_size > 0:
             if is_rank0:
@@ -833,6 +916,8 @@ class UpdateWeightDistributedMixin:
                 self._broadcast_weight_bucket_vllm(sampler_idx, buffer)
                 count_buckets += 1
             cpu_barrier()
+        del weight_generator
+        clear_memory()
 
         # 所有 bucket 发完后单发一次 finalize RPC，worker 端跑
         # ``process_weights_after_loading``（对 MoE 尤其重要，避免 expert

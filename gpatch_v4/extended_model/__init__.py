@@ -71,6 +71,11 @@ REGISTER_RL_PREPARE_DATA_FORWARD = {
     **({
         MODEL_ARCH.WELMV4_MOE: WelmV4PrepareDataForwardLLM
     } if WelmV4PrepareDataForwardLLM else {}),
+    **(
+        {
+            MODEL_ARCH.DEEPSEEK_V4: DeepseekV4PrepareDataForwardLLM
+        } if DeepseekV4PrepareDataForwardLLM else {}
+    ),
     MODEL_ARCH.QWEN3_VL:
         Qwen3VLPrepareDataForward,
     MODEL_ARCH.QWEN3_VL_MOE:

@@ -24,6 +24,7 @@ from megatron.core import mpu
 from gpatch_v4.actor.mixin import (
     CheckpointConverterMixin,
     FlopsCounterMixin,
+    ProfileMixin,
     RetryActorMixin,
     TokenizerMixin,
     TrainingPltMixin,
@@ -35,6 +36,7 @@ from gpatch_v4.core.parallel_state import (
     is_last_rank,
     is_mp_and_cp_head,
     is_tp_and_cp_head,
+    preserve_rng_state,
 )
 from gpatch_v4.orches.train_actor import BaseActor
 from gpatch_v4.rollout_generator import RolloutGeneratorFactory
@@ -61,14 +63,16 @@ from gpatch_v4.utils.test_utils import save_data
 from gpatch_v4.utils.training_utils import get_dump_moe_metrics
 
 try:
-    from megatron.core.gcore_utils import clear_gathered_routing_info  # only branch wxdev support
+    from megatron.core.gcore_utils import (
+        clear_gathered_routing_info,  # only branch wxdev support
+    )
 except ImportError:
     clear_gathered_routing_info = None
 
 
 class FinetuneActor(
     BaseActor, TokenizerMixin, CheckpointConverterMixin, RetryActorMixin, TrainingPltMixin,
-    FlopsCounterMixin
+    FlopsCounterMixin, ProfileMixin
 ):
     """Ray actor for supervised fine-tuning (SFT)."""
     async def init(self, config):
@@ -197,9 +201,9 @@ class FinetuneActor(
         self.train_step = self.model_engine.setup_model_and_get_optimizer()
         logging_rank0(f"finished setup_model_and_optimizer at {self.train_step} ...")
         if self.train_step > 0:
-            # 如果是续训（train_step > 0），重建 dataloader 以跳过已训练的数据
-            self.build_dataset_and_dataloader(self.train_step)
-            logging_rank0(f"dataloader rebuilt form {self.train_step}.")
+            with preserve_rng_state():
+                self.build_dataset_and_dataloader(self.train_step)
+            logging_rank0(f"dataloader rebuilt from {self.train_step}.")
 
     def build_dataset_and_dataloader(self, resume_step=None):
         """Build training dataset and dataloader from a user-provided factory function.
@@ -329,6 +333,7 @@ class FinetuneActor(
         self._training_plt_report(TrainingPltMixin.TrainState.EVAL_END, {})
 
     async def _train_loop(self):
+        self.setup_profile()
         timers = TimerSingleton.get_timer()
         training_config = self.config.training
         num_microbatches = training_config.gradient_accumulation_steps
@@ -337,6 +342,7 @@ class FinetuneActor(
         init_epoch = init_step // training_config.train_step_per_epoch
         init_step = init_step % training_config.train_step_per_epoch
         eval_before_train_flag = self.config.training.eval_before_train
+        collected_metrics = []
 
         cpu_barrier()
         for epoch in range(init_epoch, training_config.num_train_epoches):
@@ -354,6 +360,7 @@ class FinetuneActor(
             for cur_epoch_train_step in range(
                 start_steps_per_epoch, training_config.train_step_per_epoch
             ):
+                timers("train_step_total", log_level=0).start(barrier=True)
                 await asyncio.sleep(0.01)
                 self.last_progress_time = time.time()
 
@@ -382,10 +389,12 @@ class FinetuneActor(
                 self.model_engine.should_dump_metrics = should_dump
 
                 timers("train_step", log_level=0).start(barrier=True)
+                self.profile_start(train_step)
                 if not training_config.skip_train_step:
                     metric = self.model_engine.finetune_step(
                         expanded_rbs, num_microbatches, train_step
                     )
+                self.profile_end(train_step)
                 timers("train_step").stop()
                 self._training_plt_report(
                     TrainingPltMixin.TrainState.TRAIN_STEP, dict(step=train_step)
@@ -397,11 +406,14 @@ class FinetuneActor(
                 if clear_gathered_routing_info is not None:
                     clear_gathered_routing_info()
 
-                time_log_keys = ["get_batched_data", "train_step"]
+                timers("train_step_total").stop()
+                time_log_keys = ["get_batched_data", "train_step", "train_step_total"]
                 metric = record_time_to_metrics(timers, time_log_keys, metric, reset=True)
 
                 mfu, avg_mfu = self.flops_counter_calc(
-                    train_step, expanded_rbs, metric['time_perf/train_step'],
+                    train_step,
+                    expanded_rbs,
+                    metric['time_perf/train_step'],
                     metric['finetune/seq_length'],
                     seqlen_sum=metric.get('finetune/dyn_cp_seqlen_sum'),
                     seqlen_sq_sum=metric.get('finetune/dyn_cp_seqlen_sq_sum'),
@@ -413,6 +425,8 @@ class FinetuneActor(
                 if is_last_rank():
                     log_prefix = f"[SFT] training train_step {train_step}/{training_config.total_training_step} epoch {epoch}"
                     TrainReporterSingleton.log_and_report(metric, train_step, log_prefix=log_prefix)
+                if self.config.debug.trainer_return_ppo_step_metrics:
+                    collected_metrics.append(metric)
                 cpu_barrier()
 
                 if self.config.training.total_eval_step is not None and self.config.training.total_eval_step > 0 and (
@@ -443,11 +457,14 @@ class FinetuneActor(
         if is_last_rank():
             TrainReporterSingleton.finish()
 
+        return collected_metrics
+
     async def train_loop(self):
         try:
             self._training_plt_report(TrainingPltMixin.TrainState.TRAIN_START, {})
-            await self._train_loop()
+            ret = await self._train_loop()
             self._training_plt_report(TrainingPltMixin.TrainState.TRAIN_END, {})
+            return ret
         except Exception as e:
             log(f"train_loop error: {e}")
             traceback.print_exc()

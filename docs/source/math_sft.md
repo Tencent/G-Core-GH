@@ -112,3 +112,15 @@ format matching degree 0.69901
 eval accuracy 0.57998
 format matching degree 0.69826
 ```
+
+mbridge lora sft(lora 好像对初始化比较敏感):
+```
+eval accuracy 0.56
+format matching degree 0.70
+```
+
+mbridge canonical_lora sft（lora 好像对初始化比较敏感）:
+```
+eval accuracy 0.55
+format matching degree 0.684
+```

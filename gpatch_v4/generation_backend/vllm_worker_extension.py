@@ -1,9 +1,19 @@
 # copyright (c) 2025 tencent inc. all rights reserved.
 # xiaotaoliu@tencent.com, nrwu@tencent.com
 
+import os
 from typing import Any
 
 import torch
+
+from gpatch_v4.generation_backend.vllm_model_specific import (
+    finalize_weights_after_reload,
+    load_weights_for_update,
+    prepare_weights_for_reload,
+    restore_moe_after_wakeup,
+    save_moe_for_sleep,
+)
+from gpatch_v4.utils import log
 
 
 class GCoreVllmWorkerExtension:
@@ -15,32 +25,51 @@ class GCoreVllmWorkerExtension:
     ``self.weight_transfer_engine``, ``self.model_runner``,
     ``self.model_config``, and ``self.device`` are available.
     """
+    def gcore_start_weights_update(self) -> None:
+        """Prepare the model to receive checkpoint-format weights.
+
+        Restores MoE params and attaches weight loaders (verl-style, no
+        vLLM layerwise reload). Must be called once before the first bucket
+        of a multi-bucket update; pair with
+        :meth:`gcore_finalize_weights_update` after the last bucket.
+        """
+        if getattr(self, "_gcore_weight_update_active", False):
+            raise RuntimeError(
+                "gcore_start_weights_update called while a weight update "
+                "is already active. Call gcore_finalize_weights_update first."
+            )
+
+        model = self.model_runner.model
+        with torch.device(self.device):
+            prepare_weights_for_reload(model, self.model_runner, self.device)
+        self._gcore_weight_update_active = True
+
     def gcore_update_weights_ipc(self, update_info: dict[str, Any]) -> None:
-        """Per-bucket weight receive, with final post-load processing.
+        """Per-bucket weight receive via native IPCWeightTransferEngine.
 
         Parameters
         ----------
         update_info : dict
             Backend-specific update dict (same shape as what vLLM's built-in
-            ``Worker.update_weights`` accepts) with one extra key:
-
-            - ``is_last_bucket`` (bool, optional, default ``True``):
-              When ``True``, :func:`process_weights_after_loading` is run
-              after the bucket is loaded. Trainer should set ``False`` for
-              every bucket except the final one in a multi-bucket update.
+            ``Worker.update_weights`` accepts). ``is_last_bucket`` is ignored;
+            the trainer must call :meth:`gcore_finalize_weights_update` once
+            after all buckets are loaded.
         """
-        from vllm.model_executor.model_loader.utils import process_weights_after_loading
-
         if self.weight_transfer_engine is None:
             raise RuntimeError(
                 "Weight transfer not configured. "
                 "Please set weight_transfer_config to enable weight transfer."
             )
 
-        # Strip our control flag before handing the dict to vLLM's parser,
-        # which rejects unknown keys via dataclass kwargs.
+        if not getattr(self, "_gcore_weight_update_active", False):
+            raise RuntimeError(
+                "gcore_start_weights_update must be called before "
+                "gcore_update_weights_ipc."
+            )
+
+        # Strip legacy control flag before handing the dict to vLLM's parser.
         update_info = dict(update_info)
-        is_last_bucket = bool(update_info.pop("is_last_bucket", True))
+        update_info.pop("is_last_bucket", None)
 
         typed_update_info = self.weight_transfer_engine.parse_update_info(update_info)
         model = self.model_runner.model
@@ -48,11 +77,12 @@ class GCoreVllmWorkerExtension:
         with torch.device(self.device):
             self.weight_transfer_engine.receive_weights(
                 typed_update_info,
-                load_weights=model.load_weights,
+                load_weights=lambda weights: load_weights_for_update(
+                    model,
+                    self.model_runner,
+                    weights,
+                ),
             )
-            if is_last_bucket:
-                model_config = self.model_runner.vllm_config.model_config
-                process_weights_after_loading(model, model_config, self.device)
 
     def gcore_update_weights_bucketed(self, update_info: dict[str, Any]) -> None:
         """Receive one dtype-homogeneous flat-IPC bucket and load it.
@@ -62,66 +92,36 @@ class GCoreVllmWorkerExtension:
         ``UpdateWeightIpcMixin._update_weights_by_bucketed_ipc_vllm``; see
         :func:`open_flat_ipc_bucket` for the exact schema.
 
-        We open the flat-IPC bucket via
-        :func:`open_flat_ipc_bucket` (which handles uuid lookup, tensor
-        rebuild with device-id retargeting, shape/dtype checks, and the
-        ``narrow + view`` slicing) and feed the resulting ``(name, view)``
-        pairs to ``model.load_weights``.
-
-        No ``process_weights_after_loading`` is invoked here -- the
-        trainer is expected to call :meth:`gcore_finalize_weights_update`
-        exactly once at the end of the whole update.
+        No finalize is invoked here — the trainer calls
+        :meth:`gcore_finalize_weights_update` exactly once after all buckets.
         """
-        from gpatch_v4.generation_backend.bucketed_ipc_transfer import open_flat_ipc_bucket
-        from gpatch_v4.generation_backend.vllm_moe_weight_loader_patch import (
-            patch_vllm_moe_model_weight_loader,
+        from gpatch_v4.generation_backend.bucketed_ipc_transfer import (
+            open_flat_ipc_bucket,
         )
 
-        model = self.model_runner.model
+        if not getattr(self, "_gcore_weight_update_active", False):
+            raise RuntimeError(
+                "gcore_start_weights_update must be called before "
+                "gcore_update_weights_bucketed."
+            )
 
-        # Lazily apply the MoE weight_loader patch at the start of each
-        # update. We key off a one-shot flag reset by the finalize RPC so
-        # the patch runs exactly once per update (idempotent, but avoids
-        # per-bucket layer iteration on large MoE models).
-        if not getattr(self, "_gcore_bucketed_prepared", False):
-            patch_vllm_moe_model_weight_loader(model)
-            self._gcore_bucketed_prepared = True
+        model = self.model_runner.model
 
         # ``flat`` is kept alive for the duration of ``load_weights`` so
         # the narrow views remain valid; the trainer won't release the
         # CUDA IPC segment until our Ray reply is acked (ray.get).
         flat, model_weights = open_flat_ipc_bucket(update_info, self.device)
+
         with torch.device(self.device):
-            model.load_weights(weights=model_weights)
+            load_weights_for_update(model, self.model_runner, model_weights)
         del model_weights, flat
 
     def gcore_update_weights_distributed(self, update_info: dict[str, Any]) -> None:
         """Receive one flat NCCL-broadcast bucket and load it into the model.
 
-        Sender-side counterpart:
-        :meth:`UpdateWeightDistributedMixin._broadcast_weight_bucket_vllm`.
-
-        ``update_info`` schema (all buckets share the same format):
-
-        - ``names`` (list[str])
-        - ``dtype_names`` (list[str]) -- e.g. ``["bfloat16", "float32"]``
-        - ``shapes`` (list[list[int]])
-        - ``total_bytes`` (int) -- flat uint8 bucket length
-        - ``group_name`` (str) -- trainer-side NCCL group label (info only)
-
-        Each worker allocates a contiguous uint8 tensor of ``total_bytes``,
-        joins the ``PyNcclCommunicator.broadcast`` initiated by trainer
-        rank 0 on the group created by
-        :meth:`~.init_weight_transfer_engine`, then slices the flat buffer
-        into per-tensor byte views and re-interprets them as
-        ``view(dtype).view(shape)`` before handing them to
-        ``model.load_weights``.
-
-        ``process_weights_after_loading`` is **not** called here -- the
+        ``process_weights_after_loading`` is **not** called here — the
         trainer issues a single :meth:`gcore_finalize_weights_update`
-        RPC after all buckets are acked to finalize the whole update
-        (inlined at the tail of
-        :meth:`UpdateWeightDistributedMixin._update_weights_by_distributed_vllm`).
+        RPC after all buckets are acked.
         """
         if self.weight_transfer_engine is None:
             raise RuntimeError(
@@ -161,28 +161,42 @@ class GCoreVllmWorkerExtension:
             f"distributed bucket byte layout mismatch: offset={offset} total_bytes={total_bytes}"
         )
 
+        if not getattr(self, "_gcore_weight_update_active", False):
+            raise RuntimeError(
+                "gcore_start_weights_update must be called before "
+                "gcore_update_weights_distributed."
+            )
+
         model = self.model_runner.model
         with torch.device(self.device):
-            model.load_weights(weights=weights)
-        # flat 在 load_weights 之后才释放，保证所有 view 段期间都有效。
+            load_weights_for_update(model, self.model_runner, weights)
         del weights, flat
 
     def gcore_finalize_weights_update(self) -> None:
-        """Run ``process_weights_after_loading`` once per full weight update.
+        """Finalize one full checkpoint-format weight update.
 
-        Transport-agnostic finalize -- called by the trainer exactly once
-        at the end of any multi-bucket weight sync path (bucketed-IPC or
-        NCCL-distributed). Also resets the one-shot
-        ``_gcore_bucketed_prepared`` marker so the next bucketed-IPC
-        update re-applies the MoE weight-loader patch; setting the
-        attribute is a no-op for non-bucketed paths (idempotent).
+        Runs MegaMoE finalize and vLLM ``process_weights_after_loading``.
+        Called by the trainer exactly once after all buckets are loaded.
         """
-        from vllm.model_executor.model_loader.utils import process_weights_after_loading
+        if not getattr(self, "_gcore_weight_update_active", False):
+            raise RuntimeError(
+                "gcore_finalize_weights_update called without an active "
+                "weight update. Call gcore_start_weights_update first."
+            )
 
         model = self.model_runner.model
         model_config = self.model_runner.vllm_config.model_config
 
         with torch.device(self.device):
-            process_weights_after_loading(model, model_config, self.device)
+            finalize_weights_after_reload(model, model_config, self.model_runner, self.device)
+        self._gcore_weight_update_active = False
 
-        self._gcore_bucketed_prepared = False
+    def gcore_save_moe_for_sleep(self) -> None:
+        stash = save_moe_for_sleep(self.model_runner.model, self.model_runner, self.device)
+        self._gcore_moe_sleep_stash = stash
+
+    def gcore_restore_moe_after_wakeup(self) -> None:
+        stash = getattr(self, "_gcore_moe_sleep_stash", None)
+        if stash:
+            restore_moe_after_wakeup(self.model_runner.model, self.model_runner, self.device, stash)
+            self._gcore_moe_sleep_stash = {}

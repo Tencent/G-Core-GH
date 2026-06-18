@@ -10,6 +10,7 @@ import sys
 import tarfile
 import threading
 import time
+import traceback
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
@@ -71,6 +72,11 @@ def clear_memory():
     torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def n_times_clear_memory(n: int = 1):
+    for i in range(n):
+        clear_memory()
 
 
 def get_memory_usage():
@@ -704,12 +710,15 @@ def safe_import_class(class_path: str) -> Optional[Any]:
     -------
     type or None
     """
-    if can_import_class(class_path):
+    try:
         module_path, class_name = class_path.rsplit(".", 1)
         module = importlib.import_module(module_path)
         cls = getattr(module, class_name)
         return cls
-    else:
+    except (ImportError, ValueError, AttributeError):
+        logging_with_rank_and_datetime(
+            f"Failed to import class '{class_path}'. Original traceback:\n{traceback.format_exc()}"
+        )
         return None
 
 

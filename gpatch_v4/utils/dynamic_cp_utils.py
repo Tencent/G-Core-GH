@@ -931,6 +931,15 @@ def sft_dyn_cp_schedule_default(
         packed_keys=packed_keys,
         cat_keys=cat_keys,
     )
+
+    # Move packed microbatches to CPU to reduce peak GPU memory when GBS is
+    # large.  Each microbatch will be moved back to GPU lazily during forward.
+    for sample in new_samples:
+        for k, v in list(sample.items()):
+            if isinstance(v, torch.Tensor) and v.is_cuda:
+                sample[k] = v.to('cpu', non_blocking=True)
+    torch.cuda.current_stream().synchronize()
+
     seqlen_sum = float(sum(seqlens_gathered))
     seqlen_sq_sum = float(sum(s**2 for s in seqlens_gathered))
 
@@ -1015,16 +1024,15 @@ def sft_dyn_cp_schedule_smart_padding(
     M = N // num_cp_groups
     my_samples = gbs_batches[my_group_idx * M:(my_group_idx + 1) * M]
 
-    for s in my_samples:
-        for k, v in s.items():
-            if isinstance(v, torch.Tensor):
-                s[k] = v.to(dev, non_blocking=True)
+    # Keep samples on CPU; they will be moved to GPU lazily per-microbatch
+    # during the forward pass to reduce peak GPU memory when GBS is large.
+    cpu_dev = torch.device('cpu')
 
     num_packed = min(num_packed, M)
     num_microbatches = (M + num_packed - 1) // num_packed
     base_size = M // num_microbatches
     remainder = M % num_microbatches
-    local_cp_size_t = torch.tensor(local_cp_size, dtype=torch.int32, device=dev)
+    local_cp_size_t = torch.tensor(local_cp_size, dtype=torch.int32)
 
     new_samples: List[Dict[str, torch.Tensor]] = []
     offset = 0
@@ -1046,7 +1054,7 @@ def sft_dyn_cp_schedule_smart_padding(
             padded_lens,
             original_lens,
             local_cp_size_t,
-            dev,
+            cpu_dev,
             packed_keys,
             cat_keys,
         )

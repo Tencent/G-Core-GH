@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import gc
 import inspect
@@ -9,15 +10,18 @@ import shutil
 import threading
 import traceback
 import warnings
+from contextlib import nullcontext
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
 import torch.distributed
+import yaml
 from packaging.version import Version
+from safetensors.torch import load_file, save_file
 
 from megatron.core import dist_checkpointing, mpu, package_info, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
@@ -34,9 +38,43 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
 )
 from megatron.core.optimizer import MegatronOptimizer
+from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+
+try:
+    from mbridge.peft.canonical_lora import LoRALinearSplitFC1UpGate, LoRALinearSplitQKV
+    from mbridge.peft.lora import (
+        gather_lora_state_dict,
+        infer_hf_target_modules,
+        lora_merged,
+        mcore_adapter_name_to_hf,
+    )
+    from mbridge.peft.lora_layers import (
+        LinearAdapter,
+        LoRAGroupedLinear,
+        LoRALinear,
+        LoRATopKRouter,
+    )
+except ImportError:
+    lora_merged = None
+    gather_lora_state_dict = None
+    infer_hf_target_modules = None
+    mcore_adapter_name_to_hf = None
+    LinearAdapter = None
+    LoRAGroupedLinear = None
+    LoRALinear = None
+    LoRATopKRouter = None
+    LoRALinearSplitFC1UpGate = None
+    LoRALinearSplitQKV = None
+
+from megatron.bridge.training.checkpointing import (
+    apply_peft_adapter_filter_to_state_dict,
+)
 
 from gpatch_v4.configs.checkpoint_config import CheckpointConfig
 from gpatch_v4.core.parallel_state import cpu_barrier
+from gpatch_v4.training_backend.megatron_backend.mcore_peft import (
+    peft_to_run_config_dict,
+)
 from gpatch_v4.training_backend.megatron_backend.megatron_utils import unwrap_model
 from gpatch_v4.utils.common_utils import (
     assert_hf_metadata_cache_exists,
@@ -48,6 +86,92 @@ from gpatch_v4.utils.common_utils import (
 )
 
 
+@contextlib.contextmanager
+def _lora_structure_unwrapped(models):
+    """Context manager that temporarily swaps LoRA wrappers with their inner
+    ``to_wrap`` modules so that ``named_parameters()`` yields clean names
+    (without ``.to_wrap.``), but does NOT merge LoRA deltas into base weights.
+
+    Use this when saving unmerged base weights via the bridge, which only
+    recognizes the original (unwrapped) parameter names.
+    """
+    _ADAPTER_WRAPPER_TYPES = (
+        LoRALinear,
+        LoRAGroupedLinear,
+        LoRALinearSplitQKV,
+        LoRALinearSplitFC1UpGate,
+        LoRATopKRouter,
+    )
+
+    module_swaps = []
+    linear_adapter_backups = []
+
+    for model_chunk in models:
+        all_modules = dict(model_chunk.named_modules())
+        for name, module in all_modules.items():
+            if isinstance(module, _ADAPTER_WRAPPER_TYPES):
+                parts = name.rsplit(".", 1)
+                if len(parts) == 2:
+                    parent_name, attr_name = parts
+                    parent = all_modules[parent_name]
+                else:
+                    parent = model_chunk
+                    attr_name = parts[0]
+                setattr(parent, attr_name, module.to_wrap)
+                module_swaps.append((parent, attr_name, module))
+            elif isinstance(module, LinearAdapter):
+                saved_in = module._modules.pop('linear_in')
+                saved_out = module._modules.pop('linear_out')
+                linear_adapter_backups.append((module, saved_in, saved_out))
+
+    try:
+        yield
+    finally:
+        for parent, attr_name, lora_module in module_swaps:
+            setattr(parent, attr_name, lora_module)
+        for la_module, saved_in, saved_out in linear_adapter_backups:
+            la_module._modules['linear_in'] = saved_in
+            la_module._modules['linear_out'] = saved_out
+
+
+def _remap_peft_sharded_keys(loaded_state_dict, model):
+    """Remap keys from sharded_state_dict convention to model.state_dict() convention.
+
+    mbridge's AdapterWrapper.sharded_state_dict() flattens ``to_wrap`` keys
+    (e.g., ``linear_proj.weight`` instead of ``linear_proj.to_wrap.weight``),
+    but ``model.state_dict()`` uses the full hierarchy.  Build a mapping from
+    the sharded naming to the model naming so that ``load_state_dict`` works.
+    """
+    model_keys = set(model.state_dict().keys())
+    loaded_keys = set(loaded_state_dict.keys())
+    if loaded_keys == model_keys:
+        return loaded_state_dict
+
+    remap = {}
+    for mk in model_keys:
+        if mk in loaded_keys:
+            continue
+        candidate = mk.replace(".to_wrap.", ".")
+        if candidate in loaded_keys:
+            remap[candidate] = mk
+
+    if not remap:
+        return loaded_state_dict
+
+    remapped = {}
+    for k, v in loaded_state_dict.items():
+        remapped[remap.get(k, k)] = v
+    return remapped
+
+
+def _save_peft_run_config(dist_checkpoint_path: str, peft) -> None:
+    """Write ``peft_config.yaml`` with PEFT metadata for adapter export."""
+    run_cfg = {"peft": peft_to_run_config_dict(peft)}
+    os.makedirs(dist_checkpoint_path, exist_ok=True)
+    with open(os.path.join(dist_checkpoint_path, "peft_config.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump(run_cfg, f, sort_keys=False)
+
+
 def _get_hf_save_path(checkpoint_config, iteration):
     if checkpoint_config.export_hf_save_path is not None:
         export_dir = Path(checkpoint_config.export_hf_save_path) / f"{iteration}"
@@ -56,7 +180,7 @@ def _get_hf_save_path(checkpoint_config, iteration):
     return export_dir
 
 
-def _mbridge_save_hf(config, iteration, model, bridge):
+def _mbridge_save_hf(config, iteration, model, bridge, peft):
     cpu_barrier()
     logging_rank0(f"begin to mbridge_save_hf")
     checkpoint_config = config.checkpoint
@@ -88,7 +212,19 @@ def _mbridge_save_hf(config, iteration, model, bridge):
                            ] = checkpoint_config.mbridge_distributed_filesystem
     if "strict" in save_func_sig.parameters:
         save_weights_kwargs["strict"] = checkpoint_config.strict_export
-    bridge.save_weights(unwrapped_model, export_dir, memory_efficient=True, **save_weights_kwargs)
+
+    # Save base weights to export_dir.
+    # When LoRA is active, unwrap the module structure (without merging deltas)
+    # so that the bridge sees clean parameter names.
+    save_ctx = (_lora_structure_unwrapped(unwrapped_model) if peft is not None else nullcontext())
+    with save_ctx:
+        bridge.save_weights(
+            unwrapped_model,
+            export_dir,
+            memory_efficient=True,
+            **save_weights_kwargs,
+        )
+
     cpu_barrier()
     if torch.distributed.get_rank() == 0:
         copy_cached_hf_metadata_files(
@@ -97,6 +233,34 @@ def _mbridge_save_hf(config, iteration, model, bridge):
             export_dir,
         )
     save_args_json(config, export_dir)
+
+    if peft is not None:
+        # Save adapter-only weights (HF PEFT format) for resume and export
+        adapter_export_dir = _get_hf_save_path(checkpoint_config, f"{iteration}_adapter")
+        _mbridge_save_adapter_only(config, model, adapter_export_dir, bridge=bridge)
+
+        # Optionally save merged (base+adapter) weights for deployment
+        if checkpoint_config.save_merged_lora_weights:
+            assert lora_merged is not None, "lora_merged is not available"
+            merge_export_dir = _get_hf_save_path(checkpoint_config, f"{iteration}_merge")
+            os.makedirs(merge_export_dir, exist_ok=True)
+            with lora_merged(unwrapped_model):
+                bridge.save_weights(
+                    unwrapped_model,
+                    merge_export_dir,
+                    memory_efficient=True,
+                    **save_weights_kwargs,
+                )
+            cpu_barrier()
+            if torch.distributed.get_rank() == 0:
+                copy_cached_hf_metadata_files(
+                    config.policy.hf_model_path,
+                    checkpoint_config.save_ckpt_path,
+                    merge_export_dir,
+                )
+            save_args_json(config, merge_export_dir)
+            logging_rank0(f"Saved merged LoRA weights to {merge_export_dir}")
+
     cpu_barrier()
     end_eport_hf = sync_cuda_and_get_time()
     logging_rank0(
@@ -105,7 +269,7 @@ def _mbridge_save_hf(config, iteration, model, bridge):
     return export_dir
 
 
-def _megatron_bridge_save_hf(config, iteration, model, bridge):
+def _megatron_bridge_save_hf(config, iteration, model, bridge, peft):
     cpu_barrier()
     logging_rank0(f"begin to megatron_bridge_save_hf")
     checkpoint_config = config.checkpoint
@@ -143,6 +307,9 @@ def _megatron_bridge_save_hf(config, iteration, model, bridge):
     save_args_json(config, export_dir)
     cpu_barrier()
     end_eport_hf = sync_cuda_and_get_time()
+    if peft is not None:
+        adapter_export_dir = _get_hf_save_path(checkpoint_config, f"{iteration}_adapter")
+        _megatron_bridge_save_hf_adapter(config, model, bridge, peft, adapter_export_dir)
     logging_rank0(
         f"Finish to megatron_bridge_save_hf {export_dir}, time cost:{end_eport_hf - start_eport_hf}"
     )
@@ -226,12 +393,247 @@ def _update_tokenizer_configs(
     return changes
 
 
-def bridge_save_hf(config, iteration, model, bridge, override_tokenizer_special_token: dict = None):
+def _mbridge_save_adapter_only(config, model, output_dir, bridge=None):
+    """Export LoRA adapter weights in HF PEFT format.
+
+    Produces ``adapter_config.json`` + ``adapter_model.safetensors`` in
+    *output_dir*.  Uses ``gather_lora_state_dict`` which handles TP > 1.
+    Also saves extra trainable state (e.g. out_norm) that would lose
+    precision through bridge's format conversion.
+    """
+    cpu_barrier()
+    logging_rank0(f"begin to mbridge_save_adapter_only -> {output_dir}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    unwrapped_model = unwrap_model(model)
+    adapter_state = gather_lora_state_dict(unwrapped_model, bridge=bridge)
+
+    if torch.distributed.get_rank() == 0:
+        save_file(adapter_state, os.path.join(output_dir, "adapter_model.safetensors"))
+
+        lora_cfg = config.policy.lora
+        adapter_config = {
+            "peft_type": "LORA",
+            "base_model_name_or_path": config.policy.hf_model_path,
+            "r": lora_cfg.rank,
+            "lora_alpha": lora_cfg.alpha,
+            "lora_dropout": lora_cfg.dropout,
+            "target_modules": infer_hf_target_modules(adapter_state),
+            "bias": "none",
+            "task_type": "CAUSAL_LM",
+        }
+        with open(os.path.join(output_dir, "adapter_config.json"), "w") as f:
+            json.dump(adapter_config, f, indent=2)
+
+    cpu_barrier()
+    logging_rank0(f"Finish mbridge_save_adapter_only {output_dir}")
+
+
+def _scatter_weight_to_local_shard(full_weight, module, device):
+    """Scatter a full (un-sharded) weight tensor to the local TP shard.
+
+    Reverse of ``_gather_parallel_weight`` in mbridge:
+    - ColumnParallelLinear: split along dim 0, take local rank's shard.
+    - RowParallelLinear: split along dim 1, take local rank's shard.
+    - Regular nn.Linear or expert-parallel modules (ETP != TP): no split.
+
+    Compares shapes to avoid splitting modules that use a different
+    parallel group (e.g. expert_tensor_parallel with ETP=1).
+    """
+    local_shape = module.weight.shape
+    if full_weight.shape == local_shape:
+        return full_weight.to(device)
+
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    if tp_size <= 1:
+        return full_weight.to(device)
+
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    if isinstance(module, RowParallelLinear):
+        chunks = full_weight.chunk(tp_size, dim=1)
+    elif isinstance(module, ColumnParallelLinear):
+        chunks = full_weight.chunk(tp_size, dim=0)
+    else:
+        return full_weight.to(device)
+    return chunks[tp_rank].contiguous().to(device)
+
+
+def _interleave_lora_b_for_scatter(full_b: torch.Tensor, stride: int, tp_size: int) -> torch.Tensor:
+    """Re-interleave a sequential HF LoRA-B weight back for TP scatter.
+
+    Inverse of ``_deinterleave_gathered_lora_b``:
+    Input (sequential):  [gate_all, up_all]
+    Output (interleaved per-rank): [rank0_gate, rank0_up, rank1_gate, rank1_up, ...]
+    """
+    if stride <= 1 or tp_size <= 1:
+        return full_b
+
+    total_rows = full_b.shape[0]
+    per_stride = total_rows // stride
+    per_stride_per_rank = per_stride // tp_size
+
+    parts = []
+    for r in range(tp_size):
+        for s in range(stride):
+            start = s * per_stride + r * per_stride_per_rank
+            end = start + per_stride_per_rank
+            parts.append(full_b[start:end])
+    return torch.cat(parts, dim=0)
+
+
+def _load_adapter_from_hf_peft(models, adapter_dir, bridge=None):
+    """Load adapter weights from HF PEFT format into model's adapter modules.
+
+    This is the inverse of ``_mbridge_save_adapter_only`` /
+    ``gather_lora_state_dict``. It loads ``adapter_model.safetensors``,
+    maps HF keys back to mcore module names, scatters full tensors to
+    local TP shards, and assigns to ``linear_in.weight`` / ``linear_out.weight``.
+
+    Parameters
+    ----------
+    models : list[nn.Module]
+        Unwrapped model chunks.
+    adapter_dir : str
+        Directory containing ``adapter_model.safetensors``.
+    bridge : optional
+        mbridge Bridge instance for HF↔mcore name mapping.
+    """
+    adapter_path = os.path.join(adapter_dir, "adapter_model.safetensors")
+    if not os.path.exists(adapter_path):
+        raise FileNotFoundError(f"Adapter file not found for resume: {adapter_path}")
+
+    adapter_state = load_file(adapter_path, device="cpu")
+    log(f"Loaded adapter state dict from {adapter_path} ({len(adapter_state)} keys)", rank=0)
+
+    # Unwrap DDP/FSDP wrappers so named_modules() yields the same names
+    # as during save (which uses unwrap_model before gather_lora_state_dict).
+    unwrapped_models = unwrap_model(models)
+
+    # Build reverse mapping: hf_key -> (mcore_name, "linear_in"/"linear_out")
+    hf_to_mcore = {}
+    for model_chunk in unwrapped_models:
+        for name, module in model_chunk.named_modules():
+            if LoRALinearSplitQKV is not None and isinstance(
+                module, (LoRALinearSplitQKV, LoRALinearSplitFC1UpGate)
+            ):
+                for sub_name, sub_adapter in module.adapter.items():
+                    if sub_adapter is None:
+                        continue
+                    for part in ("linear_in", "linear_out"):
+                        mcore_key = f"{name}.adapter.{sub_name}.{part}.weight"
+                        hf_key = mcore_adapter_name_to_hf(mcore_key, bridge=bridge)
+                        hf_to_mcore[hf_key] = (sub_adapter, part, module)
+
+            elif LoRATopKRouter is not None and isinstance(module, LoRATopKRouter):
+                adapter = module.adapter
+                for part in ("linear_in", "linear_out"):
+                    mcore_key = f"{name}.adapter.{part}.weight"
+                    hf_key = mcore_adapter_name_to_hf(mcore_key, bridge=bridge)
+                    hf_to_mcore[hf_key] = (adapter, part, module)
+
+            elif LoRAGroupedLinear is not None and isinstance(module, LoRAGroupedLinear):
+                ep_rank = mpu.get_expert_model_parallel_rank()
+                ep_size = mpu.get_expert_model_parallel_world_size()
+                num_local_experts = len(module.adapter)
+                for i in range(num_local_experts):
+                    global_expert_id = ep_rank * num_local_experts + i
+                    adapter_i = module.adapter[i]
+                    for part in ("linear_in", "linear_out"):
+                        mcore_key = f"{name}.adapter.{global_expert_id}.{part}.weight"
+                        hf_key = mcore_adapter_name_to_hf(mcore_key, bridge=bridge)
+                        hf_to_mcore[hf_key] = (adapter_i, part, module)
+
+            elif LinearAdapter is not None and isinstance(module, LinearAdapter):
+                for part in ("linear_in", "linear_out"):
+                    mcore_key = f"{name}.{part}.weight"
+                    hf_key = mcore_adapter_name_to_hf(mcore_key, bridge=bridge)
+                    hf_to_mcore[hf_key] = (module, part, module)
+
+            elif LoRALinear is not None and isinstance(module, LoRALinear):
+                adapter = module.adapter
+                for part in ("linear_in", "linear_out"):
+                    mcore_key = f"{name}.adapter.{part}.weight"
+                    hf_key = mcore_adapter_name_to_hf(mcore_key, bridge=bridge)
+                    hf_to_mcore[hf_key] = (adapter, part, module)
+
+    loaded_count = 0
+    for hf_key, full_weight in adapter_state.items():
+        if hf_key not in hf_to_mcore:
+            log(f"Warning: adapter key {hf_key!r} not matched to any model module", rank=0)
+            continue
+
+        adapter_module, part, parent_lora_module = hf_to_mcore[hf_key]
+        target_linear = getattr(adapter_module, part)
+        device = target_linear.weight.device
+
+        # For standard LoRA linear_out on strided layers (SwiGLU), re-interleave
+        if part == "linear_out" and LoRALinear is not None and isinstance(
+            parent_lora_module, LoRALinear
+        ):
+            stride = getattr(parent_lora_module.to_wrap, 'stride', 1)
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+            if stride > 1 and tp_size > 1:
+                full_weight = _interleave_lora_b_for_scatter(full_weight, stride, tp_size)
+
+        local_weight = _scatter_weight_to_local_shard(full_weight, target_linear, device)
+        target_linear.weight.data.copy_(local_weight)
+        loaded_count += 1
+
+    log(f"Loaded {loaded_count} adapter weight tensors from {adapter_dir}", rank=0)
+
+
+def _megatron_bridge_save_hf_adapter(config, model, bridge, peft, export_dir):
+    cpu_barrier()
+    logging_rank0("begin to megatron_bridge_save_hf_adapter")
+    checkpoint_config = config.checkpoint
+    start_export = sync_cuda_and_get_time()
+
+    if os.path.exists(export_dir):
+        logging_rank0(f"WARNING: may override the huggingface adapter at {export_dir}")
+    else:
+        os.makedirs(export_dir, exist_ok=True)
+
+    bridge.save_hf_adapter(
+        model,
+        export_dir,
+        peft_config=peft,
+        base_model_name_or_path=config.policy.hf_model_path,
+    )
+    cpu_barrier()
+    if torch.distributed.get_rank() == 0:
+        assert_hf_metadata_cache_exists(
+            config.policy.hf_model_path,
+            checkpoint_config.save_ckpt_path,
+        )
+        copy_cached_hf_metadata_files(
+            config.policy.hf_model_path,
+            checkpoint_config.save_ckpt_path,
+            export_dir,
+        )
+    save_args_json(config, export_dir)
+    cpu_barrier()
+    end_export = sync_cuda_and_get_time()
+    logging_rank0(
+        f"Finish megatron_bridge_save_hf_adapter {export_dir}, "
+        f"time cost:{end_export - start_export}"
+    )
+    return export_dir
+
+
+def bridge_save_hf(
+    config,
+    iteration,
+    model,
+    bridge,
+    override_tokenizer_special_token: dict = None,
+    peft=None,
+):
     try:
         if config.training.build_from_mbridge:
-            save_path = _mbridge_save_hf(config, iteration, model, bridge)
+            save_path = _mbridge_save_hf(config, iteration, model, bridge, peft)
         else:
-            save_path = _megatron_bridge_save_hf(config, iteration, model, bridge)
+            save_path = _megatron_bridge_save_hf(config, iteration, model, bridge, peft)
 
         if torch.distributed.get_rank() == 0:
             if override_tokenizer_special_token is not None:
@@ -550,7 +952,8 @@ def save_checkpoint(
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
     global_step: int = 0,
     bridge=None,
-    override_tokenizer_special_token: dict = None
+    override_tokenizer_special_token: dict = None,
+    peft=None,
 ):
     tracker_filename = "latest_checkpointed_iteration.txt"
     checkpoint_config = config.checkpoint
@@ -560,6 +963,7 @@ def save_checkpoint(
     log(f"saving checkpoint to {dist_checkpoint_path}", rank=0)
     if not isinstance(models, list):
         models = [models]
+
     if checkpoint_config.convert_mcore_to_hf_online and checkpoint_config.save_ckpt_path is not None:
         assert bridge is not None
         bridge_save_hf(
@@ -567,7 +971,8 @@ def save_checkpoint(
             global_step,
             models,
             bridge,
-            override_tokenizer_special_token=override_tokenizer_special_token
+            override_tokenizer_special_token=override_tokenizer_special_token,
+            peft=peft,
         )
 
     # Note that model weights, optimizer states, and extra states are generated
@@ -594,6 +999,9 @@ def save_checkpoint(
                     )
         else:
             log(f"NOT Generated state dict for model saving", rank=0)
+        if peft is not None and not config.training.build_from_mbridge:
+            state_dict = apply_peft_adapter_filter_to_state_dict(state_dict, peft)
+            log("Filtered state dict to PEFT adapter parameters only", rank=0)
         # Start Async save if enabled
         async_save_request = save_dist_checkpointing(
             sharded_state_dict=state_dict,
@@ -612,13 +1020,22 @@ def save_checkpoint(
 
     prev_iteration = 0
     save_retain_interval = checkpoint_config.save_retain_interval
-    if save_retain_interval is not None:
+    # 这里不应该多 rank 去读，ceph 可能有偶现读到\x00的问题
+    if save_retain_interval is not None and 0 == torch.distributed.get_rank():
         tracker_path = os.path.join(checkpoint_config.save_ckpt_path, tracker_filename)
         if os.path.exists(tracker_path):
             with open(tracker_path, 'r') as f:
-                content = f.read().strip()
+                content = f.read().strip().strip('\x00')
                 if content:
-                    prev_iteration = int(content)
+                    try:
+                        prev_iteration = int(content)
+                    except ValueError:
+                        log(
+                            f"Warning: corrupted tracker file '{tracker_path}', "
+                            f"content={content!r}. Treating as iteration 0.",
+                            rank=0
+                        )
+                        prev_iteration = 0
                 else:
                     prev_iteration = 0
         else:
@@ -629,6 +1046,9 @@ def save_checkpoint(
         with open(latest_checkpoint_file, "w") as f:
             f.write(str(global_step))
     cpu_barrier()
+    if peft is not None:
+        _save_peft_run_config(dist_checkpoint_path, peft)
+
     log(f"successfully saved checkpoint to {dist_checkpoint_path}", rank=0)
 
     def delete_checkpoint(iteration_to_delete):
@@ -636,6 +1056,11 @@ def save_checkpoint(
         checkpoint_name = os.path.join(checkpoint_config.save_ckpt_path, directory)
         hf_dir = format(iteration_to_delete)
         hf_checkpoint_name = os.path.join(checkpoint_config.save_ckpt_path, "hf", hf_dir)
+
+        hf_checkpoint_name = _get_hf_save_path(checkpoint_config, iteration_to_delete)
+        adapter_hf_checkpoint_name = _get_hf_save_path(
+            checkpoint_config, f"{iteration_to_delete}_adapter"
+        )
         try:
             shutil.rmtree(checkpoint_name)
             log(
@@ -653,6 +1078,11 @@ def save_checkpoint(
             log(
                 f"successfully deleted hf checkpoint from iteration {iteration_to_delete:7d} at {checkpoint_config.save_ckpt_path}"
             )
+            if peft is not None:
+                shutil.rmtree(adapter_hf_checkpoint_name)
+                log(
+                    f"successfully deleted adapter adapter_only hf checkpoint from iteration {iteration_to_delete:7d} at {checkpoint_config.save_ckpt_path}"
+                )
         except Exception as e:
             log(
                 f'encountered exception "{e}" when trying to delete hf checkpoint from iteration {iteration_to_delete:7d} at {checkpoint_config.save_ckpt_path}'
@@ -752,6 +1182,7 @@ def load_checkpoint(
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
     global_step: int = 0,
     bridge=None,
+    peft=None,
 ):
     checkpoint_config = config.checkpoint
     assert global_step is not None, \
@@ -779,6 +1210,10 @@ def load_checkpoint(
     )
     log(f"Generated state dict for loading: {sharded_state_dict.keys()}", rank=0)
 
+    if peft is not None and not load_model_from_hf and not config.training.build_from_mbridge:
+        sharded_state_dict = apply_peft_adapter_filter_to_state_dict(sharded_state_dict, peft)
+        log("Filtered sharded state dict for PEFT adapter resume", rank=0)
+
     # Load Dist Checkpointing
     state_dict = load_dist_checkpointing(
         sharded_state_dict=sharded_state_dict,
@@ -793,11 +1228,21 @@ def load_checkpoint(
         )
         hf_model_path = _get_hf_save_path(checkpoint_config, global_step)
         log(f"Loading model weights from HF format via bridge: {hf_model_path}", rank=0)
-        if config.training.build_from_mbridge:
-            bridge.load_weights(models, hf_model_path, memory_efficient=True)
-        else:
-            bridge.load_hf_weights(models, hf_model_path, allowed_mismatched_params=[])
+        # When LoRA is active, temporarily unwrap module structure so the
+        # bridge sees clean parameter names (without .to_wrap.).
+        load_ctx = (_lora_structure_unwrapped(models) if peft is not None else nullcontext())
+        with load_ctx:
+            if config.training.build_from_mbridge:
+                bridge.load_weights(models, hf_model_path, memory_efficient=True)
+            else:
+                bridge.load_hf_weights(models, hf_model_path, allowed_mismatched_params=[])
         log(f"Loaded model weights from HF format: {hf_model_path}", rank=0)
+
+        # Load adapter (linear_in / linear_out) + extra trainable state for LoRA resume
+        if peft is not None:
+            adapter_dir = _get_hf_save_path(checkpoint_config, f"{global_step}_adapter")
+            log(f"Loading adapter weights for LoRA resume: {adapter_dir}", rank=0)
+            _load_adapter_from_hf_peft(models, adapter_dir, bridge=bridge)
     elif checkpoint_config.use_dist_checkpointing:
         assert "model" in state_dict or any(
             f"model{vpp_rank}" in state_dict for vpp_rank in range(len(models))
@@ -809,7 +1254,9 @@ def load_checkpoint(
                 assert f"model{vpp_rank}" in state_dict, f"model{vpp_rank} not found in state_dict"
                 model_state_dict = state_dict[f"model{vpp_rank}"]
             mpu.set_virtual_pipeline_model_parallel_rank(vpp_rank)
-            models[vpp_rank].load_state_dict(model_state_dict)
+            if peft is not None and config.training.build_from_mbridge:
+                model_state_dict = _remap_peft_sharded_keys(model_state_dict, models[vpp_rank])
+            models[vpp_rank].load_state_dict(model_state_dict, strict=False)
         log(f"Loaded sharded model checkpoint from {checkpoint_config.load_ckpt_path}", rank=0)
     elif checkpoint_config.use_hf_checkpoint:
         raise NotImplementedError("hf format checkpoint has not been implemented")
@@ -821,6 +1268,23 @@ def load_checkpoint(
         optimizer_state_dict = state_dict["optimizer"]
         optimizer.load_state_dict(optimizer_state_dict)
         log(f"Loaded optimizer checkpoint from {checkpoint_config.load_ckpt_path}", rank=0)
+
+        # When model weights were loaded from HF format (skip_save_mcore_model),
+        # force-sync model BF16 params with optimizer's FP32 main params to
+        # eliminate any precision discrepancy from the bridge roundtrip.
+        if load_model_from_hf and peft is not None:
+            sub_optimizers = (
+                optimizer.chained_optimizers
+                if hasattr(optimizer, 'chained_optimizers') else [optimizer]
+            )
+            for sub_opt in sub_optimizers:
+                if hasattr(sub_opt, '_copy_main_params_to_model_params'):
+                    sub_opt._copy_main_params_to_model_params()
+            for model_chunk in models:
+                if hasattr(model_chunk, 'start_param_sync'):
+                    model_chunk.start_param_sync(force_sync=True)
+            log("Synced model params from optimizer FP32 main params", rank=0)
+
         if "lr_scheduler" in state_dict:
             lr_scheduler_state_dict = state_dict["lr_scheduler"]
             if lr_scheduler is not None:

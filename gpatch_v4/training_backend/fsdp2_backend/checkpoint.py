@@ -23,22 +23,27 @@ from gpatch_v4.utils import copy_cached_hf_metadata_files, log
 
 
 def _fill_missing_optim_state(optimizer):
-    """Create zero state entries for parameters that never received gradients.
+    """Fill zero state for params without gradients, so DCP save/load doesn't miss keys.
 
-    DCP requires every optimizer-managed parameter to have a state entry;
-    params with no grads (e.g. an unused audio tower) otherwise trigger
-    ``Missing key in checkpoint state_dict`` on load. We fill zero
-    AdamW-style state (``step``, ``exp_avg``, ``exp_avg_sq``) for those.
+    Infers state format from ``param_group["use_muon"]``:
+    - True  → ``momentum_buffer``          (Muon)
+    - False → ``step``, ``exp_avg``, ``exp_avg_sq``  (AdamW, backward compatible)
     """
     for group in optimizer.param_groups:
+        use_muon = group.get("use_muon", False)
         for param in group["params"]:
             if param in optimizer.state:
                 continue
-            optimizer.state[param] = {
-                "step": torch.tensor(0.0),
-                "exp_avg": torch.zeros_like(param),
-                "exp_avg_sq": torch.zeros_like(param),
-            }
+            if use_muon:
+                optimizer.state[param] = {
+                    "momentum_buffer": torch.zeros_like(param),
+                }
+            else:
+                optimizer.state[param] = {
+                    "step": torch.tensor(0.0),
+                    "exp_avg": torch.zeros_like(param),
+                    "exp_avg_sq": torch.zeros_like(param),
+                }
 
 
 def get_latest_checkpoint_folder(path):

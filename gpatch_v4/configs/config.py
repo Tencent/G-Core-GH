@@ -1,4 +1,5 @@
 import collections
+import logging
 import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, List, Optional
@@ -38,6 +39,20 @@ from gpatch_v4.configs.training_config import (
     TrainingConfig,
 )
 from gpatch_v4.configs.utils import MappingProtocol
+
+
+def _assert_deterministic_mode_constraints(training, checkpoint) -> None:
+    if not training.apply_deterministic_mode:
+        return
+    assert not checkpoint.skip_save_mcore_model, (
+        "skip_save_mcore_model=True is incompatible with apply_deterministic_mode=True. "
+        "The HF bridge roundtrip introduces precision loss that breaks deterministic resume."
+    )
+    if training.attention_backend == "flash":
+        os.environ["GPATCH_DISABLE_FA3"] = "1"
+        logging.info(
+            "Deterministic mode + flash backend: set GPATCH_DISABLE_FA3=1 to force FA2 fallback"
+        )
 
 
 def _assert_dynamic_cp_requires_flash_attention(training, *policies) -> None:
@@ -84,6 +99,7 @@ class FinetuneConfig(MappingProtocol):
     task: Any = field(default=None, metadata={'help': 'any task related config'})
 
     def __post_init__(self):
+        _assert_deterministic_mode_constraints(self.training, self.checkpoint)
         _assert_dynamic_cp_requires_flash_attention(self.training, self.policy)
 
 
@@ -129,7 +145,21 @@ class RlConfig(MappingProtocol):
     task: Any = field(default=None, metadata={'help': 'any task related config'})
 
     def __post_init__(self):
+        _assert_deterministic_mode_constraints(self.training, self.checkpoint)
         _assert_dynamic_cp_requires_flash_attention(self.training, self.policy, self.critic)
+        # Global covariance centers on the global (cross-DP) mean, so it does not
+        # degenerate at train_mbs == 1; only the per-micro-batch path needs mbs > 1.
+        if (
+            self.ppo.ppo_entropy_regularization_type is not None and
+            not self.ppo.ppo_entropy_global_cov
+        ):
+            use_dynamic_mbs = self.policy.dynamic_mbs_target_seqlen is not None
+            assert self.training.train_mbs > 1 or use_dynamic_mbs, (
+                f"ppo_entropy_regularization_type requires train_mbs > 1 or dynamic mbs enabled "
+                f"(policy.dynamic_mbs_target_seqlen is not None), "
+                f"got train_mbs={self.training.train_mbs}, "
+                f"dynamic_mbs_target_seqlen={self.policy.dynamic_mbs_target_seqlen}."
+            )
 
 
 @dataclass
@@ -236,6 +266,7 @@ class OnPolicyDistillConfig(MappingProtocol):
     task: Any = field(default=None, metadata={'help': 'any task related config'})
 
     def __post_init__(self):
+        _assert_deterministic_mode_constraints(self.training, self.checkpoint)
         teachers = tuple(self.teachers.values()) if self.teachers else ()
         _assert_dynamic_cp_requires_flash_attention(
             self.training, self.policy, self.teacher, *teachers
@@ -276,6 +307,7 @@ class DpoConfig(MappingProtocol):
 
     def __post_init__(self):
         assert self.placement_type in ["colocate", "disaggregated"]
+        _assert_deterministic_mode_constraints(self.training, self.checkpoint)
         _assert_dynamic_cp_requires_flash_attention(self.training, self.policy)
 
 
@@ -316,6 +348,7 @@ class OffPolicyDistillConfig(MappingProtocol):
 
     def __post_init__(self):
         assert self.placement_type in ["colocate", "disaggregated"]
+        _assert_deterministic_mode_constraints(self.training, self.checkpoint)
         _assert_dynamic_cp_requires_flash_attention(self.training, self.policy, self.teacher)
 
         if not self.training.setup_teacher_in_independent_topo:

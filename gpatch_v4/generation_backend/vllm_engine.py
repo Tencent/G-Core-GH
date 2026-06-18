@@ -218,6 +218,7 @@ class VllmEngine(InferEngine):
 
         self.model_index = 0
         await self.infer_engine.wake_up(tags=should_wake)
+        await self.infer_engine.collective_rpc("gcore_restore_moe_after_wakeup")
         for t in should_wake:
             self.wake_up_tag[t] = True
         log(f"VllmEngine wake_up tags={should_wake}", rank=0)
@@ -244,6 +245,7 @@ class VllmEngine(InferEngine):
         if not should_sleep:
             return
 
+        await self.infer_engine.collective_rpc("gcore_save_moe_for_sleep")
         await self.infer_engine.sleep(level=1)
         # EngineCore._reset_caches() clears mm_receiver_cache during sleep,
         # but the renderer-side mm hash cache is left stale. Clear both sides
@@ -382,7 +384,7 @@ class VllmEngine(InferEngine):
         log("VllmEngine update_weights_from_distributed (nccl) done", rank=0)
 
     async def finalize_weights_update(self):
-        """Trigger a single ``process_weights_after_loading`` on every worker.
+        """Run worker finalize (MegaMoE + verl-style post-process) once.
 
         Transport-agnostic finalize. Called once per full weight update,
         after all buckets have been acked -- serves both the bucketed-IPC
@@ -395,6 +397,15 @@ class VllmEngine(InferEngine):
         if self.wake_up_tag.get("kv_cache", False):
             await self.infer_engine.reset_prefix_cache()
         log("VllmEngine finalize_weights_update done", rank=0)
+
+    async def start_weights_update(self):
+        """Prepare vLLM workers to receive checkpoint-format weights.
+
+        Must be called once before the first bucket of a multi-bucket
+        update. Pairs with :meth:`finalize_weights_update`.
+        """
+        await self.infer_engine.collective_rpc("gcore_start_weights_update")
+        log("VllmEngine start_weights_update done", rank=0)
 
     async def update_weights_from_file(self, weight_file: str):
         """Reload checkpoint-format weights from a safetensors file.

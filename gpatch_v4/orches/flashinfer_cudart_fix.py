@@ -1,16 +1,60 @@
 # copyright (c) 2026 tencent inc. all rights reserved.
-"""Avoid flashinfer binding tilelang's libcudart stub during vLLM config init.
+"""Avoid flashinfer binding tilelang's libcudart stub.
 
-vLLM ``PassConfig.default_fi_allreduce_fusion_max_size_mb()`` imports
-``flashinfer.comm`` (which binds the first ``libcudart`` in ``/proc/self/maps``,
-often tilelang's stub). Setting ``fi_allreduce_fusion_max_size_mb`` explicitly
-skips that import.
+tilelang ships ``libcudart_stub.so`` — a compile-time linker stub that lacks
+runtime symbols like ``cudaDeviceReset``.  flashinfer's ``CudaRTLibrary``
+discovers it via file-system search and binds to it, causing
+``AttributeError: undefined symbol: cudaDeviceReset``.
 
-The lookup table is copied from vLLM (do not import ``allreduce_rms_fusion`` —
-that module also imports ``flashinfer.comm`` at load time).
+Two fixes live here:
+
+* **vLLM path** — set ``fi_allreduce_fusion_max_size_mb`` explicitly so
+  ``PassConfig`` never imports ``flashinfer.comm``.
+* **sglang path** — monkey-patch ``ctypes.CDLL`` while sglang is imported,
+  redirecting any load of ``libcudart_stub`` to the real ``libcudart.so``.
 """
 
 from __future__ import annotations
+
+import contextlib
+import ctypes
+import glob
+import os
+
+
+def _find_real_cudart() -> str | None:
+    for candidate in [
+        os.environ.get("CUDART_LIBRARY_PATH"),
+        "/usr/local/cuda/lib64/libcudart.so",
+        *sorted(glob.glob("/usr/local/cuda-*/targets/x86_64-linux/lib/libcudart.so")),
+        *sorted(glob.glob("/usr/local/cuda-*/lib64/libcudart.so")),
+    ]:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+@contextlib.contextmanager
+def patch_ctypes_for_cudart_stub():
+    """Redirect ``ctypes.CDLL("…libcudart_stub…")`` to the real libcudart."""
+    real_cudart = _find_real_cudart()
+    if real_cudart is None:
+        yield
+        return
+
+    _orig_init = ctypes.CDLL.__init__
+
+    def _patched_init(self, name, *args, **kwargs):
+        if name and "libcudart_stub" in str(name):
+            print(f"redirect {name} to {real_cudart}", flush=True)
+            name = real_cudart
+        _orig_init(self, name, *args, **kwargs)
+
+    ctypes.CDLL.__init__ = _patched_init
+    try:
+        yield
+    finally:
+        ctypes.CDLL.__init__ = _orig_init
 
 # Sync with vllm/vllm/compilation/passes/fusion/allreduce_rms_fusion.py
 # FI_ALLREDUCE_FUSION_MAX_SIZE_MB

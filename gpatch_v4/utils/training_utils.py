@@ -238,7 +238,9 @@ def get_batches_max_seqlen(batches: List[Dict[str, Any]], pad_to_multi_of: int) 
 
 
 def update_square_averaging_token_len(batches: List[Dict[str, Any]], max_seq_length: int):
-    square_averaging_weight = torch.tensor(0, dtype=torch.float, device=torch.cuda.current_device())
+    # Compute on the same device as labels (may be CPU for lazy-loaded dynamic CP batches).
+    labels_device = batches[0]['labels'].device if batches else torch.device('cpu')
+    square_averaging_weight = torch.tensor(0, dtype=torch.float, device=labels_device)
     for batch in batches:
         labels = batch['labels']
         if batch['tokens'].shape[-1] > max_seq_length:
@@ -507,6 +509,62 @@ def masked_global_statistics_list(
     values = torch.cat([v.view(-1) for v in values])
     mask = torch.cat([m.view(-1) for m in mask])
     return masked_global_statistics(values, mask, key_name, group)
+
+
+def masked_global_topk_threshold(
+    values: Tensor,
+    mask: Tensor,
+    k_global: int,
+    group=None,
+) -> Tensor:
+    """Global top-k threshold of masked ``values`` across ranks in ``group``.
+
+    Returns the scalar ``tau`` equal to the ``k_global``-th largest value among
+    all masked entries across every rank in ``group``. Selecting entries with
+    ``value >= tau`` therefore yields the exact global top-``k_global`` set.
+
+    The threshold is computed exactly without gathering all values: the global
+    top-k is contained in the union of each rank's local top-k (any global
+    top-k value has fewer than ``k_global`` values above it globally, hence
+    fewer than ``k_global`` above it on its own rank). So the ``k_global``-th
+    largest of the gathered per-rank local top-k is the exact global threshold.
+
+    Parameters
+    ----------
+    values : Tensor
+        Per-token values on the local shard (any shape).
+    mask : Tensor
+        Same shape as ``values``; nonzero marks valid entries.
+    k_global : int
+        Global number of top entries to keep. Must be >= 1.
+    group : optional
+        Process group to reduce over.
+
+    Returns
+    -------
+    Tensor
+        Scalar threshold ``tau`` (float32, on the current cuda device).
+    """
+    assert k_global >= 1, f"k_global must be >= 1, got {k_global}"
+    device = torch.cuda.current_device()
+    values = values.to(device=device, dtype=torch.float32)
+    mask = mask.to(device=device)
+    valid = values[mask.bool()]
+
+    local_k = min(k_global, valid.numel())
+    if local_k > 0:
+        local_topk = torch.topk(valid, local_k, largest=True).values
+    else:
+        local_topk = valid.new_empty(0)
+    if local_topk.numel() < k_global:
+        pad = local_topk.new_full((k_global - local_topk.numel(), ), float("-inf"))
+        local_topk = torch.cat([local_topk, pad])
+
+    world_size = torch.distributed.get_world_size(group=group)
+    gathered = [torch.empty_like(local_topk) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered, local_topk.contiguous(), group=group)
+    gathered = torch.cat(gathered)
+    return torch.topk(gathered, k_global, largest=True).values[-1]
 
 
 def pad_or_truncate_last_dim(
@@ -1032,6 +1090,63 @@ def from_parallel_logits_to_topk_logprobs(
     return global_topk_logprobs, global_topk_token_ids
 
 
+@torch.no_grad()
+def from_parallel_logits_to_token_prob_and_rank(
+    vocab_parallel_logits: torch.Tensor,
+    token_id: int,
+    eps: float = 1e-10,
+    ignore_cp: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute one global token's probability and rank under vocab parallel logits."""
+    cp_size = mpu.get_context_parallel_world_size() if not ignore_cp else 1
+    tp_group = mpu.get_tensor_model_parallel_group()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    tp_world_size = mpu.get_tensor_model_parallel_world_size()
+    partition_vocab_size = vocab_parallel_logits.size(-1)
+    padded_vocab_size = partition_vocab_size * tp_world_size
+    if token_id < 0 or token_id >= padded_vocab_size:
+        raise ValueError(
+            f"token_id {token_id} is outside padded vocab range [0, {padded_vocab_size})"
+        )
+    vocab_parallel_logits = vocab_parallel_logits.float()
+
+    vocab_start_index, vocab_end_index = tensor_parallel.utils.VocabUtility.vocab_range_from_per_partition_vocab_size(
+        partition_vocab_size, tp_rank, tp_world_size
+    )
+    owns_token = vocab_start_index <= token_id < vocab_end_index
+
+    logits_max = vocab_parallel_logits.max(dim=-1, keepdim=True)[0]
+    torch.distributed.all_reduce(logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+    shifted_logits = vocab_parallel_logits - logits_max
+    sum_exp_logits = torch.exp(shifted_logits).sum(dim=-1, keepdim=True)
+    torch.distributed.all_reduce(sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+
+    if owns_token:
+        local_token_idx = token_id - vocab_start_index
+        local_token_logits = vocab_parallel_logits[..., local_token_idx]
+        local_shifted_token_logits = shifted_logits[..., local_token_idx]
+    else:
+        local_token_logits = torch.zeros_like(vocab_parallel_logits[..., 0])
+        local_shifted_token_logits = torch.zeros_like(vocab_parallel_logits[..., 0])
+
+    token_logits = local_token_logits.clone()
+    torch.distributed.all_reduce(token_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+    shifted_token_logits = local_shifted_token_logits.clone()
+    torch.distributed.all_reduce(
+        shifted_token_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
+    )
+
+    token_prob = torch.exp(shifted_token_logits) / (sum_exp_logits.squeeze(-1) + eps)
+    local_rank = (vocab_parallel_logits > token_logits.unsqueeze(-1)).sum(dim=-1).to(torch.float32)
+    torch.distributed.all_reduce(local_rank, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+
+    if cp_size > 1 and not ignore_cp:
+        token_prob = all_gather_from_context_parallel_region(token_prob)
+        local_rank = all_gather_from_context_parallel_region(local_rank)
+
+    return token_prob, local_rank
+
+
 def from_parallel_logits_to_opd_topk_logprobs(
     vocab_parallel_logits: torch.Tensor,
     target_ids: torch.Tensor,
@@ -1225,3 +1340,23 @@ def pad_topk_logprobs_to_target_len(
             f"topk logprobs seq dim exceeds target: {logprobs_lst[i].shape[-2]=} > {tgt_s=}"
         )
         logprobs_lst[i] = pad_3d_seq_dim(logprobs_lst[i], tgt_s, value=0)
+
+
+def get_im_end_metrics_token_id(tokenizer) -> int:
+        token = tokenizer.eos_token
+        if token is None:
+            raise ValueError("tokenizer.eos_token must be set when training.im_end_metrics_enable=True")
+        token_ids = tokenizer.encode(token, add_special_tokens=False)
+        if len(token_ids) != 1:
+            raise ValueError(
+                f"tokenizer.eos_token={token!r} must encode to exactly one token, got {token_ids}"
+            )
+        token_id = tokenizer.eos_token_id
+        if token_id is None or token_id != token_ids[0]:
+            raise ValueError(
+                f"tokenizer.eos_token={token!r} is inconsistent with tokenizer.eos_token_id; "
+                f"encode={token_ids}, eos_token_id={token_id}"
+            )
+        return int(token_id)
+
+

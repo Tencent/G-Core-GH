@@ -69,6 +69,22 @@ class PpoConfig(MappingProtocol):
     fipo_correction_aware_filter : bool
         When *True*, the sequence-level dual-clip filter excludes tokens
         already zeroed by off-policy correction (e.g. icepop).
+    ppo_entropy_regularization_type : str or None
+        Entropy regularization type: ``"clip-cov"`` or ``"kl-cov"``. *None* to
+        disable. See `arXiv:2505.22617 <https://arxiv.org/abs/2505.22617>`_.
+    ppo_clip_cov_ratio : float
+        [clip-cov] Fraction of valid response tokens to zero-out.
+    ppo_clip_cov_ub : float
+        [clip-cov] Upper bound for covariance filtering.
+    ppo_clip_cov_lb : float
+        [clip-cov] Lower bound for covariance filtering.
+    ppo_kl_cov_ratio : float
+        [kl-cov] Fraction of top-k covariance tokens to apply KL penalty.
+    ppo_kl_cov_coef : float
+        [kl-cov] Coefficient for KL penalty on high-covariance tokens.
+    ppo_entropy_global_cov : bool
+        Compute the advantage-logprob covariance over the global train_gbs
+        (across DP) rather than per-micro-batch. *False* keeps per-mb behavior.
     """
     advantage_type: str = field(default="grpo", metadata={"help": "Whether to use advantage."})
     # use_grpo: bool = field(default=True, metadata={"help": "Whether to use grpo."})
@@ -205,6 +221,41 @@ class PpoConfig(MappingProtocol):
                 "When True, FIPO's sequence-level dual-clip filter excludes tokens "
                 "already zeroed by off-policy correction (e.g. icepop mode)."
         },
+    )
+
+    # Entropy Regularization (clip-cov / kl-cov)
+    # ref: https://arxiv.org/abs/2505.22617
+    ppo_entropy_regularization_type: Optional[str] = field(
+        default=None,
+        metadata={"help": "Entropy regularization type: 'clip-cov' or 'kl-cov'. None to disable."}
+    )
+    ppo_clip_cov_ratio: float = field(
+        default=2e-4,
+        metadata={"help": "[clip-cov] Fraction of valid response tokens to zero-out."}
+    )
+    ppo_clip_cov_ub: float = field(
+        default=5.0, metadata={"help": "[clip-cov] Upper bound for covariance filtering."}
+    )
+    ppo_clip_cov_lb: float = field(
+        default=1.0, metadata={"help": "[clip-cov] Lower bound for covariance filtering."}
+    )
+    ppo_kl_cov_ratio: float = field(
+        default=2e-4,
+        metadata={"help": "[kl-cov] Fraction of top-k covariance tokens to apply KL penalty."}
+    )
+    ppo_kl_cov_coef: float = field(
+        default=0.1,
+        metadata={"help": "[kl-cov] Coefficient for KL penalty on high-covariance tokens."}
+    )
+    ppo_entropy_global_cov: bool = field(
+        default=True,
+        metadata={
+            "help":
+                "[clip-cov / kl-cov] Compute the advantage-logprob covariance over the "
+                "global train_gbs (across DP) instead of per-micro-batch. When True, "
+                "centering uses the global mean and kl-cov selects the true global top-rho% "
+                "via a global threshold. Default True keeps the global behavior."
+        }
     )
 
     gdpo_reward_weights: dict[str, Any] = field(default_factory=dict)
@@ -350,3 +401,11 @@ class DistillConfig(PpoConfig):
                 "(https://arxiv.org/abs/2604.13016)."
         }
     )
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert not (self.ppo_entropy_regularization_type is not None and self.log_prob_top_k > 0), (
+            "ppo_entropy_regularization_type and log_prob_top_k > 0 are incompatible. "
+            "Entropy regularization operates on 2D (B, S) log-probs, but "
+            f"log_prob_top_k={self.log_prob_top_k} produces 3D (B, S, K) tensors."
+        )

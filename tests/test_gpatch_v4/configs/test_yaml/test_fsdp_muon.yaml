@@ -1,0 +1,54 @@
+# @package _global_
+
+training:
+  training_backend: fsdp2
+  use_fast_tokenizer: True
+  train_gbs: 32
+  train_mbs: 1
+  seq_length: 4096
+  data_parallel_random_init: False
+  save_interval: 10
+  num_train_epoches: 1
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+
+policy:
+  dist_config:
+    nnodes: 1
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+  model_arch: "qwen2"
+  without_ref: True
+  hf_model_path: "hf-hub/Qwen/Qwen3-0.6B"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3-0.6B"
+
+checkpoint:
+  load_ckpt_path: unittest_fsdp_sft_muon
+  save_ckpt_path: unittest_fsdp_sft_muon
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+  override_tokenizer_special_token:
+    eos_token: "<|im_end|>"
+
+optimizer:
+  optimizer_type: "muon"
+  lr: 2.0e-5
+  lr_warmup_steps: 0
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "tests/test_gpatch_v4/test_data/sft"
+  py_path: "tasks/math_rl_v4/finetune_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+debug:
+  save_first_rollout_data: False
