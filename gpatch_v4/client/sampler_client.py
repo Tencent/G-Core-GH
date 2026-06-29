@@ -304,9 +304,23 @@ class SamplerClient(
         if self._use_ipc_weight_update:
             resp = await self.update_weights_by_ipc_handle(sampler_idx, model_engine, replace_zeros)
         else:
+            if self.infer_backend == "sglang":
+                await self._release_kv_cache_for_distributed_update(sampler_idx)
+                cpu_barrier()
             resp = self.update_weights_by_distributed(sampler_idx, model_engine, replace_zeros)
+            if self.infer_backend == "sglang":
+                await self._resume_kv_cache_after_distributed_update(sampler_idx)
+                cpu_barrier()
 
         return resp
+
+    async def _release_kv_cache_for_distributed_update(self, sampler_idx):
+        if self._is_rpc_leader():
+            await self._batch_rpc_call(sampler_idx, "release_kv_cache_for_weight_update", {})
+
+    async def _resume_kv_cache_after_distributed_update(self, sampler_idx):
+        if self._is_rpc_leader():
+            await self._batch_rpc_call(sampler_idx, "resume_kv_cache_after_weight_update", {})
 
     async def infer_engine_flush_cache(self, sampler_idx):
         """Flush the inference engine KV cache.

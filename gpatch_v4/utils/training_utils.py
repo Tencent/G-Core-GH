@@ -7,7 +7,7 @@ import traceback
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Dict, Iterator, List, Mapping, Tuple, Union
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -964,15 +964,20 @@ def dataclass_from_args(args, cls):
 
 
 def from_parallel_logits_to_logprobs(
-    vocab_parallel_logits, target, inference_only=False, higher_stability=False, ignore_cp=False
+    vocab_parallel_logits,
+    target,
+    inference_only=False,
+    higher_stability=False,
+    ignore_cp=False,
+    pre_shifted=False,
 ):
     """Get log probs from a ``[B, S//CP, V//TP]`` tensor.
 
-    NOTE: this function shifts the target — pass unmodified targets.
-
     ``ignore_cp``: skip CP gather (already gathered by CP).
+    ``pre_shifted``: target is already next-token shifted (THD packed Dynamic
+    CP), so skip the internal roll and the trailing truncation.
 
-    Returns a ``[B, S]`` tensor.
+    Returns a ``[B, S-1]`` tensor, or ``[B, S]`` when ``pre_shifted``.
     """
     cp_rank = mpu.get_context_parallel_rank() if not ignore_cp else 0
     cp_size = mpu.get_context_parallel_world_size() if not ignore_cp else 1
@@ -981,7 +986,8 @@ def from_parallel_logits_to_logprobs(
     assert s % cp_size == 0, f'{s=} {cp_size=}'
     local_s = s // cp_size
 
-    target = target.roll(shifts=-1, dims=-1)
+    if not pre_shifted:
+        target = target.roll(shifts=-1, dims=-1)
     # NOTE(guanyouhe): Ulysess CP应该并不能这样分割
     if not ignore_cp:
         target = reorder_target_for_cp(target)
@@ -998,6 +1004,8 @@ def from_parallel_logits_to_logprobs(
 
     if cp_size > 1 and not ignore_cp:
         curr_log_probs = all_gather_from_context_parallel_region(curr_log_probs)
+    if pre_shifted:
+        return curr_log_probs.contiguous()
     return curr_log_probs[:, :-1].contiguous()
 
 
@@ -1343,20 +1351,179 @@ def pad_topk_logprobs_to_target_len(
 
 
 def get_im_end_metrics_token_id(tokenizer) -> int:
-        token = tokenizer.eos_token
-        if token is None:
-            raise ValueError("tokenizer.eos_token must be set when training.im_end_metrics_enable=True")
-        token_ids = tokenizer.encode(token, add_special_tokens=False)
-        if len(token_ids) != 1:
-            raise ValueError(
-                f"tokenizer.eos_token={token!r} must encode to exactly one token, got {token_ids}"
-            )
-        token_id = tokenizer.eos_token_id
-        if token_id is None or token_id != token_ids[0]:
-            raise ValueError(
-                f"tokenizer.eos_token={token!r} is inconsistent with tokenizer.eos_token_id; "
-                f"encode={token_ids}, eos_token_id={token_id}"
-            )
-        return int(token_id)
+    token = tokenizer.eos_token
+    if token is None:
+        raise ValueError("tokenizer.eos_token must be set when training.im_end_metrics_enable=True")
+    token_ids = tokenizer.encode(token, add_special_tokens=False)
+    if len(token_ids) != 1:
+        raise ValueError(
+            f"tokenizer.eos_token={token!r} must encode to exactly one token, got {token_ids}"
+        )
+    token_id = tokenizer.eos_token_id
+    if token_id is None or token_id != token_ids[0]:
+        raise ValueError(
+            f"tokenizer.eos_token={token!r} is inconsistent with tokenizer.eos_token_id; "
+            f"encode={token_ids}, eos_token_id={token_id}"
+        )
+    return int(token_id)
 
 
+@torch.no_grad()
+def whiten_advantages_cross_dp(
+    advantages: List[Tensor],
+    mask: List[Tensor],
+    dp_group=None,
+) -> Tuple[List[Tensor], Dict[str, float]]:
+    """Whiten advantages globally across DP ranks.
+
+    All DP ranks must call this in lockstep (same number of times per step),
+    otherwise the all_reduce will deadlock.
+
+    Parameters
+    ----------
+    advantages : list of Tensor
+        Per-sample advantage tensors (CPU or CUDA).
+    mask : list of Tensor
+        Per-sample response masks, same shapes as ``advantages``.
+    dp_group
+        Process group for DP all-reduce.  Defaults to
+        ``mpu.get_data_parallel_group()``.
+
+    Returns
+    -------
+    tuple[list[Tensor], dict[str, float]]
+        ``(whitened_advantages, sanity_metrics)`` where ``sanity_metrics``
+        contains post-whiten mean / var / count for verification.
+    """
+    if dp_group is None:
+        dp_group = mpu.get_data_parallel_group()
+
+    flat_adv = torch.cat([a.flatten() for a in advantages])
+    flat_mask = torch.cat([m.flatten().to(flat_adv.dtype) for m in mask])
+
+    orig_device = flat_adv.device
+    cuda_device = torch.device("cuda", torch.cuda.current_device())
+
+    # Pass 1: global mean
+    local_sum = (flat_adv * flat_mask).sum()
+    local_cnt = flat_mask.sum()
+    stats = torch.stack([local_sum, local_cnt]).to(cuda_device)
+    dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=dp_group)
+    stats = stats.to(orig_device)
+    g_cnt = stats[1].clamp(min=1.0)
+    mean = stats[0] / g_cnt
+
+    # Pass 2: global variance (numerically stable, avoids catastrophic cancellation)
+    local_sq_dev = ((flat_adv - mean)**2 * flat_mask).sum()
+    sq_dev = local_sq_dev.to(cuda_device)
+    dist.all_reduce(sq_dev, op=dist.ReduceOp.SUM, group=dp_group)
+    sq_dev = sq_dev.to(orig_device)
+    var = (sq_dev / g_cnt).clamp(min=0.0)
+    inv_std = torch.rsqrt(var + 1e-8)
+
+    advantages = [(a - mean) * inv_std for a in advantages]
+
+    # Sanity check: post-whiten stats
+    flat_adv_after = torch.cat([a.flatten() for a in advantages])
+    local_sum_a = (flat_adv_after * flat_mask).sum()
+    local_sq_dev_a = ((flat_adv_after)**2 * flat_mask).sum()
+    stats_a = torch.stack([local_sum_a, local_sq_dev_a, local_cnt]).to(cuda_device)
+    dist.all_reduce(stats_a, op=dist.ReduceOp.SUM, group=dp_group)
+    stats_a = stats_a.to(orig_device)
+    g_cnt_a = stats_a[2].clamp(min=1.0)
+    g_mean_a = stats_a[0] / g_cnt_a
+    g_var_a = (stats_a[1] / g_cnt_a - g_mean_a * g_mean_a).clamp(min=0.0)
+
+    sanity_metrics = {
+        "whiten_check/post_mean": g_mean_a.item(),
+        "whiten_check/post_var": g_var_a.item(),
+        "whiten_check/global_count": stats_a[2].item(),
+    }
+    return advantages, sanity_metrics
+
+
+def build_token_loss_weights_from_spans(
+    tokenizer,
+    full_text: str,
+    target_start_char: int,
+    weight_spans: List[Dict[str, Any]],
+    default_target_weight: float = 1.0,
+    offset_mapping: Optional[List[Tuple[int, int]]] = None,
+) -> List[float]:
+    """Convert char-level ``weight_spans`` to per-token loss weights.
+
+    Parameters
+    ----------
+    tokenizer
+        HuggingFace tokenizer with ``return_offsets_mapping`` support.
+    full_text : str
+        Concatenated ``prompt + target`` string.
+    target_start_char : int
+        Character offset where target (label) begins in ``full_text``.
+    weight_spans : list[dict]
+        Each dict has ``start_char``, ``end_char`` (relative to target),
+        and ``weight``.
+    default_target_weight : float
+        Weight for target tokens not covered by any span.
+    offset_mapping : list[tuple[int, int]] | None
+        Pre-computed ``(char_start, char_end)`` per token.  When provided
+        the function skips re-tokenizing ``full_text``.
+
+    Returns
+    -------
+    list[float]
+        Per-token weights, same length as ``tokenizer(full_text)`` output.
+    """
+    if offset_mapping is None:
+        encoded = tokenizer(
+            full_text,
+            return_offsets_mapping=True,
+            add_special_tokens=False,
+        )
+        offset_mapping = encoded["offset_mapping"]
+
+    offsets = offset_mapping
+    loss_weights = [0.0] * len(offsets)
+
+    abs_spans = []
+    for span in weight_spans:
+        abs_spans.append(
+            {
+                "start": target_start_char + span["start_char"],
+                "end": target_start_char + span["end_char"],
+                "weight": span["weight"],
+            }
+        )
+
+    for i, (tok_start, tok_end) in enumerate(offsets):
+        if tok_end <= target_start_char:
+            continue
+        loss_weights[i] = default_target_weight
+        for s in abs_spans:
+            if tok_start < s["end"] and s["start"] < tok_end:
+                loss_weights[i] = s["weight"]
+                break
+
+    return loss_weights
+
+
+def format_token_weight_table(tokenizer, full_text, weights, target_start, spans=None):
+    encoded = tokenizer(full_text, return_offsets_mapping=True, add_special_tokens=False)
+    offsets = encoded["offset_mapping"]
+    lines = [
+        f"\n{'idx':>4} | {'token_text':20s} | {'char_span':12s} | {'weight':>6s} | region",
+        "-" * 75,
+    ]
+    for i, (tid, (cs, ce)) in enumerate(zip(encoded["input_ids"], offsets)):
+        tok_text = repr(full_text[cs:ce])
+        span_str = f"[{cs:3d},{ce:3d})"
+        region = "prompt" if ce <= target_start else "target"
+        if spans and region == "target":
+            for s in spans:
+                abs_s = target_start + s["start_char"]
+                abs_e = target_start + s["end_char"]
+                if cs < abs_e and abs_s < ce:
+                    region = f"span(w={s['weight']})"
+                    break
+        lines.append(f"{i:4d} | {tok_text:20s} | {span_str:12s} | {weights[i]:6.2f} | {region}")
+    return "\n".join(lines)

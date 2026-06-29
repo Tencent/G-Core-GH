@@ -1,0 +1,153 @@
+# @package _global_
+
+training:
+  training_backend: mcore
+  use_gen_rm_reward: False
+  use_bt_rm_reward: False
+  use_fast_tokenizer: True
+  rollout_gbs: 128
+  rollout_mbs: 1
+  sampling_repeat_n: 32
+  sampling_keep_n: 32
+  train_gbs: 4096
+  train_mbs: 1
+  data_parallel_random_init: False
+  save_interval: 100
+  build_from_mbridge: True
+  num_train_epoches: 2
+  ppo_max_epochs_2: 1
+  seq_length: 512
+  total_training_step: 10000
+  ppo_step_per_epoch: 256
+  total_ppo_step: 1024
+
+  metrics_report:
+    - "acc_reward"
+    - "fmt_reward"
+  agentic:
+    train_env_manager:
+      max_traj_per_env: 8
+      group_per_worker: 8
+    env_cfg_template:
+      use_thread_lock: false
+      env_type: sokoban
+      max_steps: 16
+      env_manager_cls: gpatch_v4.agentic.env_manager.step_vl_traj_env_manager_sokoban.StepVLTrajEnvManager
+      env_config:
+        env_instruction: "You are solving the Sokoban puzzle. You are the player and you need to push all boxes to targets. When you are right next to a box, you can push it by moving in the same direction. You cannot push a box through a wall, and you cannot pull a box. The answer must be one of action in a turn, format is <answer>Right</answer>"
+        dim_room: [6, 6]
+        num_boxes: 1
+        format_penalty: -0.15
+        render_mode: "rgb_array"
+    reward_normalization:
+      grouping: batch # 可以tags(env_type)/traj_group_id(group)/batch(rollout_batch)... group_by计算reward/adv
+      method: mean_std # asym_clip / identity / mean_std
+
+    adv_estimator: step_reinforce
+    whiten_advantages: True
+    advantage_clip: 20
+    step_reward_gamma: 0.95
+    gamma: 1.0
+    mask_negative_samples: True
+
+checkpoint:
+  load_ckpt_path: save_qwen_2_5_1_5b_grpo_2
+  save_ckpt_path: save_qwen_2_5_1_5b_grpo_2
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 5.0e-6
+  lr_warmup_steps: 2
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  lr_decay_steps: 1000
+
+data:
+  data_pathes:
+    - "hf-hub/openai/gsm8k-jsonl/train"
+  py_path: "tasks/math_rl_v4/simple_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+policy:
+  dist_config:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+  model_arch: "qwen2_5_vl"
+  hf_model_path: "/data/Qwen2.5-VL-7B-Instruct"
+  hf_tokenizer_path: ${policy.hf_model_path}
+  ref_hf_model_path: ${policy.hf_model_path}
+  sampler_client:
+    rpc_type: ray
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+  rollout_gen_type: agentic
+
+critic:
+  dist_config:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+  model_arch: "qwen2_5_vl"
+  hf_model_path: "/data/Qwen2.5-VL-7B-Instruct"
+  hf_tokenizer_path: ${policy.hf_model_path}
+  without_ref: True
+  sampler_client:
+    rpc_type: ray
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+  rollout_gen_type: agentic
+
+
+sampler:
+  backend: sglang
+  model_info:
+    - model_arch: "qwen2_5_vl"
+      hf_model_path: ${policy.hf_model_path}
+      gen_rollout_py_path: "gpatch_v4/agentic/generate_func.py"
+      gen_rollout_fn_name: "generate_func"
+
+  infer_engine_configs:
+    - dist_config:
+        tensor_model_parallel_size: 2
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.7
+      max_running_requests: 512
+      temperature: 1.0
+      top_p: 0.9
+      generate_max_tokens: 128
+
+bt_rm:
+  reward_type: "rule_only"
+  reward_model_info:
+    - model_arch: "qwen2.5-math-rm-72b"
+      hf_model_path: "hf-hub/Qwen/Qwen2.5-Math-RM-72B/"
+      reward_py_path: tasks/math_rl_v4/bt_reward.py
+      parse_reward_fn_name: math_rl_rule_reward
+      reward_weight: 1.0
+  infer_engine_configs:
+    - dist_config:
+        nnodes: -1
+
+# dist_config.nnodes 设置 -1 表示适用所有节点
+
+ppo:
+  grpo_advantage_epsilon: 1.0e-6
+  enable_off_policy_correction: True
+  ppo_ratio_eps: 0.2
+  grpo_kl_loss_beta: 0.01
+  advantage_type: ppo
+  ppo_discount_factor: 0.99
+  critic_model_warmup_steps: 20
+
+debug:
+  save_first_rollout_data: True
+  debug_engine_update_weight: False

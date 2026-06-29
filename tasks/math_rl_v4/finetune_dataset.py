@@ -161,6 +161,7 @@ def get_dataset_and_dataloader(
         batch_size=config.training.train_mbs,
         num_workers=config.data.dataloader_num_workers,
         drop_last=True,
+        multiprocessing_context=config.data.multiprocessing_method,
     )
     return {
         'train_dataset': dataset,

@@ -193,6 +193,7 @@ def batched_indexer_fwd(q, k, weights, cu_seqlen_ks, cu_seqlen_ke):
     seqlen, batch, heads, dim = q.shape
     seq_len_kv = k.shape[0]
 
+    # TODO 这里其实 copy 成本很大，THD 情况优化下。
     all_logits = torch.empty([batch, seqlen, seq_len_kv], device=q.device, dtype=torch.float32)
     for b in range(batch):
         all_logits[b] = indexer_fwd_interface(

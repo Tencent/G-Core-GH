@@ -121,6 +121,79 @@ def calculate_grpo_advantages(
     return advantages_mask, advantages_mask
 
 
+def calculate_identity_advantages(
+    rewards: List[torch.Tensor],
+    mask: List[torch.Tensor],
+):
+    """Identity advantage — raw reward tiled to each token position, no normalization.
+
+    Parameters
+    ----------
+    rewards : list of torch.Tensor
+        Scalar rewards, one per sample.
+    mask : list of torch.Tensor
+        Response mask per sample.
+
+    Returns
+    -------
+    tuple[list[torch.Tensor], list[torch.Tensor]]
+        ``(advantages, returns)``, both are raw reward tiled to token positions.
+    """
+    advantages_mask = []
+    for reward, m in zip(rewards, mask):
+        assert reward.numel() == 1
+        assert m.ndim == 1
+        adv = reward.sum().tile([m.shape[-1]]) * m
+        advantages_mask.append(adv)
+
+    return advantages_mask, advantages_mask
+
+
+def calculate_reinforce_advantages(
+    rewards: List[torch.Tensor],
+    mask: List[torch.Tensor],
+    gamma: float = 1.0,
+):
+    """Compute REINFORCE-style discounted return-to-go per token.
+
+    ``reward`` can be either:
+    - scalar ``(numel==1)``: assigned to the last valid token in ``mask``;
+    - per-token tensor with the same length as ``mask``.
+    """
+    gamma_v = float(gamma)
+    advantages_mask = []
+
+    for reward, m in zip(rewards, mask):
+        assert m.ndim == 1
+        token_rewards = torch.zeros_like(m, dtype=torch.float32)
+
+        if reward.numel() == 1:
+            # 如果 reward 是标量，则将 reward 分配给最后一个有效 token
+            valid_idx = torch.nonzero(m.bool(), as_tuple=False).view(-1)
+            if valid_idx.numel() > 0:
+                token_rewards[valid_idx[-1]] = reward.sum().to(torch.float32)
+        elif reward.numel() == m.numel():
+            # 如果 进来的 reward 是 token level 的，则直接赋值
+            token_rewards = reward.reshape_as(m).to(torch.float32)
+        else:
+            raise ValueError(
+                f"reinforce advantages expect scalar reward or len(mask) reward, "
+                f"got reward.numel={reward.numel()} and mask.numel={m.numel()}"
+            )
+
+        advantages = torch.zeros_like(token_rewards, dtype=torch.float32)
+        cumulative_reward = torch.zeros((), dtype=torch.float32, device=token_rewards.device)
+        for t in reversed(range(token_rewards.shape[-1])):
+            local_reward = token_rewards[t] if m[t].bool() else torch.zeros_like(cumulative_reward)
+            cumulative_reward = local_reward + gamma_v * cumulative_reward
+            if m[t].bool():
+                advantages[t] = cumulative_reward
+
+        advantages_mask.append(advantages * m.to(torch.float32))
+
+    return advantages_mask, advantages_mask
+
+
 def compute_gdpo_combined_advantages(
     rewards_dict: Dict[str, List[torch.Tensor]],
     mask: List[torch.Tensor],
@@ -334,22 +407,20 @@ def calculate_ppo_advantages_and_returns(
         ``(advantages, returns)``.
     """
     assert mask is not None
-    if mask is not None:
-        # need the masking here because our sentence might not span the entire sequence length
-        values = values * mask
-        rewards = rewards * mask
 
     last_gae_lam = 0
+    next_values = 0.0
     advantages = torch.zeros_like(rewards)
     max_seq_len = values.size(-1)
 
     for i in reversed(range(max_seq_len)):
-        if i == max_seq_len - 1:
-            next_values = 0.0  # Last element has next_value==0.0
-        else:
-            next_values = values[i + 1]  # Get value from next position.
         delta = rewards[i] + discount_factor * next_values - values[i]
-        last_gae_lam = delta + discount_factor * gae_lambda * last_gae_lam
+        last_gae_lam_ = delta + discount_factor * gae_lambda * last_gae_lam
+
+        # skip values and TD-error on observation tokens
+        m = mask[i]
+        next_values = values[i] * m + (1 - m) * next_values
+        last_gae_lam = last_gae_lam_ * m + (1 - m) * last_gae_lam
         advantages[i] = last_gae_lam
 
     if per_token_rewards is not None:
@@ -641,7 +712,6 @@ def calculate_g_opd_advantages(
     return advantages, returns, metrics
 
 
-
 def calculate_topk_advantages(
     mask_lst: List[torch.Tensor],
     stu_topk_logprobs: List[torch.Tensor],
@@ -698,8 +768,8 @@ def calculate_topk_advantages(
 
     has_base = base_topk_logprobs is not None
     is_multi_teacher = (
-        multi_teacher_topk_logprobs is not None and teacher_types is not None
-        and len(multi_teacher_topk_logprobs) > 0
+        multi_teacher_topk_logprobs is not None and teacher_types is not None and
+        len(multi_teacher_topk_logprobs) > 0
     )
 
     all_teachers: Dict[str, List[torch.Tensor]] = {default_teacher_name: teacher_topk_logprobs}

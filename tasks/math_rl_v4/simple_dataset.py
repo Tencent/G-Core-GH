@@ -147,6 +147,7 @@ def get_dataset_and_dataloader(
         batch_size=config.training.rollout_mbs,
         num_workers=config.data.dataloader_num_workers,
         drop_last=True,
+        multiprocessing_context=config.data.multiprocessing_method,
     )
 
     if config.training.eval_interval > 0:
@@ -167,6 +168,7 @@ def get_dataset_and_dataloader(
             batch_size=config.training.rollout_mbs,
             num_workers=config.data.dataloader_num_workers,
             drop_last=True,
+            multiprocessing_context=config.data.multiprocessing_method,
         )
     else:
         eval_dataset = None

@@ -13,9 +13,12 @@ from megatron.core.optimizer.optimizer import (
     FP32Optimizer,
     MixedPrecisionOptimizer,
 )
+from megatron.core.pipeline_parallel import get_forward_backward_func
 
 from gpatch_v4.core import parallel_state
+from gpatch_v4.core.mappings import all_gather_from_context_parallel_region
 from gpatch_v4.core.parallel_state import is_tp_and_cp_head
+from gpatch_v4.core.smart_pad_helper import CatedSmartPadInferHelper
 from gpatch_v4.extended_model import PrepareDataForwardFactory
 from gpatch_v4.training_backend.base_engine import BaseEngine
 from gpatch_v4.training_backend.common.swap_mixin import EngineSwapMixin
@@ -30,6 +33,9 @@ from gpatch_v4.training_backend.megatron_backend.mixin import (
     BridgeUtilsMixin,
     CheckpointMixin,
     ForwardStepMixin,
+)
+from gpatch_v4.training_backend.megatron_backend.welm_v45_myfa import (
+    install_welm_v45_myfa_hooks,
 )
 from gpatch_v4.training_backend.megatron_backend.optimizer import (
     get_megatron_last_lr,
@@ -52,6 +58,7 @@ from gpatch_v4.utils.common_utils import (
     logging_rank0,
     profile_memory_and_time,
 )
+from gpatch_v4.utils.communication_utils import BroadcastUtils
 from gpatch_v4.utils.training_utils import get_dump_moe_metrics
 
 try:
@@ -94,7 +101,7 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
         if not self.policy_config.without_ref:
             # disable moe router replay for ref model
             with self.disable_moe_router_replay():
-                self.ref_bridge, _ = self.build_bridge(
+                self.ref_bridge, self.ref_hf_config = self.build_bridge(
                     self.policy_config.ref_hf_model_path,
                     override_transformer_config=self.policy_config.override_transformer_config
                 )
@@ -114,6 +121,9 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             model_type=f"ref model",
             wrap_with_ddp=False,
         )
+        installed = install_welm_v45_myfa_hooks(self.ref_model, self.ref_hf_config)
+        if installed:
+            log(f"installed WeLM v4.5 MyFA hooks on ref model: {installed}", rank=0)
         if not load_weights_from_bridge:
             # 如果不用 mbrige 转出来权重
             #TODO: 从 load_ref_ckpt_path or load_ref_ckpt_path 加载
@@ -148,6 +158,10 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                 wrap_with_ddp=self.policy_config.wrap_with_ddp,
                 build_value_model=self.is_critic_model,
             )
+        installed = install_welm_v45_myfa_hooks(self.model, self.hf_config)
+        if installed:
+            log(f"installed WeLM v4.5 MyFA hooks on policy model: {installed}", rank=0)
+        logging_memory_usage_details("memory tracking after policy model load", rank=0)
 
         if self.config.training.moe_router_replay:
             # RouterReplay 实例是进程级全局状态，policy model 和 ref model
@@ -168,6 +182,7 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             self.vocab_size = unwrapped_model[0].language_model.vocab_size
         prev_ppo_step = 0
         if self.policy_config.without_optim:
+            logging_memory_usage_details("memory tracking after setup_model_and_get_optimizer", rank=0)
             return prev_ppo_step
 
         optimizer, optimizer_scheduler = get_optimizer_and_scheduler(self.config, self.model)
@@ -188,6 +203,8 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
 
         if self.optimizer is not None:
             self.mcore_config.grad_scale_func = self.optimizer.scale_loss
+        clear_memory()
+        logging_memory_usage_details("memory tracking after setup_model_and_get_optimizer", rank=0)
         return prev_ppo_step
 
     def step_and_get_lr(self):
@@ -417,9 +434,30 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             for model_chunk in self.model:
                 model_chunk.zero_grad_buffer()
             self.optimizer.zero_grad()
+
+            mb_num_microbatches = num_microbatches
+            dyn_cp_stats = None
+            if self.config.policy.dist_config.dynamic_context_parallel:
+                batch, mb_num_microbatches, seqlen_sum, seqlen_sq_sum = (
+                    self.prepare_data.grpo_reroute_data_for_dynamic_cp(
+                        batch,
+                        self.tokenizer.pad_token_id,
+                        vocab_size=self.vocab_size,
+                        pad_with_random_token=self.config.training.moe_pad_with_random_tokens,
+                    )
+                )
+                dyn_cp_stats = {
+                    "policy/dyn_cp_seqlen_sum": seqlen_sum,
+                    "policy/dyn_cp_seqlen_sq_sum": seqlen_sq_sum,
+                    "policy/dyn_cp_num_micro_batches": mb_num_microbatches,
+                }
+
             # maybe enable r3 replay if required
             with self.get_router_replay_ctx():
-                _metric = self._update_policy(batch, num_microbatches=num_microbatches)
+                _metric = self._update_policy(batch, num_microbatches=mb_num_microbatches)
+
+            if dyn_cp_stats is not None:
+                _metric.update(dyn_cp_stats)
 
             self._rl_collect_mb_dumped_metrics(_metric, dumped_metrics_per_ppo_step)
 
@@ -541,6 +579,86 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
         for model_module in self.model:
             model_module.train()
 
+    def _align_values_to_rollout_logprobs(
+        self,
+        rollout_batches: List[Dict[str, List[Any]]],
+        values_list: List[List[torch.Tensor]],
+    ):
+        """Project critic values onto each sample's policy-logprob coordinates."""
+        for rollout_batch, batch_values in zip(rollout_batches, values_list, strict=True):
+            logprobs = rollout_batch.get("logprobs")
+            if logprobs is None:
+                continue
+            prompt_lengths = rollout_batch.get("prompt_lengths")
+            sequence_lengths = rollout_batch.get("sequence_lengths")
+
+            def to_int(x):
+                return int(x.item()) if hasattr(x, "item") else int(x)
+
+            for i, (value, logprob) in enumerate(zip(batch_values, logprobs, strict=True)):
+                target_len = logprob.size(-1)
+                value_len = value.size(-1)
+                if value_len == target_len:
+                    continue
+                if value_len > target_len:
+                    batch_values[i] = value[:target_len].contiguous()
+                    continue
+
+                prefix_len = None
+                response_len = None
+                if prompt_lengths is not None:
+                    prefix_len = max(to_int(prompt_lengths[i]) - 1, 0)
+                if prompt_lengths is not None and sequence_lengths is not None:
+                    response_len = max(
+                        to_int(sequence_lengths[i]) - to_int(prompt_lengths[i]),
+                        0,
+                    )
+
+                padded_prefix_len = target_len - value_len
+                if (
+                    prefix_len is not None
+                    and padded_prefix_len > 0
+                    and padded_prefix_len <= prefix_len
+                    and (response_len is None or value_len >= response_len)
+                ):
+                    batch_values[i] = torch.nn.functional.pad(
+                        value,
+                        (padded_prefix_len, 0),
+                        value=0.0,
+                    ).contiguous()
+                    continue
+
+                if (
+                    prefix_len is not None
+                    and (
+                        (
+                            value_len == target_len - prefix_len
+                            and (response_len is None or value_len >= response_len)
+                        )
+                        or (
+                            response_len is not None
+                            and value_len == response_len
+                            and prefix_len + value_len <= target_len
+                        )
+                    )
+                ):
+                    right_pad = target_len - prefix_len - value_len
+                    batch_values[i] = torch.nn.functional.pad(
+                        value,
+                        (prefix_len, right_pad),
+                        value=0.0,
+                    ).contiguous()
+                    continue
+
+                raise RuntimeError(
+                    "critic values shorter than policy logprobs after CP gather: "
+                    f"sample={i}, values_shape={value.shape}, logprobs_shape={logprob.shape}, "
+                    f"prompt_length={None if prompt_lengths is None else prompt_lengths[i]}, "
+                    f"sequence_length={None if sequence_lengths is None else sequence_lengths[i]}, "
+                    f"padded_prefix_len={padded_prefix_len}"
+                )
+        return values_list
+
     def normal_compute_values(self, rollout_batches: List[Dict[str, List[Any]]]):
         samples_per_batch = len(rollout_batches[0]['tokens'])
         batches_list = expand_rollout_batches(rollout_batches)
@@ -568,10 +686,105 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
 
         values_list = restor_shape(values)
         assert values_list is not None
-        return values_list
+        return self._align_values_to_rollout_logprobs(rollout_batches, values_list)
 
+    @torch.no_grad()
+    def _smart_pad_value_forward_step(
+        self,
+        batch_iter,
+        num_microbatches,
+        micro_batch_size,
+        seq_length,
+    ):
+        fwd_bwd_function = get_forward_backward_func()
+        value_microbatches = fwd_bwd_function(
+            forward_step_func=self.get_logits_output_only_func(seq_length, inference_only=True),
+            data_iterator=batch_iter,
+            model=self._smart_pad_current_model,
+            num_microbatches=num_microbatches,
+            forward_only=True,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            collect_non_loss_data=True,
+            decoder_seq_length=seq_length,
+        )
+        if len(value_microbatches) == 0:
+            clear_memory()
+            return value_microbatches
+
+        values = torch.cat(value_microbatches).squeeze(-1)
+        if mpu.get_context_parallel_world_size() > 1:
+            values = all_gather_from_context_parallel_region(values)
+        values = values[:, :-1].clone()
+
+        ret = []
+        offset = 0
+        for value_microbatch in value_microbatches:
+            cur_mbs = value_microbatch.size(0)
+            ret.append(values[offset:offset + cur_mbs])
+            offset += cur_mbs
+        clear_memory()
+        return ret
+
+    @torch.no_grad()
     def smart_pad_compute_values(self, rollout_batches: List[Dict[str, List[Any]]]):
-        raise NotImplementedError("Not implemented yet")
+        samples_per_batch = len(rollout_batches[0]['tokens'])
+        batches_list = expand_rollout_batches(rollout_batches)
+        assert len(batches_list) == samples_per_batch * len(rollout_batches)
+
+        self.onload_model()
+        for model_module in self.model:
+            model_module.eval()
+
+        self.batch_iters = 0
+        total_samples = len(batches_list)
+        self.total_iters = total_samples // self.forward_only_mbs
+        self.batch_log_str = "[smart_pad] get_values microbatch "
+        self._smart_pad_current_model = self.model
+
+        dynamic_mbs_target_seqlen = getattr(
+            self.policy_config, 'dynamic_mbs_target_seqlen_fwd_only', None
+        )
+        dynamic_mbs_limit = getattr(self.policy_config, 'dynamic_mbs_limit_fwd_only', None)
+
+        smart_pad_helper = CatedSmartPadInferHelper(batches_list, self.forward_only_mbs)
+        get_seqlen_func = lambda sample: sample["tokens"].shape[-1]
+        try:
+            smart_pad_helper.gen_row_based_batches()
+            smart_pad_helper.gen_extend_batches(get_seqlen_func)
+            smart_pad_helper.gen_sorted_batches()
+            smart_pad_helper.gen_smart_pad_batches(self.training_config.pad_to_mulitiple_of)
+            smart_pad_helper.forward_per_seqlen_batches(
+                forward_step_wrapped_func=self._smart_pad_value_forward_step,
+                dynamic_mbs_target_seqlen=dynamic_mbs_target_seqlen,
+                dynamic_mbs_limit=dynamic_mbs_limit,
+                update_total_iters_callback=lambda total_steps:
+                setattr(self, 'total_iters', total_steps),
+            )
+
+            values = []
+            values_list = smart_pad_helper.get_rowed_based_forward_results(
+                is_row_based_rets=True
+            )
+            if mpu.is_pipeline_last_stage():
+                for per_forward_step_results in values_list:
+                    for value in per_forward_step_results:
+                        values.append(value.cpu())
+        finally:
+            self._smart_pad_current_model = None
+
+        values = BroadcastUtils.broadcast_object_within_pp(values)
+        assert len(values) == total_samples, (
+            f"len(values) expect {total_samples}, but get {len(values)}"
+        )
+
+        grouped_values = []
+        bs = len(values) // samples_per_batch
+        assert bs * samples_per_batch == len(values)
+        for i in range(bs):
+            grouped_values.append(values[i * samples_per_batch:(i + 1) * samples_per_batch])
+        clear_memory()
+        return self._align_values_to_rollout_logprobs(rollout_batches, grouped_values)
 
     def compute_values(self, rollout_batches: List[Dict[str, List[Any]]]):
         """Returns critic-model values."""

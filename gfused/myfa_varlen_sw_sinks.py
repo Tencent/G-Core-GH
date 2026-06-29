@@ -28,6 +28,7 @@ def myfa_varlen_sw_sinks_fwd(
 ):
     assert D == tl.math.next_power_of_2(D)
     if window_size is not None:
+        assert is_causal, "non-causal + sliding window is not supported"
         assert window_size % BLOCK_K == 0
     groups = HQ // HK
     B = T.dynamic('B', torch.int32)
@@ -48,8 +49,6 @@ def myfa_varlen_sw_sinks_fwd(
         O: T.Tensor((LQ, HQ, D), dtype),
     ):
         with T.Kernel(B, HQ, T.ceildiv(max_seqlen, BLOCK_Q), threads=threads) as (b_i, h_i, q_idx):
-            kv_h_i = h_i // groups
-
             q = T.alloc_shared((BLOCK_Q, D), dtype)
             k = T.alloc_shared((BLOCK_K, D), dtype)
             v = T.alloc_shared((BLOCK_K, D), dtype)
@@ -71,33 +70,29 @@ def myfa_varlen_sw_sinks_fwd(
                 sinks = T.alloc_fragment((BLOCK_Q, ), dtype)
                 for i in T.Parallel(BLOCK_Q):
                     sinks[i] = SINKS[h_i]
+            kv_h_i = h_i // groups
 
+            q_beg = q_idx * BLOCK_Q
             q_beg_abs = cu_seqlens_q[b_i] + q_idx * BLOCK_Q
             q_end_abs = q_beg_abs + BLOCK_Q
             T.copy(Q[q_beg_abs:q_end_abs, h_i, :], q)
 
             lq = cu_seqlens_q[b_i + 1] - cu_seqlens_q[b_i]
             lk = cu_seqlens_k[b_i + 1] - cu_seqlens_k[b_i]
-            offset = lk - lq
-
-            q_beg = q_idx * BLOCK_Q
+            q_offset = lk - lq
 
             if is_causal:
                 if window_size is not None:
-                    k_loop_start = T.max(0, (offset + q_beg - window_size + 1) // BLOCK_K)
+                    k_loop_start = T.max(0, (q_offset + q_beg - window_size + 1) // BLOCK_K)
                 else:
                     k_loop_start = 0
                 k_loop_end = T.min(
-                    T.ceildiv(offset + q_beg + BLOCK_Q, BLOCK_K),
+                    T.ceildiv(q_offset + q_beg + BLOCK_Q, BLOCK_K),
                     T.ceildiv(lk, BLOCK_K),
                 )
             else:
-                if window_size is not None:
-                    k_loop_start = T.max(0, (offset + q_beg - window_size + 1) // BLOCK_K)
-                else:
-                    k_loop_start = 0
+                k_loop_start = 0
                 k_loop_end = T.ceildiv(lk, BLOCK_K)
-
             loop_range = k_loop_end - k_loop_start
 
             for k_local in T.Pipelined(loop_range, num_stages=num_stages):
@@ -107,13 +102,14 @@ def myfa_varlen_sw_sinks_fwd(
                 k_end_abs = k_beg_abs + BLOCK_K
                 T.copy(K[k_beg_abs:k_end_abs, kv_h_i, :], k)
 
+                # mask
                 if is_causal:
                     if window_size is not None:
                         for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
                             acc_s[i, j] = T.if_then_else(
                                 (k_beg + j < lk) and (q_beg + i < lq) and
-                                (q_beg + i + offset >= k_beg + j) and
-                                (k_beg + j >= q_beg + i + offset - window_size + 1),
+                                (q_beg + i + q_offset >= k_beg + j) and
+                                (k_beg + j >= q_beg + i + q_offset - window_size + 1),
                                 0.0,
                                 -T.infinity(acc_s.dtype),
                             )
@@ -121,27 +117,19 @@ def myfa_varlen_sw_sinks_fwd(
                         for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
                             acc_s[i, j] = T.if_then_else(
                                 (k_beg + j < lk) and (q_beg + i < lq) and
-                                (q_beg + i + offset >= k_beg + j),
+                                (q_beg + i + q_offset >= k_beg + j),
                                 0.0,
                                 -T.infinity(acc_s.dtype),
                             )
                 else:
-                    if window_size is not None:
-                        for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
-                            acc_s[i, j] = T.if_then_else(
-                                (k_beg + j < lk) and (q_beg + i < lq) and
-                                (k_beg + j >= q_beg + i + offset - window_size + 1),
-                                0.0,
-                                -T.infinity(acc_s.dtype),
-                            )
-                    else:
-                        for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
-                            acc_s[i, j] = T.if_then_else(
-                                (k_beg + j < lk) and (q_beg + i < lq),
-                                0.0,
-                                -T.infinity(acc_s.dtype),
-                            )
+                    for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
+                        acc_s[i, j] = T.if_then_else(
+                            (k_beg + j < lk) and (q_beg + i < lq),
+                            0.0,
+                            -T.infinity(acc_s.dtype),
+                        )
 
+                # s = qk^T
                 T.gemm(q, k, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                 T.copy(V[k_beg_abs:k_end_abs, kv_h_i, :], v)
 
@@ -229,6 +217,7 @@ def myfa_varlen_sw_sinks_bwd_pre(
             acc = T.alloc_fragment((BLOCK_Q, D), acc_dtype)
             delta = T.alloc_fragment((BLOCK_Q, ), acc_dtype)
 
+            # delta = sum_d(o * dO)
             q_beg = cu_seqlens_q[b_i] + q_idx * BLOCK_Q
             q_end = q_beg + BLOCK_Q
             T.copy(O[q_beg:q_end, h_i, :], o)
@@ -312,6 +301,7 @@ def myfa_varlen_sw_sinks_bwd(
 ):
     assert D == tl.math.next_power_of_2(D)
     if window_size is not None:
+        assert is_causal, "non-causal + sliding window is not supported"
         assert window_size % BLOCK_K == 0
     groups = HQ // HK
     B = T.dynamic('B', torch.int32)
@@ -335,8 +325,6 @@ def myfa_varlen_sw_sinks_bwd(
         dV: T.Tensor((LK, HK, D), acc_dtype),
     ):
         with T.Kernel(B, HQ, T.ceildiv(max_seqlen, BLOCK_K), threads=threads) as (b_i, h_i, k_idx):
-            kv_h_i = h_i // groups
-
             q = T.alloc_shared((BLOCK_Q, D), dtype)
             k = T.alloc_shared((BLOCK_K, D), dtype)
             v = T.alloc_shared((BLOCK_K, D), dtype)
@@ -344,10 +332,10 @@ def myfa_varlen_sw_sinks_bwd(
             do = T.alloc_shared((BLOCK_Q, D), dtype)
             delta = T.alloc_shared((BLOCK_Q, ), acc_dtype)
 
-            p = T.alloc_fragment((BLOCK_Q, BLOCK_K), acc_dtype)
-            p_cast = T.alloc_shared((BLOCK_Q, BLOCK_K), dtype)
-            dp = T.alloc_fragment((BLOCK_Q, BLOCK_K), acc_dtype)
-            ds_cast = T.alloc_shared((BLOCK_Q, BLOCK_K), dtype)
+            pT = T.alloc_fragment((BLOCK_K, BLOCK_Q), acc_dtype)
+            pT_cast = T.alloc_shared((BLOCK_K, BLOCK_Q), dtype)
+            dpT = T.alloc_fragment((BLOCK_K, BLOCK_Q), acc_dtype)
+            dsT_cast = T.alloc_shared((BLOCK_K, BLOCK_Q), dtype)
             dq = T.alloc_fragment((BLOCK_Q, D), acc_dtype)
             dk = T.alloc_fragment((BLOCK_K, D), acc_dtype)
             dv = T.alloc_fragment((BLOCK_K, D), acc_dtype)
@@ -355,6 +343,7 @@ def myfa_varlen_sw_sinks_bwd(
             k_beg = k_idx * BLOCK_K
             k_beg_abs = cu_seqlens_k[b_i] + k_beg
             k_end_abs = k_beg_abs + BLOCK_K
+            kv_h_i = h_i // groups
             T.copy(K[k_beg_abs:k_end_abs, kv_h_i, :], k)
             T.copy(V[k_beg_abs:k_end_abs, kv_h_i, :], v)
             T.clear(dk)
@@ -362,21 +351,19 @@ def myfa_varlen_sw_sinks_bwd(
 
             lq = cu_seqlens_q[b_i + 1] - cu_seqlens_q[b_i]
             lk = cu_seqlens_k[b_i + 1] - cu_seqlens_k[b_i]
-            offset = lk - lq
+            q_offset = lk - lq
 
             if is_causal:
-                q_loop_start = T.max(0, (k_beg - offset) // BLOCK_Q)
+                q_loop_start = T.max(0, (k_beg - q_offset) // BLOCK_Q)
             else:
                 q_loop_start = 0
-
             if window_size is not None:
                 q_loop_end = T.min(
-                    T.ceildiv((k_idx + 1) * BLOCK_K - offset + window_size, BLOCK_Q),
+                    T.ceildiv((k_idx + 1) * BLOCK_K - q_offset + window_size, BLOCK_Q),
                     T.ceildiv(lq, BLOCK_Q),
                 )
             else:
                 q_loop_end = T.ceildiv(lq, BLOCK_Q)
-
             loop_range = q_loop_end - q_loop_start
 
             for q_local in T.Pipelined(loop_range, num_stages=num_stages):
@@ -387,73 +374,71 @@ def myfa_varlen_sw_sinks_bwd(
                 T.copy(Q[q_beg_abs:q_end_abs, h_i, :], q)
 
                 # S = QK^T * scaling
-                T.clear(p)
-                T.gemm(q, k, p, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-                for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
-                    p[i, j] = p[i, j] * scaling
+                # S^T = K @ Q^T * scaling
+                T.clear(pT)
+                T.gemm(k, q, pT, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+
+                for i, j in T.Parallel(BLOCK_K, BLOCK_Q):
+                    pT[i, j] = pT[i, j] * scaling
 
                 # P = softmax(S)
                 T.copy(LSE[b_i, h_i, q_beg:q_beg + BLOCK_Q], lse)
-                for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
-                    p[i, j] = T.exp(p[i, j] - lse[i])
+
+                for i, j in T.Parallel(BLOCK_K, BLOCK_Q):
+                    pT[i, j] = T.exp(pT[i, j] - lse[j])
 
                 # mask
                 if is_causal:
                     if window_size is not None:
-                        for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
-                            p[i, j] = T.if_then_else(
-                                (k_beg + j < lk) and (q_beg + i < lq) and
-                                (q_beg + i + offset >= k_beg + j) and
-                                (k_beg + j >= q_beg + i + offset - window_size + 1),
-                                p[i, j],
+                        for i, j in T.Parallel(BLOCK_K, BLOCK_Q):
+                            pT[i, j] = T.if_then_else(
+                                (k_beg + i < lk) and (q_beg + j < lq) and
+                                (q_beg + j + q_offset >= k_beg + i) and
+                                (k_beg + i >= q_beg + j + q_offset - window_size + 1),
+                                pT[i, j],
                                 0.,
                             )
                     else:
-                        for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
-                            p[i, j] = T.if_then_else(
-                                (k_beg + j < lk) and (q_beg + i < lq) and
-                                (q_beg + i + offset >= k_beg + j),
-                                p[i, j],
+                        for i, j in T.Parallel(BLOCK_K, BLOCK_Q):
+                            pT[i, j] = T.if_then_else(
+                                (k_beg + i < lk) and (q_beg + j < lq) and
+                                (q_beg + j + q_offset >= k_beg + i),
+                                pT[i, j],
                                 0.,
                             )
                 else:
-                    if window_size is not None:
-                        for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
-                            p[i, j] = T.if_then_else(
-                                (k_beg + j < lk) and (q_beg + i < lq) and
-                                (k_beg + j >= q_beg + i + offset - window_size + 1),
-                                p[i, j],
-                                0.,
-                            )
-                    else:
-                        for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
-                            p[i, j] = T.if_then_else(
-                                (k_beg + j < lk) and (q_beg + i < lq),
-                                p[i, j],
-                                0.,
-                            )
+                    for i, j in T.Parallel(BLOCK_K, BLOCK_Q):
+                        pT[i, j] = T.if_then_else(
+                            (k_beg + i < lk) and (q_beg + j < lq),
+                            pT[i, j],
+                            0.,
+                        )
 
                 # dP = dO @ V^T
+                # dP^T = V @ dO^T
                 T.copy(dO[q_beg_abs:q_end_abs, h_i, :], do)
-                T.clear(dp)
-                T.gemm(do, v, dp, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                T.clear(dpT)
+                T.gemm(v, do, dpT, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
                 # dV = P^T @ dO
-                T.copy(p, p_cast)
-                T.gemm(p_cast, do, dv, transpose_A=True, policy=T.GemmWarpPolicy.FullRow)
+                T.copy(pT, pT_cast)
+                T.gemm(pT_cast, do, dv, policy=T.GemmWarpPolicy.FullRow)
 
-                # dS = P * (dP - delta)
+                # dS = P * (dP - delta), shape [LQ, LK]
+                # dS^T = P^T * (dP^T - delta)
+                # delta = sum_d(dO * O)
                 T.copy(DELTA[b_i, h_i, q_beg:q_beg + BLOCK_Q], delta)
-                for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
-                    ds_cast[i, j] = p[i, j] * (dp[i, j] - delta[i])
-                    ds_cast[i, j] *= scaling
+                for i, j in T.Parallel(BLOCK_K, BLOCK_Q):
+                    dsT_cast[i, j] = pT[i, j] * (dpT[i, j] - delta[j])
+                    dsT_cast[i, j] *= scaling
 
                 # dK = (scaling * dS)^T @ Q
-                T.gemm(ds_cast, q, dk, transpose_A=True, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(dsT_cast, q, dk, policy=T.GemmWarpPolicy.FullRow)
 
-                # dQ = (scaling * dS) @ K
+                # dQ = (scaling * dS) @ K^T)
                 T.clear(dq)
-                T.gemm(ds_cast, k, dq, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(dsT_cast, k, dq, transpose_A=True, policy=T.GemmWarpPolicy.FullRow)
+
                 T.atomic_add(dQ[q_beg_abs:q_end_abs, h_i, :], dq)
 
             T.atomic_add(dK[k_beg_abs:k_end_abs, kv_h_i, :], dk)
@@ -464,9 +449,9 @@ def myfa_varlen_sw_sinks_bwd(
 
 def _get_fwd_block_config(d):
     if d <= 128:
-        return 64, 64, 1, 128
+        return 64, 64, 3, 128
     elif d <= 256:
-        return 64, 64, 1, 128
+        return 64, 64, 2, 128
     elif d <= 512:
         return 64, 64, 1, 128
     else:
@@ -477,7 +462,7 @@ def _get_bwd_block_config(d):
     if d <= 128:
         return 32, 128, 2, 256
     elif d <= 256:
-        return 64, 64, 1, 128
+        return 64, 64, 2, 256
     elif d <= 512:
         return 64, 32, 1, 128
     else:
@@ -493,6 +478,7 @@ class MyfaVarlenSwSinks(torch.autograd.Function):
     def forward(
         ctx, q, k, v, sinks, cu_seqlens_q, cu_seqlens_k, max_seqlen, is_causal, window_size
     ):
+        assert is_causal or window_size is None, "non-causal + sliding window is not supported"
         _, HQ, d = q.shape
         HK = k.shape[1]
         scaling = 1.0 / math.sqrt(d)
@@ -503,6 +489,7 @@ class MyfaVarlenSwSinks(torch.autograd.Function):
         block_q, block_k, num_stages, threads = _get_fwd_block_config(d)
         if window_size is not None:
             block_k = min(block_k, window_size)
+        dt = q.dtype
         fwd_kernel = myfa_varlen_sw_sinks_fwd.compile(
             HQ=HQ,
             HK=HK,
@@ -511,6 +498,7 @@ class MyfaVarlenSwSinks(torch.autograd.Function):
             is_causal=is_causal,
             window_size=window_size,
             has_sinks=has_sinks,
+            dtype=dt,
             BLOCK_Q=block_q,
             BLOCK_K=block_k,
             num_stages=num_stages,

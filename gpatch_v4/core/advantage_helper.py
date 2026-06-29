@@ -9,8 +9,10 @@ from gpatch_v4.core.advantage_impl import (
     calculate_gdpo_advantages,
     calculate_gdpo_sample_bn_advantages,
     calculate_grpo_advantages,
+    calculate_identity_advantages,
     calculate_ppo_advantages_and_returns,
     calculate_ppo_rewards,
+    calculate_reinforce_advantages,
     calculate_reverse_kl_advantages,
     calculate_topk_advantages,
     compute_gdpo_combined_advantages,
@@ -288,34 +290,34 @@ def prepare_and_compute_ppo_advantages(ctx: AdvantageContext) -> AdvantageResult
     advantages = []
     returns = []
     for i in range(len(values)):
-        values_ = values[i]
-        rewards_ = rewards[i]
-        init_policy_kl_ = init_policy_kl[i]
-        sequence_lengths_ = sequence_lengths[i]
-        mask_ = mask[i]
-        per_token_rewards_ = None
+        values_i = values[i]
+        rewards_i = rewards[i]
+        init_policy_kl_i = init_policy_kl[i]
+        sequence_lengths_i = sequence_lengths[i]
+        mask_i = mask[i]
+        per_token_rewards_i = None
         if per_token_rewards is not None:
-            per_token_rewards_ = per_token_rewards[i]
+            per_token_rewards_i = per_token_rewards[i]
 
         # TODO(by astrachang): 这里没有实现类型变化的计算
         rewards_with_kl = calculate_ppo_rewards(
-            values_,
-            rewards_,
+            values_i,
+            rewards_i,
             None,
-            sequence_lengths_,
-            init_policy_kl_,
+            sequence_lengths_i,
+            init_policy_kl_i,
             ctx.config.ppo.ppo_initial_policy_kl_penalty,
         )
-        advantages_, returns_ = calculate_ppo_advantages_and_returns(
-            values=values_,
+        advantages_i, returns_i = calculate_ppo_advantages_and_returns(
+            values=values_i,
             rewards=rewards_with_kl,
             discount_factor=ctx.config.ppo.ppo_discount_factor,
             gae_lambda=ctx.config.ppo.ppo_gae_lambda,
-            mask=mask_,
-            per_token_rewards=per_token_rewards_,
+            mask=mask_i,
+            per_token_rewards=per_token_rewards_i,
         )
-        advantages.append(advantages_)
-        returns.append(returns_)
+        advantages.append(advantages_i)
+        returns.append(returns_i)
     assert returns[0].dtype == torch.float32
     return AdvantageResult(advantages=advantages, returns=returns)
 
@@ -337,7 +339,7 @@ def prepare_and_compute_opd_advantages(ctx: AdvantageContext) -> AdvantageResult
     log_prob_top_k = ctx.config.ppo.log_prob_top_k
 
     if log_prob_top_k > 0:
-        # Top-K path: 3D ``[S-1, K]`` advantages replace the 2D label-based KL advantages. 
+        # Top-K path: 3D ``[S-1, K]`` advantages replace the 2D label-based KL advantages.
         # The loss layer detects this via ``advantages.dim() == 3``.
         advantages, distill_metrics = _compute_topk_advantages(
             ctx, teacher_name, has_base=False, rewards=ctx.rewards
@@ -410,7 +412,8 @@ def prepare_and_compute_g_opd_advantages(ctx: AdvantageContext) -> AdvantageResu
 
     if log_prob_top_k > 0:
         advantages, distill_metrics = _compute_topk_advantages(
-            ctx, default_teacher_name,
+            ctx,
+            default_teacher_name,
             has_base=base_logprobs is not None,
             rewards=ctx.rewards if g_opd_mix_reward else None,
         )
@@ -473,9 +476,7 @@ def _compute_topk_advantages(
             if t_name != default_teacher_name:
                 multi_teacher_topk_lp[t_name] = val
 
-    base_topk_lp = (
-        rollout_batch.get("base_on_stu_topk_logprobs", None) if has_base else None
-    )
+    base_topk_lp = (rollout_batch.get("base_on_stu_topk_logprobs", None) if has_base else None)
 
     routing_field = getattr(ctx.config.ppo, "g_opd_teacher_routing_field", "teacher_type")
     teacher_types = rollout_batch.get(routing_field, None) if multi_teacher_topk_lp else None
@@ -498,6 +499,28 @@ def _compute_topk_advantages(
         default_teacher_name=default_teacher_name,
     )
     return topk_advantages, topk_metrics
+
+
+@register_advantage("identity")
+def prepare_and_compute_identity_advantages(ctx: AdvantageContext) -> AdvantageResult:
+    """Identity advantage — raw reward tiled to each token position, no normalization."""
+    assert ctx.rewards is not None
+    advantages, returns = calculate_identity_advantages(
+        rewards=ctx.rewards,
+        mask=ctx.mask,
+    )
+    return AdvantageResult(advantages=advantages, returns=returns)
+
+
+@register_advantage("reinforce")
+def prepare_and_compute_reinforce_advantages(ctx: AdvantageContext) -> AdvantageResult:
+    assert ctx.rewards is not None
+    advantages, returns = calculate_reinforce_advantages(
+        rewards=ctx.rewards,
+        mask=ctx.mask,
+        gamma=ctx.config.ppo.reinforce_gamma,
+    )
+    return AdvantageResult(advantages=advantages, returns=returns)
 
 
 # ============================================================================

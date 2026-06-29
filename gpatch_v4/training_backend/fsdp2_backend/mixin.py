@@ -27,12 +27,16 @@ try:
 except ImportError:
     DeepseekV4ForCausalLM = None
     apply_hp = None
+from gpatch_v4.core.seqlen_balancing import convert_mbs_for_pack_seq
 from gpatch_v4.models.hp_module import HpModule
 from gpatch_v4.training_backend.fsdp2_backend.checkpoint import (
     save_checkpoint,
     save_hf_checkpoint,
 )
-from gpatch_v4.training_backend.fsdp2_backend.mtp_loss import calculate_mtp_loss
+from gpatch_v4.training_backend.fsdp2_backend.mtp_loss import (
+    calculate_mtp_loss,
+    mtp_per_depth_valid_count,
+)
 from gpatch_v4.utils import (
     clear_memory,
     get_batches_max_seqlen,
@@ -147,54 +151,6 @@ class Fsdp2EngineMixin:
             f"ep_fsdp_size={world_size // self.ep_size}, "
             f"cp_size_hp={self.cp_size}"
         )
-
-        # ---- DSV4 CP × dynamic-pad invariant (fail-fast) ----
-        # DSV4's v1 CP (gpatch_v4/models/deepseek_v4/modeling_deepseek_v4.py
-        # :1053) requires ``s_local % compress_rate_hca == 0`` where
-        # ``compress_rate_hca = max(config.compress_ratios) = 128`` for
-        # DSV4-Flash/Pro. Combined with mixin.py:432 dynamic padding
-        # (``s_full = pad_to_mulitiple_of × k`` for some ``k ≥ 1``), this
-        # forces ``(pad_to_mulitiple_of // cp_size) % 128 == 0``. The
-        # ``training.seq_length`` cap at mixin.py:434 must satisfy the same
-        # divisibility — otherwise truncation produces an illegal s_local.
-        #
-        # TODO: when extending HpModule to other architectures, read
-        # compress_rate from model config instead of hard-coding 128.
-        # The model config isn't loaded yet at this point (model is built
-        # later in get_fsdp2_model), so for now we hard-code the DSV4
-        # constant and gate by ``model_arch == 'deepseek_v4'``.
-        model_arch = getattr(self.policy_config, "model_arch", None)
-        if model_arch == "deepseek_v4":
-            _COMPRESS_RATE_HCA = 128  # DSV4 HCA m'=128, see config.compress_ratios
-            pad_mul = self.training_config.pad_to_mulitiple_of
-            seq_len = self.training_config.seq_length
-            assert pad_mul % self.cp_size == 0, (
-                f"DSV4 CP requires pad_to_mulitiple_of ({pad_mul}) divisible by "
-                f"cp_size ({self.cp_size}); otherwise s_full = pad_mul * k may "
-                f"not be cp_size-divisible."
-            )
-            assert (pad_mul // self.cp_size) % _COMPRESS_RATE_HCA == 0, (
-                f"DSV4 CP requires (pad_to_mulitiple_of // cp_size) "
-                f"({pad_mul} // {self.cp_size} = {pad_mul // self.cp_size}) "
-                f"divisible by compress_rate_hca ({_COMPRESS_RATE_HCA}); "
-                f"otherwise s_local = (pad_mul * k) / cp_size may not be "
-                f"compress_rate-divisible. Bump pad_to_mulitiple_of to a "
-                f"multiple of cp_size * {_COMPRESS_RATE_HCA} = "
-                f"{self.cp_size * _COMPRESS_RATE_HCA}."
-            )
-            assert seq_len % self.cp_size == 0, (
-                f"DSV4 CP requires training.seq_length ({seq_len}) divisible "
-                f"by cp_size ({self.cp_size})."
-            )
-            assert (seq_len // self.cp_size) % _COMPRESS_RATE_HCA == 0, (
-                f"DSV4 CP requires (training.seq_length // cp_size) "
-                f"({seq_len} // {self.cp_size} = {seq_len // self.cp_size}) "
-                f"divisible by compress_rate_hca ({_COMPRESS_RATE_HCA}); "
-                f"otherwise the seq_length cap at mixin.py:434 produces an "
-                f"illegal s_local. Bump training.seq_length to a multiple of "
-                f"cp_size * {_COMPRESS_RATE_HCA} = "
-                f"{self.cp_size * _COMPRESS_RATE_HCA}."
-            )
 
     def _get_init_weight_context_manager(self):
         """Ref: verl/utils/fsdp_utils.py::get_init_weight_context_manager.
@@ -527,23 +483,76 @@ class ForwardStepMixin:
             batch
         ) * dp_size, f"{training_config.train_gbs=} {len(batch)=} {dp_size=}"
 
-        if self.config.debug.experimental_pad_to_max_length:
-            max_seq_length = self.config.training.seq_length
+        pack_seq = self.policy_config.ppo_pack_seq
+        if pack_seq:
+            assert not training_config.use_dynamic_mbs, (
+                "use_dynamic_mbs is incompatible with ppo_pack_seq "
+                "(pack-seq does its own token-budget micro-batch splitting)"
+            )
+            dp_group = mpu.get_data_parallel_group()
+            data_iter = convert_mbs_for_pack_seq(
+                batch,
+                max_token_len=training_config.seq_length,
+                pad_each_doc_to_multi_of=self.prepare_data._pad_each_doc_to_multi_of,
+                dp_group=dp_group,
+            )
+            num_microbatches = len(data_iter)
+            max_seq_length = training_config.seq_length
         else:
-            max_seq_length = get_batches_max_seqlen(batch, self.training_config.pad_to_mulitiple_of)
-            max_seq_length = get_max_seqlen_within_dp(max_seq_length)
-            max_seq_length = min(max_seq_length, training_config.seq_length)
-        if training_config.loss_func in ["square_averaging_cross_entropy"]:
-            assert False
-            update_square_averaging_token_len(batch, max_seq_length)
+            if self.config.debug.experimental_pad_to_max_length:
+                max_seq_length = self.config.training.seq_length
+            else:
+                max_seq_length = get_batches_max_seqlen(
+                    batch, self.training_config.pad_to_mulitiple_of
+                )
+                max_seq_length = get_max_seqlen_within_dp(max_seq_length)
+                max_seq_length = min(max_seq_length, training_config.seq_length)
+            if training_config.loss_func in ["square_averaging_cross_entropy"]:
+                assert False
+                update_square_averaging_token_len(batch, max_seq_length)
 
-        dynamic_mbs = 1
-        if training_config.use_dynamic_mbs:
-            dynamic_mbs = self._calc_dynamic_mbs(len(batch), max_seq_length)
-            num_microbatches = len(batch) // dynamic_mbs
+            dynamic_mbs = 1
+            if training_config.use_dynamic_mbs:
+                dynamic_mbs = self._calc_dynamic_mbs(len(batch), max_seq_length)
+                num_microbatches = len(batch) // dynamic_mbs
 
-        data_iter = get_k_split_list(batch, num_microbatches)
+            data_iter = get_k_split_list(batch, num_microbatches)
         loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+
+        # 在 dp rank 与 micro batch 之间统计 valid token 数量，用于后面 loss 的归一化。
+        # MTP（仅 DSV4）额外统计逐 depth 的全局 valid token 数，作为无偏 den 替换
+        # calculate_mtp_loss 里的 per-micro-batch den。
+        enable_mtp = training_config.enable_mtp
+        mtp_num_depth = int(self.hf_config.num_nextn_predict_layers) if enable_mtp else 0
+        mtp_cp_rank = dist.get_rank(self.model._cp_group) if self.cp_size > 1 else 0
+        device = torch.cuda.current_device()
+        global_n = torch.zeros((), device=device)
+        global_n_for_mtp = torch.zeros(mtp_num_depth, device=device) if enable_mtp else None
+        for mb_samples in data_iter:
+            prep_batch, _ = self.prepare_data.sft_train(
+                mb_samples,
+                max_seq_length,
+                self.tokenizer.pad_token_id,
+                comput_attn_mask=False,
+                pad_with_random_token=False,
+                input_teacher_logits=False,
+                vocab_size=self._get_vocab_size(),
+            )
+            global_n += (prep_batch["labels"] != -100).sum()
+            if enable_mtp:
+                global_n_for_mtp += mtp_per_depth_valid_count(
+                    prep_batch["full_labels"],
+                    prep_batch["full_loss_mask"],
+                    num_depth=mtp_num_depth,
+                    cp_size=self.cp_size,
+                    cp_rank=mtp_cp_rank,
+                    packed_seq_params=prep_batch.get("full_packed_seq_params"),
+                )
+        dist.all_reduce(global_n)
+        global_n = global_n.clamp_min(1.0)
+        if enable_mtp:
+            dist.all_reduce(global_n_for_mtp)
+            global_n_for_mtp = global_n_for_mtp.clamp_min(1.0)
 
         report_loss = 0.
         report_main_loss = 0.
@@ -574,20 +583,17 @@ class ForwardStepMixin:
             labels = labels_2d.view(-1)
             loss_mask = loss_mask_2d.view(-1)
 
-            # Total valid tokens across DP*CP world.
-            global_n = (labels != -100).sum()
-            dist.all_reduce(global_n)
-
             # Enable model parallelism
             labels = labels.to(logits.device)
             loss = loss_fct(logits, labels)
             loss = loss * loss_mask.to(loss.device)
 
             # TODO: 将 loss func 独立出去
-            # Per-token mean (= megatron's sum(loss)/sum(loss_mask)). `* dp_size`
-            # cancels the 1/dp_size from the final WORLD-AVG on `report_loss`
-            # (CP is folded by the CP-SUM on `tmp`, so only DP needs compensation).
-            main_loss = torch.sum(loss) / (global_n + 1e-8)
+            # Q: 为什么 `* dp_size`？
+            # A: 因为在 dp rank 之间 reduce 缩小了尺度。
+            # Q: 为什么不需要 `/ num_microbatches`？
+            # A: 因为在 micro batch 之间 reduce 已经缩小了尺度。
+            main_loss = torch.sum(loss) / global_n
             main_loss = main_loss * self.dp_size
 
             mtp_loss = None
@@ -605,57 +611,52 @@ class ForwardStepMixin:
                         getattr(training_config, "mtp_loss_scaling_factor", 0.1),
                     )
                 )
-                _, _, mtp_depth_nums, mtp_depth_dens = calculate_mtp_loss(
+                mtp_depth_nums = calculate_mtp_loss(
                     mtp_per_depth_h=mtp_per_depth_h,
                     labels=labels_2d.to(logits.device),
                     lm_head=self.model.lm_head,
                     loss_fct=loss_fct,
                     loss_mask=loss_mask_2d.to(logits.device),
                     cp_group=model_cp_group,
-                    scaling_factor=mtp_scale,
+                    packed_seq_params=fwd_kwargs.get("packed_seq_params"),
                 )
+                assert len(mtp_depth_nums) == global_n_for_mtp.numel(
+                ), (f"{len(mtp_depth_nums)=} != {global_n_for_mtp.numel()=}")
                 mtp_depth_losses = []
                 mtp_depth_loss_metrics = []
-                for n_local, d_local in zip(mtp_depth_nums, mtp_depth_dens):
-                    d_global = d_local.detach().clone()
-                    # Align MTP normalization with main_loss:
-                    # use WORLD valid-token denominator, keep local numerator
-                    # for backward scaling, then compensate FSDP's dp averaging
-                    # via `* dp_size` (same as main_loss).
-                    dist.all_reduce(d_global)
-                    mtp_depth_losses.append((n_local / d_global.clamp_min(1.0)) * self.dp_size)
-                    n_global_metric = n_local.detach().clone()
-                    # Reporting metric: global numerator/global denominator.
+                for depth, d_loss_local in enumerate(mtp_depth_nums):
+                    # Per-depth unbiased global den from labels_full (replaces
+                    # calculate_mtp_loss's biased per-micro-batch den).
+                    den = global_n_for_mtp[depth]
+                    mtp_depth_losses.append(d_loss_local / den * self.dp_size)
+                    n_global_metric = d_loss_local.detach().clone()
+                    # Reporting metric: global numerator / global token count.
                     dist.all_reduce(n_global_metric)
-                    mtp_depth_loss_metrics.append(n_global_metric / d_global.clamp_min(1.0))
+                    mtp_depth_loss_metrics.append(n_global_metric / den * self.dp_size)
                 mtp_loss = torch.stack(mtp_depth_losses
                                       ).sum() * (mtp_scale / max(len(mtp_depth_losses), 1))
                 loss = main_loss + mtp_loss
             else:
                 loss = main_loss
-
-            # TODO: still biased across micro batches with different
-            # valid-token counts (each micro normalizes by its own global_n).
-            loss = loss / num_microbatches
             if not forward_only:
                 loss.backward()
 
             tmp = loss.detach().clone()
-            tmp_main = main_loss.detach().clone() / num_microbatches
+            tmp_main = main_loss.detach().clone()
             if self.cp_size > 1:
                 dist.all_reduce(tmp, group=self.model._cp_group)
                 dist.all_reduce(tmp_main, group=self.model._cp_group)
             report_loss += tmp.item()
             report_main_loss += tmp_main.item()
             if mtp_loss is not None:
-                tmp_mtp = mtp_loss.detach().clone() / num_microbatches
+                tmp_mtp = mtp_loss.detach().clone()
                 if self.cp_size > 1:
                     dist.all_reduce(tmp_mtp, group=self.model._cp_group)
                 report_mtp_loss += tmp_mtp.item()
                 if report_mtp_depth_loss is None:
                     report_mtp_depth_loss = [0.0 for _ in range(len(mtp_depth_losses))]
                 for i, dloss in enumerate(mtp_depth_loss_metrics):
-                    dtmp = dloss.detach().clone() / num_microbatches
+                    dtmp = dloss.detach().clone()
                     report_mtp_depth_loss[i] += dtmp.item()
 
         report_loss = torch.tensor(report_loss).to(torch.cuda.current_device())
@@ -682,6 +683,7 @@ class ForwardStepMixin:
                     metrics[f"{metric_prefix}/mtp_depth_{i}_loss"] = depth_t.item()
         if training_config.use_dynamic_mbs:
             metrics[f"{metric_prefix}/dynamic_mbs"] = dynamic_mbs
+        metrics[f"{metric_prefix}/num_micro_batches"] = num_microbatches
         return metrics
 
     def clip_grad_norm_(self):

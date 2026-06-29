@@ -264,7 +264,7 @@ class GrpoTrainActor(
             f"skip_prev_logps requires ppo_max_epochs_2 == 1, "
             f"got {training_config.ppo_max_epochs_2}"
         )
-        _supported_loss_funcs = {"grpo", "gspo"}
+        _supported_loss_funcs = {"grpo", "gspo", "cispo"}
         assert ppo_config.loss_func in _supported_loss_funcs, (
             f"skip_prev_logps only supports loss_func in {_supported_loss_funcs}, "
             f"got '{ppo_config.loss_func}'"
@@ -378,7 +378,7 @@ class GrpoTrainActor(
         self.policy_engine.set_model_eval()
         self.eval_iter = iter(self.eval_dataloader)
         global_metrics = defaultdict(float)
-        rollout_nb = self.get_num_rollout_micro_batches()
+        rollout_nb = self.get_num_eval_rollout_micro_batches()
 
         for step in range(training_config.total_eval_step):
             clear_memory()
@@ -479,29 +479,12 @@ class GrpoTrainActor(
             assert self.eval_dataset is not None, f"enable eval:{training_config.eval_interval} should have eval_dataset"
             assert self.eval_dataloader is not None, f"enable eval:{training_config.eval_interval} should have eval_dataloader"
 
-            use_eval_rollout = training_config.eval_rollout_gbs is not None
-
-            eval_rollout_gas = training_config.eval_rollout_gbs // (
-                dp_size * training_config.eval_rollout_mbs
-            ) if use_eval_rollout else rollout_gas
+            eval_rollout_gas = self.get_num_eval_rollout_micro_batches()
 
             eval_step = (len(self.eval_dataloader) // eval_rollout_gas)
             training_config.total_eval_step = eval_step
 
             assert eval_step > 0, f"{len(self.eval_dataloader)=} > {eval_rollout_gas=}"
-
-    def calculate_advantage(
-        self,
-        rollout_batches: List[Dict[str, List[Any]]],
-    ):
-        """Compute advantages from rollout data (not implemented).
-
-        Parameters
-        ----------
-        rollout_batches : list of dict
-        """
-        raise NotImplementedError()
-        return rollout_batches
 
     def maybe_calculate_values(self, rollout_batches: List[Dict[str, List[Any]]]):
         if self.require_critic_model():
@@ -722,6 +705,27 @@ class GrpoTrainActor(
         rollout_nb = training_config.rollout_gbs // (dp_size * training_config.rollout_mbs)
         assert rollout_nb > 0, f"rollout_nb {rollout_nb}"
         return rollout_nb
+
+    def get_num_eval_rollout_micro_batches(self):
+        """Compute the number of eval rollout micro-batches per DP rank.
+
+        Honors ``eval_rollout_gbs`` / ``eval_rollout_mbs`` when set, otherwise
+        falls back to the training rollout micro-batch count. Kept consistent
+        with ``auto_calc_ppo_step``'s ``total_eval_step`` derivation.
+
+        Returns
+        -------
+        int
+        """
+        training_config = self.config.training
+        if training_config.eval_rollout_gbs is None:
+            return self.get_num_rollout_micro_batches()
+        dp_size = mpu.get_data_parallel_world_size()
+        eval_rollout_nb = training_config.eval_rollout_gbs // (
+            dp_size * training_config.eval_rollout_mbs
+        )
+        assert eval_rollout_nb > 0, f"eval_rollout_nb {eval_rollout_nb}"
+        return eval_rollout_nb
 
     def get_critic_model_warmup_step(self):
         if not self.require_critic_model():

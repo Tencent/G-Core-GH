@@ -168,6 +168,7 @@ class GrpoSamplerActor(BaseActor, TokenizerMixin):
                 self.config.training.enable_mtp and
                 getattr(self.config.training, "online_mtp_sft", False)
             ),
+            seed=infer_engine_config.engine_seed,
             **extra_infer_engine_config,
         )
         self.build_tokenizer()
@@ -338,6 +339,20 @@ class GrpoSamplerActor(BaseActor, TokenizerMixin):
             return {"ret": True}
         await self.infer_engine.flush_cache()
         log("sampler flush_cache done", rank=0)
+        return {"ret": True}
+
+    async def release_kv_cache_for_weight_update(self, req_dict=None):
+        if not self._is_master_node:
+            return {"ret": True}
+        with perf_time("release_kv_cache_for_weight_update", rank=0):
+            await self.infer_engine.release_kv_cache_for_weight_update()
+        return {"ret": True}
+
+    async def resume_kv_cache_after_weight_update(self, req_dict=None):
+        if not self._is_master_node:
+            return {"ret": True}
+        with perf_time("resume_kv_cache_after_weight_update", rank=0):
+            await self.infer_engine.resume_kv_cache_after_weight_update()
         return {"ret": True}
 
     async def get_load(self, req_dict: Dict[str, Any] = None) -> Dict[str, Any]:

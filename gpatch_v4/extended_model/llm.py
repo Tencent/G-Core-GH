@@ -6,8 +6,6 @@ import torch.distributed as dist
 from typing_extensions import override
 
 from megatron.core import mpu, parallel_state
-from megatron.core.datasets.data_schedule import DefaultDynamicCPScheduler
-from megatron.core.datasets.data_schedule_utils import _get_global_seqlens_and_ids
 from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -25,8 +23,8 @@ from gpatch_v4.utils import (
 )
 from gpatch_v4.utils.dynamic_cp_utils import (
     _round_up,
-    sft_dyn_cp_schedule_default,
-    sft_dyn_cp_schedule_smart_padding,
+    dyn_cp_schedule_default,
+    dyn_cp_schedule_smart_padding,
 )
 
 
@@ -416,6 +414,20 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         )
         return batch, fwd_kwargs
 
+    @override
+    def prepare_loss_weights(
+        self,
+        loss_weights: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        if loss_weights.shape[-1] <= seq_len:
+            loss_weights = pad_or_truncate_last_dim(loss_weights, seq_len + 1, 0.0)
+            loss_weights = loss_weights[1:]
+        else:
+            loss_weights = loss_weights[1:]
+            loss_weights = loss_weights[-seq_len:]
+        return loss_weights
+
     def _prepare_tokens_and_labels(
         self,
         tokens: torch.Tensor,
@@ -493,6 +505,8 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         vocab_size = kwargs.get("vocab_size", 0)
         token_list = []
         label_list = []
+        loss_weights_list = []
+        loss_weights = None
         square_averaging_weight_list = []
         for i, batch in enumerate(batches):
             token, label, _ = self._prepare_tokens_and_labels(
@@ -506,10 +520,19 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
 
             token_list.append(token)
             label_list.append(label)
+            if "loss_weights" in batch:
+                lw = batch["loss_weights"]
+                lw = self.prepare_loss_weights(lw, seq_len)
+                loss_weights_list.append(lw)
             if "square_averaging_weight" in batch:
                 square_averaging_weight_list.append(batch["square_averaging_weight"])
         tokens = torch.stack(token_list).view(len(token_list), -1).cuda(non_blocking=True)
         labels = torch.stack(label_list).view(len(token_list), -1).cuda(non_blocking=True)
+
+        if len(loss_weights_list) > 0:
+            assert len(loss_weights_list) == len(token_list)
+            loss_weights = torch.stack(loss_weights_list).view(len(loss_weights_list),
+                                                               -1).cuda(non_blocking=True)
         square_averaging_weights = None
         if len(square_averaging_weight_list) > 0:
             assert len(square_averaging_weight_list) == len(token_list)
@@ -522,19 +545,24 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         )
         full_loss_mask = loss_mask
 
+        full_labels = labels.clone().detach()  # full tensor unchunked
         if dist.get_world_size(mpu.get_context_parallel_group()) > 1:
             tokens, labels, loss_mask, position_ids, attention_mask = (
                 self._sft_train_cp_chunk_data(
                     tokens, labels, loss_mask, position_ids, attention_mask
                 )
             )
+            if loss_weights is not None:
+                loss_weights = get_tensor_on_this_cp_rank(loss_weights, 1, key_name="loss_weights")
 
         batch = {
             "tokens": tokens,
             "labels": labels,
+            'full_labels': full_labels,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "loss_mask": loss_mask,
+            "loss_weights": loss_weights,
             "full_loss_mask": full_loss_mask,
             "square_averaging_weights": square_averaging_weights,
         }
@@ -592,7 +620,10 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
             index = get_thd_partitioned_indices(
                 cu_seqlens_for_partition, total_tokens, cp_size, cp_rank
             )
-            for key in ["tokens", "labels", "loss_mask", "position_ids"]:
+            cp_keys = ["tokens", "labels", "loss_mask", "position_ids"]
+            if "loss_weights" in batch:
+                cp_keys.append("loss_weights")
+            for key in cp_keys:
                 assert key in batch
                 batch[key] = batch[key].index_select(0, index)
 
@@ -608,6 +639,8 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         batch["position_ids"] = batch["position_ids"].view(1, total_tokens_val).contiguous()
         batch["labels"] = batch["labels"].view(1, total_tokens_val).contiguous()
         batch["loss_mask"] = batch["loss_mask"].view(1, total_tokens_val).contiguous()
+        if "loss_weights" in batch:
+            batch["loss_weights"] = batch["loss_weights"].view(1, total_tokens_val).contiguous()
 
         cu_seqlens_padded = batch["cu_seqlens_padded"]
         max_seqlen = batch["max_seqlen"].item()
@@ -879,7 +912,7 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                 f"Adjust gbs or context_parallel_size."
             )
             new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum = (
-                sft_dyn_cp_schedule_smart_padding(
+                dyn_cp_schedule_smart_padding(
                     gbs_batches,
                     dp_group,
                     cp_size,
@@ -897,7 +930,7 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
             ]
             dtype_map = {}
             new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum = (
-                sft_dyn_cp_schedule_default(
+                dyn_cp_schedule_default(
                     gbs_batches,
                     dp_group,
                     tp_group,
@@ -914,6 +947,189 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
             )
 
         return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum
+
+    @override
+    def grpo_reroute_data_for_dynamic_cp(
+        self,
+        gbs_batches: List[Dict[str, Any]],
+        pad_token_id: int,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float]:
+        dp_group = mpu.get_data_parallel_group()
+        tp_group = mpu.get_tensor_model_parallel_group()
+        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+
+        dp_cp_size = dp_cp_group.size()
+        tp_size = tp_group.size()
+        dp_cp_pad = 2 * dp_cp_size if dp_cp_size > 1 else 1
+        tp_pad = tp_size if tp_size > 1 else 1
+        pad_div = dp_cp_pad * tp_pad
+
+        dp_size = dp_group.size()
+        cp_size = dp_cp_group.size() // dp_size
+
+        dist_config = self.config.policy.dist_config
+
+        first = gbs_batches[0]
+        has_rollout = first.get("rollout_log_probs") is not None
+        has_sample_mask = first.get("sample_mask") is not None
+        global_retention_ratio = first.get("global_retention_ratio")
+
+        # Shift each sample before packing (input = tokens[:-1], target =
+        # tokens[1:]); a post-pack roll(-1) would leak labels across sub-sequence
+        # boundaries. RL per-token fields are already (seq_len - 1) long.
+        for i, batch in enumerate(gbs_batches):
+            tokens = batch["tokens"]
+            shifted_tokens = tokens[:-1]
+            shifted_labels = tokens[1:]
+            actual_len = shifted_tokens.shape[-1]
+            pad_len = _round_up(actual_len, pad_div)
+            sample = dict(
+                tokens=pad_or_truncate_last_dim(shifted_tokens, pad_len, pad_token_id),
+                labels=pad_or_truncate_last_dim(shifted_labels, pad_len, 0),
+                loss_mask=pad_or_truncate_last_dim(batch["mask"], pad_len, 0).to(torch.float32),
+                position_ids=torch.arange(pad_len, dtype=torch.int64, device=tokens.device),
+                advantages=pad_or_truncate_last_dim(batch["advantages"], pad_len,
+                                                    0).to(torch.float32),
+                prev_log_probs=pad_or_truncate_last_dim(batch["logprobs"], pad_len,
+                                                        0).to(torch.float32),
+                ref_log_probs=pad_or_truncate_last_dim(batch["ref_logprobs"], pad_len,
+                                                       0).to(torch.float32),
+                original_seq_len=torch.tensor([actual_len], dtype=torch.int32),
+                padded_seq_len=torch.tensor([pad_len], dtype=torch.int32),
+            )
+            if has_rollout:
+                sample["rollout_log_probs"] = pad_or_truncate_last_dim(
+                    batch["rollout_log_probs"], pad_len, 0
+                ).to(torch.float32)
+            if has_sample_mask:
+                sm = batch["sample_mask"]
+                if sm.dim() == 0:
+                    sm = sm.unsqueeze(0)
+                sm = sm.expand(actual_len).to(torch.float32).contiguous()
+                sample["sample_mask"] = pad_or_truncate_last_dim(sm, pad_len, 0)
+            gbs_batches[i] = sample
+
+        # Schedule and pack with default dynamic CP scheduler.
+        dev = torch.cuda.current_device()
+        packed_keys = [
+            "tokens",
+            "labels",
+            "loss_mask",
+            "position_ids",
+            "advantages",
+            "prev_log_probs",
+            "ref_log_probs",
+        ]
+        if has_rollout:
+            packed_keys.append("rollout_log_probs")
+        if has_sample_mask:
+            packed_keys.append("sample_mask")
+
+        global_id_seqlens_keys = packed_keys + ["original_seq_len", "padded_seq_len"]
+        new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum = dyn_cp_schedule_default(
+            gbs_batches,
+            dp_group,
+            tp_group,
+            dp_cp_group,
+            cp_size,
+            dp_size,
+            dist_config,
+            dev,
+            packed_keys=packed_keys,
+            cat_keys=[],
+            global_id_seqlens_keys=global_id_seqlens_keys,
+            dtype_map={},
+        )
+
+        if global_retention_ratio is not None:
+            for sample in new_samples:
+                sample["global_retention_ratio"] = global_retention_ratio
+
+        return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum
+
+    @override
+    def grpo_train_with_dynamic_cp(
+        self,
+        batches: List[Dict[str, Any]],
+        seqlen: int,
+        pad_token_id: int,
+        ppo_pack_seq: bool,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        assert len(batches) == 1, "grpo_train_with_dynamic_cp only supports one batch"
+        batch = batches[0]
+        # restore to gpu before forward.
+        for k, v in list(batch.items()):
+            if isinstance(v, torch.Tensor) and not v.is_cuda:
+                batch[k] = v.cuda(non_blocking=True)
+        assert "local_cp_size" in batch
+
+        lcp = batch.get("local_cp_size")
+        if lcp is not None:
+            lcp_val = lcp.item() if isinstance(lcp, torch.Tensor) else int(lcp)
+            cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=lcp_val)
+        else:
+            cp_group = parallel_state.get_context_parallel_group()
+
+        rl_token_keys = [
+            key for key in
+            ("advantages", "prev_log_probs", "ref_log_probs", "rollout_log_probs", "sample_mask")
+            if key in batch
+        ]
+        cp_split_keys = ["tokens", "labels", "loss_mask", "position_ids"] + rl_token_keys
+
+        cp_size = cp_group.size()
+        total_tokens = batch["tokens"].size(0)
+        if cp_size > 1:
+            cp_rank = cp_group.rank()
+            # Pass cu_seqlens_padded as cu_seqlens to work around a TE bug in
+            # thd_get_partitioned_indices.
+            index = get_thd_partitioned_indices(
+                batch["cu_seqlens_padded"], total_tokens, cp_size, cp_rank
+            )
+            for key in cp_split_keys:
+                batch[key] = batch[key].index_select(0, index)
+
+        tp_size = parallel_state.get_tensor_model_parallel_group().size()
+        assert batch["tokens"].size(0) % tp_size == 0, (
+            f"post-CP tokens ({batch['tokens'].size(0)}) not aligned to tp_size={tp_size}"
+        )
+
+        cp_tokens = batch["tokens"].size(0)
+        for key in cp_split_keys:
+            batch[key] = batch[key].view(1, cp_tokens).contiguous()
+
+        cu_seqlens_padded = batch["cu_seqlens_padded"]
+        max_seqlen = batch["max_seqlen"].item()
+        local_cp_size = batch["local_cp_size"].item()
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_padded,
+            cu_seqlens_kv=cu_seqlens_padded,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            local_cp_size=local_cp_size,
+            cp_group=cp_group,
+        )
+
+        batch["mask"] = batch.pop("loss_mask")
+        batch["target"] = batch.pop("labels")
+        if batch.get("global_retention_ratio") is not None:
+            batch["global_retention_ratio"] = batch["global_retention_ratio"].cuda()
+
+        fwd_kwargs = dict(
+            input_ids=batch["tokens"],
+            position_ids=batch["position_ids"],
+            attention_mask=None,
+            labels=None,
+            packed_seq_params=packed_seq_params,
+        )
+        return batch, fwd_kwargs
 
 
 class OffPoilicyDistillPrepareDataForwardLLM(PrepareDataForwardLLM):

@@ -42,7 +42,7 @@ policy:
 |---|---|---|---|
 | `dynamic_context_parallel` | bool | `False` | 是否开启 Dynamic CP。开启后训练时自动按序列长度动态调整 CP 分组 |
 | `max_seqlen_per_dp_cp_rank` | int | `None` | 每个 DPxCP rank 能容纳的最大 token 数。建议从模型在单 GPU 上能跑的最大序列长度开始调。**开启 Dynamic CP 时必填** |
-| `min_dynamic_context_parallel_size` | int | `1` | 最小 CP 组大小。`1` 表示最短的序列可以不做 CP 切分（独占一个 GPU）。设为 `2` 则至少 2 GPU 做 CP |
+| `min_dynamic_context_parallel_size` | int | `1` | 最小 CP 组大小。`1` 表示最短的序列可以不做 CP 切分（独占一个 GPU）。|
 | `context_parallel_size` | int | `1` | 此字段定义了 DPxCP 资源池的大小上限。Dynamic CP 会在 `[min, context_parallel_size × dp_size]` 范围内动态选择 |
 
 ## 使用前提 / Prerequisites
@@ -59,8 +59,9 @@ policy:
 | 不兼容能力 | 行为 |
 |---|---|
 | `virtual_pipeline_model_parallel_size > 1` (VPP) | `DistConfig.__post_init__` 阶段 assert |
-| Multi-Token Prediction (`model_arch == deepseek_v3`) | 运行时进入 `_run_dyn_cp_training` 时 assert |
-| `ppo_dump_metrics_interval > 0` | 运行时进入 `_run_dyn_cp_training` 时 assert |
+| Multi-Token Prediction (`model_arch == deepseek_v3`) | 运行时 assert |
+| `ppo_dump_metrics_interval > 0` | 运行时 assert |
+| On-Policy Distill (OPD) | 运行时 assert |
 
 ## 示例 / Example
 
@@ -84,7 +85,7 @@ To disable Dynamic CP, set `dynamic_context_parallel: False` and the system fall
 
 1. **`max_seqlen_per_dp_cp_rank`** 是最关键的参数。设得太小会导致 microbatch 数量增多、调度开销变大；设得太大可能 OOM。建议从单 GPU 能跑的最大序列长度的 80% 开始试。
 
-2. **`min_dynamic_context_parallel_size`** 通常保持 `1` 即可。如果你的 attention 实现要求 CP ≥ 2，则设为 `2`。
+2. **`min_dynamic_context_parallel_size`** SFT 通常保持 `1`。
 
 3. 观察日志中的 `[TRAIN-DYN-CP]` 或 `[SFT-DYN-CP]` 标记判断调度效果，`scheduled num_micro_batches=...` 越少，GPU 利用率越高。
 
@@ -94,60 +95,30 @@ To disable Dynamic CP, set `dynamic_context_parallel: False` and the system fall
 
 To add Dynamic CP support for a new training type, follow these three steps:
 
-### Step 1: 编写 converter / Write a converter
+SFT / GRPO 都遵循同一套范式：在 `extended_model` 里实现两个方法，并在训练入口分流。可参考 `llm.py` / `qwen3_vl.py` 中的 `sft_*` 与 `grpo_*` 实现。
 
-在 `gpatch_v4/utils/dynamic_cp_utils.py` 中添加 `convert_xxx_samples_to_dyn_cp_format(samples)`，把每条原始样本转换成 Dynamic CP 标准格式。padding 对齐由内部的 `_get_total_pad_divisor()` 处理。
+SFT and GRPO follow the same pattern: implement two methods in `extended_model` and branch at the training entry. See the `sft_*` / `grpo_*` methods in `llm.py` / `qwen3_vl.py`.
 
-Add `convert_xxx_samples_to_dyn_cp_format(samples)` in `gpatch_v4/utils/dynamic_cp_utils.py`. Padding alignment is handled internally by `_get_total_pad_divisor()`.
+### Step 1: reroute / Write a reroute
 
-每条样本必须包含的字段（长度 = padded_len）：
-- `tokens` (int64)，`labels` (int64)，`loss_mask` (float32)，`position_ids` (int64)
-- `original_seq_len`、`padded_seq_len`：`torch.tensor([len], dtype=torch.int32)`
+在 `extended_model` 实现 `xxx_reroute_data_for_dynamic_cp(gbs_batches, pad_token_id, ...)`：在**所有 rank** 上把整个 gbs 的样本预处理（next-token shift、pad 到 `_round_up(len, pad_div)`）→ 调度 → 按 key all-to-all reroute → 打包成 THD microbatch。返回 `(packed_microbatches, num_microbatches, seqlen_sum, seqlen_sq_sum)`。
 
-额外的 per-token 字段写进 dict 即可自动参与调度（all-to-all、packing、CP slicing），长度需与 `tokens` 一致。
+每条样本需含 per-token 字段 `tokens` / `labels` / `loss_mask` / `position_ids`（长度 = padded_len）与 meta `original_seq_len` / `padded_seq_len`；额外 per-token 字段（如 RL 的 `advantages` / `prev_log_probs`）放进 `packed_keys` 即可一起调度。
 
-参考 `convert_rl_samples_to_dyn_cp_format` 与 `convert_sft_samples_to_dyn_cp_format` 实现。
+### Step 2: train / Write a train func
 
-### Step 2: 编写 forward step / Write a forward step
+在 `extended_model` 实现 `xxx_train_with_dynamic_cp(batches, ...)`：对单条 packed microbatch 做 CP 切分（`get_thd_partitioned_indices`）、view、构造 `PackedSeqParams`，返回 `(batch, fwd_kwargs)`。
 
-在 `gpatch_v4/training_backend/megatron_backend/mixin.py` 添加 `xxx_forward_step_dyn_cp()`，返回一个 `fwd_output_and_loss_func` 闭包。内部用 `get_batch_for_dyn_cp(data_iterator, dynamic_cp=True, extra_token_keys=(...))` 取一条 packed batch（SFT 不用额外字段时传 `()`）。
+### Step 3: 在训练入口分流 / Dispatch at the training entry
 
-```python
-def xxx_forward_step_dyn_cp(self):
-    def fwd_output_and_loss_func(data_iterator, model):
-        batch, packed_seq_params = get_batch_for_dyn_cp(
-            data_iterator, dynamic_cp=True,
-            extra_token_keys=("my_extra_field",),
-        )
-        # ... model forward with packed_seq_params ...
-        # ... loss computation (不要做 static CP all-reduce) ...
-    return fwd_output_and_loss_func
-```
-
-### Step 3: 在 training step 入口分流 / Dispatch from training step
-
-在对应的 step 方法（如 `_finetune_step` / `_update_policy`）开头加 Dynamic CP 分支，复用共享 helper：
-
-```python
-if self.dist_config.dynamic_context_parallel:
-    return self._run_dyn_cp_training(
-        batch,
-        num_microbatches,
-        converter=convert_xxx_samples_to_dyn_cp_format,
-        forward_step_func=self.xxx_forward_step_dyn_cp(),
-        metric_prefix="xxx",
-        log_tag="XXX-DYN-CP",
-        forward_only=False,        # SFT eval 路径可传 True
-    )
-```
-
-`_run_dyn_cp_training` 负责：converter → `run_dyn_cp_schedule` → 前后向 → metrics 聚合并广播。
+- 在 step 入口（如 `finetune_step` / `rl_train_actor`）进 fwd/bwd 之前调用 `xxx_reroute_data_for_dynamic_cp`，用返回的 packed microbatches 与 `num_microbatches` 替换原 batch。
+- 在 forward step 闭包里按 `self.dist_config.dynamic_context_parallel` 选 `xxx_train_with_dynamic_cp`（dyn cp）或原 `xxx_train`（普通），loss 走开关 `pre_shifted` / `ignore_cp` 复用同一套计算。
 
 ### 注意事项 / Notes
 
 - packed 后每个 microbatch 在 token 维度上是 **THD 格式**（所有 sample 拼接成一条），所以 `micro_batch_size=1`。
-- Loss 函数内 **不要** 用 `mpu.get_context_parallel_group()` 做 static CP all-reduce，CP 通信由 attention 层内部处理。
-- 长度为 `seq_len - 1` 的额外字段（如 RL 的 logprobs）需在 converter 中先对齐到 `seq_len`、再 pad 到 `padded_len`，loss 函数中再 `[:, :-1]` 截回；converter 已把位置 `seq_len-1`（THD 子序列边界）的 `loss_mask` 置 0，跨子序列预测不会污染 loss。
+- Loss 内不做 static CP all-reduce（CP 通信由 attention 层处理）；scalar 报告指标在动态 CP 组内 AVG，token 级 `[sum, count]` 在 DP+CP 组内 all-reduce。
+- THD pack 后不能整体 `roll(-1)`（会污染子序列边界），所以在 reroute 里**预先 shift**（input = `tokens[:-1]`、target = `tokens[1:]`），loss 用 `from_parallel_logits_to_logprobs(..., pre_shifted=True)`。
 
 
 # SFT 对齐

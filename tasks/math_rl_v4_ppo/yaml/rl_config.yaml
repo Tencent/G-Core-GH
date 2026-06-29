@@ -1,4 +1,5 @@
 # @package _global_
+# PPO (actor + critic) baseline on GSM8K, mcore backend.
 
 training:
   training_backend: mcore
@@ -7,12 +8,14 @@ training:
   use_fast_tokenizer: True
   rollout_gbs: 256
   rollout_mbs: 1
-  sampling_repeat_n: 32
-  sampling_keep_n: 32
+  sampling_repeat_n: 1
+  sampling_keep_n: 1
   train_gbs: 256
   train_mbs: 1
   data_parallel_random_init: False
   save_interval: 100
+  eval_interval: -1
+  eval_before_train: False
   build_from_mbridge: True
   num_train_epoches: 2
   ppo_max_epochs_2: 2
@@ -21,13 +24,13 @@ training:
     - "fmt_reward"
 
 checkpoint:
-  load_ckpt_path: save_qwen_2_5_1_5b_grpo
-  save_ckpt_path: save_qwen_2_5_1_5b_grpo
+  load_ckpt_path: save_qwen_2_5_1_5b_ppo
+  save_ckpt_path: save_qwen_2_5_1_5b_ppo
   convert_mcore_to_hf_online: True
   mbridge_distributed_filesystem: True
 
 optimizer:
-  lr: 5.0e-7
+  lr: 1.0e-6
   lr_warmup_steps: 2
   lr_decay_style: "cosine"
   weight_decay: 0.0
@@ -37,66 +40,52 @@ optimizer:
 
 data:
   data_pathes:
-    - "hf-hub/DaertML/gsm8k-jsonl"
+    - "hf-hub/openai/gsm8k-jsonl/train"
+  eval_data_pathes:
+    - "hf-hub/openai/gsm8k-jsonl/eval"
   py_path: "tasks/math_rl_v4/simple_dataset.py"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, and put your final answer within \\boxed{}."
   fn_name: "get_dataset_and_dataloader"
   dataloader_num_workers: 1
   dataloader_pin_memory: True
 
 policy:
   dist_config:
-    tensor_model_parallel_size: 4
-    expert_model_parallel_size: 4
+    tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 2
-  model_arch: "qwen2"
-  hf_model_path: "hf-hub/Qwen/Qwen3-30B-A3B-Thinking-2507"
+  model_arch: qwen2
+  hf_model_path: "hf-hub/Qwen/Qwen2.5-1.5B-Instruct"
   hf_tokenizer_path: ${policy.hf_model_path}
   ref_hf_model_path: ${policy.hf_model_path}
+  without_ref: False
   sampler_client:
     rpc_type: ray
   gen_rm_client:
     rpc_type: ray
   bt_rm_client:
     rpc_type: ray
-  override_transformer_config:
-    recompute_granularity: full
-    recompute_method: uniform
-    recompute_num_layers: 1
 
-value:
-  without_ref: True
+critic:
   dist_config:
-    tensor_model_parallel_size: 4
-    expert_model_parallel_size: 4
+    tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 2
-  model_arch: "qwen2"
+  without_ref: True
+  model_arch: qwen2
   hf_model_path: ${policy.hf_model_path}
   hf_tokenizer_path: ${policy.hf_model_path}
-  ref_hf_model_path: ${policy.hf_model_path}
-  sampler_client:
-    rpc_type: ray
-  gen_rm_client:
-    rpc_type: ray
-  bt_rm_client:
-    rpc_type: ray
-  override_transformer_config:
-    recompute_granularity: full
-    recompute_method: uniform
-    recompute_num_layers: 1
-
 
 sampler:
   backend: sglang
   model_info:
-    - model_arch: "qwen2"
+    - model_arch: qwen2
       hf_model_path: ${policy.hf_model_path}
 
   infer_engine_configs:
     - dist_config:
         tensor_model_parallel_size: 2
       use_fast_tokenizer: True
-      gpu_memory_utilization: 0.7
-      max_running_requests: 128
+      gpu_memory_utilization: 0.6
+      max_running_requests: 64
       temperature: 1.0
       top_p: 0.9
       generate_max_tokens: 1024
@@ -111,14 +100,21 @@ bt_rm:
       reward_weight: 1.0
   infer_engine_configs:
     - dist_config:
-        tensor_model_parallel_size: 8
         nnodes: -1
 
-# dist_config.nnodes 设置 -1 表示适用所有节点
-
 ppo:
-  grpo_advantage_epsilon: 1.0e-4
+  advantage_type: "ppo"
+  loss_func: "grpo"
+  ppo_discount_factor: 1.0
+  ppo_gae_lambda: 0.95
+  whiten_advantages: True
   ppo_ratio_eps: 0.2
+  ppo_entropy_bonus: 0.0
+  ppo_initial_policy_kl_penalty: 0.0
+  grpo_kl_loss_beta: 0.0
+  ppo_value_clip: 0.2
+  ppo_logps_ratio_clamp: 20.0
+  ppo_dual_clip_ratio_c: 3.0
 
 debug:
   save_first_rollout_data: True

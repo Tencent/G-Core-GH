@@ -75,9 +75,13 @@ def get_reasoning_parser(name: str) -> Type[BaseReasoningParser]:
     return REASONING_PARSER_REGISTRY[register_name]
 
 
-from gpatch_v4.agentic.reasoning_parsers.sglang_reasoning_parsers import (  # noqa: E402,F401
-    SGLangReasoningParser,
-)
+try:
+    from gpatch_v4.agentic.reasoning_parsers.sglang_reasoning_parsers import (  # noqa: F401
+        SGLangReasoningParser,
+    )
+except ImportError:
+    print("sglang not installed; SGLangReasoningParser unavailable")
+    # pass  # sglang not installed; SGLangReasoningParser unavailable
 
 __all__ = [
     "BaseReasoningParser",

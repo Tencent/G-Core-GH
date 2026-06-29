@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, Literal
+from typing import Dict, Literal, Optional
 
 from gpatch_v4.configs.utils import MappingProtocol
 
@@ -45,7 +45,9 @@ class EnvTemplateConfig(MappingProtocol):
         },
     )
     max_steps: int = field(default=-1, metadata={"help": "max_steps"})
-    max_tokens_per_step: int = field(default=-1, metadata={"help": "max_tokens_per_step"})
+    max_tokens_per_step: Optional[int] = field(
+        default=None, metadata={"help": "max_tokens_per_step"}
+    )
     env_manager_cls: str = field(
         default=
         "gpatch_v4.agentic.env_manager.step_vl_traj_env_manager_sokoban.StepVLTrajEnvManager",
@@ -87,9 +89,6 @@ class AgenticConfig(MappingProtocol):
     )
     env_cfg_template: EnvTemplateConfig = field(default_factory=EnvTemplateConfig)
     train_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
-    adv_estimator: str = field(
-        default="gigpo", metadata={"help": "advantage estimator: gigpo (GIGPO)."}
-    )
     step_reward_gamma: float = field(
         default=0.95, metadata={"help": "Gamma parameter for step reward calculation"}
     )
@@ -99,10 +98,3 @@ class AgenticConfig(MappingProtocol):
     reward_normalization: RewardNormalizationConfig = field(
         default_factory=RewardNormalizationConfig
     )
-    lambd: float = field(
-        default=0.95, metadata={"help": "Lambda parameter for advantage calculation"}
-    )
-    gamma: float = field(default=1, metadata={"help": "Gamma parameter for advantage calculation"})
-    advantage_clip: float = field(default=0.2, metadata={"help": "Advantage clip value"})
-    whiten_advantages: bool = field(default=False, metadata={"help": "Whiten advantages"})
-    mask_negative_samples: bool = field(default=False, metadata={"help": "Mask negative samples"})

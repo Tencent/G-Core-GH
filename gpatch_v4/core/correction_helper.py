@@ -82,6 +82,66 @@ def mask_mode(
     return weights, modified_mask
 
 
+def compute_binary_kl_divergence(
+    log_p: torch.Tensor, log_q: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """KL(P||Q) for Bernoulli distributions parameterized by log-probabilities.
+
+    Parameters
+    ----------
+    log_p : torch.Tensor
+        Log-probability of event under P. Shape arbitrary.
+    log_q : torch.Tensor
+        Log-probability of event under Q. Same shape as ``log_p``.
+    eps : float
+        Clamping epsilon to avoid log(0). Uses 1e-6 (safe for float32
+        where ``1.0 - 1e-6 < 1.0``).
+
+    Returns
+    -------
+    torch.Tensor
+        Per-element KL divergence, same shape as inputs.
+    """
+    log_p_f32 = log_p.float()
+    log_q_f32 = log_q.float()
+    p = torch.clamp(torch.exp(log_p_f32), eps, 1.0 - eps)
+    q = torch.clamp(torch.exp(log_q_f32), eps, 1.0 - eps)
+    return p * torch.log(p / q) + (1 - p) * torch.log((1 - p) / (1 - q))
+
+
+def kpop_mode(
+    prev_log_probs: torch.Tensor,
+    rollout_log_probs: torch.Tensor,
+    weights: torch.Tensor,
+    mask: torch.Tensor,
+    metrics: Dict[str, list[torch.Tensor]],
+    threshold: float,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """KPop: zero IS weights where bidirectional binary KL exceeds threshold.
+
+    Like ``icepop_mode``, keeps mask unchanged and zeros out-of-range weights
+    so that filtered tokens still count in the ``masked_mean`` denominator,
+    effectively diluting the gradient when many tokens are rejected.
+
+    Reference: https://ringtech.notion.site/kpop
+    """
+    assert threshold > 0.0
+    kl_fwd = compute_binary_kl_divergence(prev_log_probs, rollout_log_probs, eps)
+    kl_rev = compute_binary_kl_divergence(rollout_log_probs, prev_log_probs, eps)
+    kl_max = torch.maximum(kl_fwd, kl_rev)
+
+    mask_bool = mask.bool()
+    in_range = (kl_max <= threshold) & mask_bool
+    oob = (~in_range) & mask_bool
+    mask_sum = torch.clamp_min(mask.sum().float(), 1)
+    metrics["kpop_filtered_fraction"] = oob.sum().float() / mask_sum
+    metrics["kpop_kl_max_mean"] = (kl_max * mask).sum() / mask_sum
+
+    weights = torch.where(in_range, weights, torch.zeros_like(weights)) * mask
+    return weights
+
+
 def icepop_mode(
     weights: torch.Tensor,
     mask: torch.Tensor,
@@ -216,6 +276,20 @@ def compute_off_policy_correction_weights(
             metrics,
             lower_bound,
             upper_bound,
+        )
+    elif mode == "kpop":
+        # KPop: zero IS weights where bidirectional binary KL > threshold.
+        # Keeps mask unchanged (same pattern as icepop).
+        # 注意：kpop 只需要用 upper_bound, 不需要传递 lower_bound
+        kpop_eps = config.ppo.off_policy_correction_kpop_eps
+        weights = kpop_mode(
+            prev_log_probs,
+            rollout_log_probs,
+            weights,
+            mask,
+            metrics,
+            upper_bound,
+            kpop_eps,
         )
     elif mode == "clip":
         # Clip the importance sampling weights to the [lower, upper] range.

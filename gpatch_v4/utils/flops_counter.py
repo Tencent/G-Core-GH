@@ -547,6 +547,148 @@ def _estimate_gpt_oss_flops(config, tokens_sum, batch_seqlens, delta_time):
     return flops_achieved
 
 
+def _estimate_deepseek_v4_flops(config, tokens_sum, batch_seqlens, delta_time):
+    """Estimate TFLOPs/s for DeepSeek-V4 training.
+
+    Follows the same decomposition as Megatron-LM ``transformer_flops()`` for
+    the ``dsv4_hybrid`` attention variant: all FLOPs are split into a
+    *token-linear* part (scales with ``Σ L_i``) and a *core-attention L²* part
+    (scales with ``Σ L_i²``).
+
+    Parameters
+    ----------
+    config : DeepseekV4Config
+    tokens_sum : int
+    batch_seqlens : list[int]
+    delta_time : float
+        Seconds.
+    """
+    H = config.hidden_size
+    V = config.vocab_size
+    n_head = config.num_attention_heads
+    d = config.head_dim
+    r_q = config.q_lora_rank
+    r_o = config.o_lora_rank
+    g_o = config.o_groups
+    W = config.sliding_window
+    I_moe = getattr(config, "moe_intermediate_size", config.intermediate_size)
+    I_shared = config.intermediate_size
+    K = config.num_experts_per_tok
+    num_layers = config.num_hidden_layers
+    mtp_num_layers = getattr(config, "num_nextn_predict_layers", 0) or 0
+
+    compress_rates = getattr(config, "compress_rates", {})
+    r_csa = compress_rates.get("compressed_sparse_attention", 4)
+    r_hca = compress_rates.get("heavily_compressed_attention", 128)
+
+    layer_types = getattr(config, "layer_types", []) or []
+    n_layers_r0 = 0
+    n_layers_r4 = 0
+    n_layers_r128 = 0
+    for lt in layer_types[:num_layers]:
+        if lt == "compressed_sparse_attention":
+            n_layers_r4 += 1
+        elif lt == "heavily_compressed_attention":
+            n_layers_r128 += 1
+        else:
+            n_layers_r0 += 1
+
+    # MTP: count as 1 extra MoE + attention layer.  If layer_types covers
+    # the MTP layer use its type; otherwise default to window-only (r=0).
+    num_total_layers = num_layers + mtp_num_layers
+    for lt in layer_types[num_layers:num_layers + mtp_num_layers]:
+        if lt == "compressed_sparse_attention":
+            n_layers_r4 += 1
+        elif lt == "heavily_compressed_attention":
+            n_layers_r128 += 1
+        else:
+            n_layers_r0 += 1
+    mtp_extra_layers = mtp_num_layers - len(layer_types[num_layers:num_layers + mtp_num_layers])
+    n_layers_r0 += mtp_extra_layers
+
+    # fwd + wgrad + dgrad = 3;  each GEMM m*n*k = 2mnk FLOPs
+    FBE = 3
+    FMA = 2
+
+    # ---- 1. MLA projections (per layer, token-linear) ----
+    q_term = r_q * (H + n_head * d + 1)
+    kv_term = H * d + d
+    o_term = n_head * d * r_o + g_o * r_o * H
+    mla_proj_per_layer = FBE * FMA * (q_term + kv_term + o_term)
+
+    # ---- 2. Sparse attention (replaces full core attention) ----
+    # r=0: window-only, fixed per-token cost
+    sparse_attn_r0 = n_layers_r0 * n_head * W * d * 2
+
+    # r=128 (HCA): window (token-linear) + all compressed KV (L²)
+    sparse_attn_r128_window = n_layers_r128 * n_head * W * d * 2
+    sparse_attn_r128_core = n_layers_r128 * n_head * d / r_hca
+
+    # r=4 (CSA): window + learned-topk compressed entries
+    idx_n_heads = getattr(config, "index_n_heads", 64)
+    idx_head_dim = getattr(config, "index_head_dim", 128)
+    idx_topk = getattr(config, "index_topk", 512)
+
+    if n_layers_r4 > 0:
+        # Use the first seqlen as representative for the effective topk
+        # causal correction.  Megatron uses args.seq_length; we approximate
+        # with the max seqlen in the batch.
+        seq_len = max(batch_seqlens) if batch_seqlens else 4096
+        effective_topk = min(idx_topk, seq_len // r_csa)
+        avg_comp_4 = effective_topk * (1 - effective_topk * r_csa / (2 * seq_len))
+        sparse_attn_r4 = n_layers_r4 * n_head * (W + avg_comp_4) * d * 2
+    else:
+        sparse_attn_r4 = 0
+
+    sparse_attn_token_term = sparse_attn_r0 + sparse_attn_r4 + sparse_attn_r128_window
+
+    # ---- 3. Main compressor projections (token-linear) ----
+    # r=4 (CSA): kv_proj + gate_proj, each H → 2*d (overlapping windows)
+    # r=128 (HCA): kv_proj + gate_proj, each H → d (non-overlapping)
+    main_compressor_term = (n_layers_r4 * H * (2 * d) * 2 + n_layers_r128 * H * (1 * d) * 2)
+
+    # ---- 4. Indexer (CSA layers only, token-linear + L²) ----
+    if n_layers_r4 > 0:
+        indexer_token_term = (
+            n_layers_r4 * H * (2 * idx_head_dim) * 2 +
+            n_layers_r4 * r_q * idx_n_heads * idx_head_dim + n_layers_r4 * H * idx_n_heads
+        )
+        indexer_scoring_core = n_layers_r4 * idx_n_heads * idx_head_dim / r_csa
+    else:
+        indexer_token_term = 0
+        indexer_scoring_core = 0
+
+    # ---- Assemble self-attention terms ----
+    dsv4_extra_term = (
+        FBE * FMA * (sparse_attn_token_term + main_compressor_term + indexer_token_term)
+    )
+    dsv4_core_term = FBE * FMA * (sparse_attn_r128_core + indexer_scoring_core)
+
+    self_attn_term = mla_proj_per_layer * num_total_layers + dsv4_extra_term
+
+    # ---- 5. MoE FFN (all layers are MoE in DSV4) ----
+    # SwiGLU: gate + up + down = 3 matmuls
+    ffn_expansion = 3
+    moe_ffn_per_layer = FBE * FMA * H * (I_moe * K * ffn_expansion + I_shared * ffn_expansion)
+
+    # ---- 6. MTP extra: norms + eh_proj ----
+    mtp_extra_term = (FBE * FMA * mtp_num_layers * (3 * H + 2 * H * H))
+
+    # ---- 7. Logit ----
+    logit_term = FBE * FMA * H * V * (mtp_num_layers + 1)
+
+    # ---- Total ----
+    seqlen_sq_sum = sum(s * s for s in batch_seqlens)
+
+    flops_total = (
+        tokens_sum *
+        (moe_ffn_per_layer * num_total_layers + self_attn_term + mtp_extra_term + logit_term) +
+        seqlen_sq_sum * dsv4_core_term
+    )
+
+    return flops_total / delta_time / 1e12
+
+
 def _estimate_unknown_flops(config, tokens_sum, batch_seqlens, delta_time):
     return 0
 
@@ -562,6 +704,7 @@ ESTIMATE_FUNC = {
     MODEL_ARCH.QWEN3_VL: _estimate_qwen3_vl_flops,
     MODEL_ARCH.QWEN3_VL_MOE: _estimate_qwen3_vl_moe_flops,
     MODEL_ARCH.DEEPSEEK_V3: _estimate_deepseek_v3_flops,
+    MODEL_ARCH.DEEPSEEK_V4: _estimate_deepseek_v4_flops,
     MODEL_ARCH.MISTRAL: _estimate_qwen2_flops,
     MODEL_ARCH.GEMMA3_TEXT: _estimate_gemma3_flops,
     MODEL_ARCH.SEED_OSS: _estimate_qwen2_flops,

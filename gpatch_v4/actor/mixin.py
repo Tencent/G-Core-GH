@@ -35,6 +35,7 @@ from gpatch_v4.utils import (
     cpu_dict,
     get_tokenizer_template,
     log,
+    log_debug,
     logging_memory_usage,
     logging_memory_usage_details,
     logging_rank0,
@@ -52,6 +53,7 @@ from gpatch_v4.utils.ppo_utils import (
     create_response_mask,
     get_advantage_clip_bounds,
 )
+from gpatch_v4.utils.training_utils import whiten_advantages_cross_dp
 
 
 class TokenizerMixin:
@@ -741,6 +743,23 @@ class RlTrainerMixin:
                         ppo_rollout_metrics[f"{result.metrics_prefix}/{k}"] += v
 
                 assert advantages[0].dtype == torch.float32
+
+                # 打印advantages的形状
+                log_debug(f"[GrpoTrainActor] advantages shape: {advantages[0].shape}", rank=0)
+
+                # ---- whiten advantages globally across DP ranks ----
+                # 对所有 DP rank 上 batch 内的有效 response token 做统一的
+                # mean/std 归一化；whiten 必须在 advantage_clip 之前。
+                # 注意：此处假设所有 DP rank 在 generate_ppo_data 中
+                # 迭代的 rollout_batch 数量一致（否则 all_reduce 会卡住）。
+                if self.config.ppo.whiten_advantages and mask is not None:
+                    assert self.config.ppo.advantage_type in [
+                        "identity", "reinforce", "ppo"
+                    ], "whiten_advantages only support identity and reinforce"
+                    advantages, whiten_metrics = whiten_advantages_cross_dp(advantages, mask)
+                    for k, v in whiten_metrics.items():
+                        ppo_rollout_metrics[k] += v
+
                 advantage_clip_bounds = get_advantage_clip_bounds(
                     self.config.ppo.advantage_clip,
                     self.config.ppo.advantage_clip_lower_bound,

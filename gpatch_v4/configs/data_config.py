@@ -22,6 +22,7 @@ class DataConfig(MappingProtocol):
     sampler_seed : int
     system_prompt : str or None
     dataloader_num_workers : int
+    multiprocessing_method : str
     dataloader_pin_memory : bool
     dataloader_prefetch_factor : int or None
     mask_history : bool
@@ -53,6 +54,9 @@ class DataConfig(MappingProtocol):
     dataloader_num_workers: int = field(
         default=1, metadata={"help": "Number of workers for the dataloader"}
     )
+    multiprocessing_method: str = field(
+        default="forkserver", metadata={"help": "Dataloader worker multiprocessing start method"}
+    )
     dataloader_pin_memory: bool = field(
         default=True, metadata={"help": "Whether to pin memory for the dataloader"}
     )
@@ -70,3 +74,6 @@ class DataConfig(MappingProtocol):
     dataloader_verify_fn_name: Optional[str] = field(
         default=None, metadata={"help": "the dataloader verify fn_name in 'py_path'"}
     )
+
+    def __post_init__(self):
+        assert self.multiprocessing_method in ["fork", "forkserver", "spawn"], "multiprocessing_method must be 'fork' or 'forkserver' or 'spawn'"

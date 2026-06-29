@@ -147,15 +147,16 @@ class EnvAgentLoopActor(AgentLoopActor):
             for cd, sidx in zip(cleaned_batches, sample_indices):
                 managers = self._build_managers_for_step()
                 repeat_n = len(managers)
-                base_seed = ppo_step * 10000 + sidx * repeat_n
+                #注意：同 group（同 ppo_step + sidx）内所有轨迹共享同一 seed，不同 group seed 不同，不依赖数据文件。
+                group_seed = ppo_step * 10000 + sidx * repeat_n
                 _t0 = time.time()
                 log(
                     f"[env_rollout] BEGIN worker_id={self.worker_id} "
-                    f"ppo_step={ppo_step} sample_idx={sidx} repeat_n={repeat_n}"
+                    f"ppo_step={ppo_step} sample_idx={sidx} repeat_n={repeat_n} group_seed={group_seed}"
                 )
                 results = await asyncio.gather(
                     *[
-                        self._run_env_in_thread(mgr, base_seed + j, ppo_step, cd)
+                        self._run_env_in_thread(mgr, group_seed, ppo_step, cd)
                         for j, mgr in enumerate(managers)
                     ]
                 )

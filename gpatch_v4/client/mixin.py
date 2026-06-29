@@ -2,6 +2,7 @@ import asyncio
 import os
 import traceback
 from abc import ABC
+import ray
 
 import torch
 import torch.distributed as dist
@@ -116,8 +117,6 @@ class UpdateWeightIpcMixin:
 
     async def _dispatch_vllm_start_weights_update(self, sampler_idx: int) -> None:
         """RPC ``start_weights_update`` to every sampler cluster endpoint."""
-        import ray
-
         if dist.get_rank() != 0:
             cpu_barrier()
             return
@@ -135,8 +134,6 @@ class UpdateWeightIpcMixin:
 
     async def _dispatch_vllm_finalize_weights_update(self, sampler_idx: int) -> None:
         """RPC ``finalize_weights_update`` to every sampler cluster endpoint."""
-        import ray
-
         if dist.get_rank() != 0:
             cpu_barrier()
             return
@@ -194,6 +191,7 @@ class UpdateWeightIpcMixin:
         rank = dist.get_rank()
 
         update_weight_max_size_bytes = self.update_weight_max_size_bytes
+        large_tensor_cleanup_threshold_bytes = 10 * update_weight_max_size_bytes
         weight_generator = model_engine.export_weights()
 
         async def async_update_weights():
@@ -203,8 +201,13 @@ class UpdateWeightIpcMixin:
                     converted_named_tensors_by_dtypes = {}
                     converted_buffer_size_by_dtypes = {}
                     for name, param in weight_generator:
+                        is_gathered_tensor = bool(
+                            getattr(param, "is_gathered_tensor", False)
+                        )
                         if replace_zeros:
                             weight_tensor = torch.zeros_like(param)
+                        elif is_gathered_tensor:
+                            weight_tensor = param
                         else:
                             weight_tensor = param.detach().clone()
 
@@ -219,61 +222,36 @@ class UpdateWeightIpcMixin:
                         if converted_buffer_size_by_dtypes[dtype] >= update_weight_max_size_bytes:
                             torch.cuda.synchronize()
                             named_tensors = converted_named_tensors_by_dtypes[dtype]
+                            bucket_bytes = converted_buffer_size_by_dtypes[dtype]
                             serialized_named_tensors = self.flattened_and_get_ipc_handle(
                                 named_tensors
                             )
 
                             count_packed_bucket_num += 1
-                            rpc_task = None
                             if dist.get_rank() == self._ipc_gather_dst_rank:
                                 update_data = {
                                     "serialized_named_tensors": serialized_named_tensors,
                                     "load_format": "flattened_bucket",
                                 }
-
-                                async def send_and_prefetch():
-                                    resp = await self.update_co(sampler_idx, update_data)
-                                    log(f"update_weights response: {resp}", rank=0)
-                                    return resp
-
-                                rpc_task = asyncio.create_task(send_and_prefetch())
-                            cpu_barrier()
-                            # prefetch next buffer
-                            next_buffer_weights = []
-                            next_buffer_size = 0
-                            try:
-                                while next_buffer_size < update_weight_max_size_bytes:
-                                    next_name, next_param = next(weight_generator)
-                                    if replace_zeros:
-                                        weight_tensor = torch.zeros_like(next_param)
-                                    else:
-                                        weight_tensor = next_param.detach().clone()
-                                    next_buffer_weights.append((next_name, weight_tensor))
-                                    next_buffer_size += weight_tensor.element_size(
-                                    ) * weight_tensor.numel()
-                            except StopIteration:
-                                log(f"all weights have been exhaustively searched.")
-
-                            if rpc_task is not None:
-                                resp = await rpc_task
+                                resp = await self.update_co(sampler_idx, update_data)
+                                log(f"update_weights response: {resp}", rank=0)
+                                if bucket_bytes >= large_tensor_cleanup_threshold_bytes:
+                                    del update_data, resp
 
                             cpu_barrier()
+                            # Avoid prefetching the next bucket while the
+                            # current flattened CUDA IPC bucket is still alive.
+                            # Large MoE weights can otherwise require two
+                            # bucket copies plus the flat tensor at once.
                             converted_named_tensors_by_dtypes[dtype] = []
                             converted_buffer_size_by_dtypes[dtype] = 0
-
-                            for next_name, next_param in next_buffer_weights:
-                                _dtype = next_param.dtype
-                                if _dtype not in converted_named_tensors_by_dtypes:
-                                    converted_named_tensors_by_dtypes[_dtype] = []
-                                    converted_buffer_size_by_dtypes[_dtype] = 0
-                                converted_named_tensors_by_dtypes[_dtype].append(
-                                    (next_name, next_param)
-                                )
-                                converted_buffer_size_by_dtypes[_dtype] += next_param.element_size(
-                                ) * next_param.numel()
-
-                            next_buffer_weights = []
-                            next_buffer_size = 0
+                            if bucket_bytes >= large_tensor_cleanup_threshold_bytes:
+                                del named_tensors
+                                del serialized_named_tensors
+                                del weight_tensor
+                                del param
+                                clear_memory()
+                                torch.cuda.ipc_collect()
 
                     last_update_weight_co = []
                     for dtype, named_tensors in converted_named_tensors_by_dtypes.items():
@@ -341,7 +319,6 @@ class UpdateWeightIpcMixin:
           acknowledged by Ray the local tensor references are released so
           ``reduce_tensor`` stops pinning GPU memory.
         """
-        import ray
         from torch.multiprocessing.reductions import reduce_tensor
 
         from gpatch_v4.generation_backend.bucketed_ipc_transfer import gcore_gpu_uuid
@@ -503,8 +480,6 @@ class UpdateWeightIpcMixin:
           ``ray.get`` acks the RPC, ensuring the CUDA IPC segment stays
           mapped for the entire receiver-side load.
         """
-        import ray
-
         from gpatch_v4.generation_backend.bucketed_ipc_transfer import (
             FlatIpcBucket,
             FlatIpcBucketBuilder,
@@ -669,9 +644,6 @@ class UpdateWeightDistributedMixin:
     async def init_distributed_weight_group(self, group_name="weight_update_group"):
         """Create NCCL group between training rank 0 and sampler engine workers."""
         import socket
-
-        import ray
-
         sampler_idx = 0
 
         backend = self.infer_backend
@@ -753,8 +725,6 @@ class UpdateWeightDistributedMixin:
         if self._dist_weight_group_name is None:
             return
 
-        import ray
-
         backend = self.infer_backend
         assert backend == "sglang", "only sglang backend is supported"
         sampler_idx = 0
@@ -798,6 +768,7 @@ class UpdateWeightDistributedMixin:
         """Iterate ``export_weights()`` on all ranks and broadcast from rank 0."""
         weight_generator = model_engine.export_weights()
         max_bucket_bytes = self.update_weight_max_size_bytes
+        large_tensor_cleanup_threshold_bytes = 10 * max_bucket_bytes
         is_rank0 = dist.get_rank() == 0
         count_buckets = 0
 
@@ -818,23 +789,71 @@ class UpdateWeightDistributedMixin:
             buffer_size += param.element_size() * param.numel()
 
             if buffer_size >= max_bucket_bytes:
+                bucket_bytes = buffer_size
                 if is_rank0:
                     torch.cuda.synchronize()
                     self._broadcast_weight_bucket(sampler_idx, buffer, flush_cache=False)
                     count_buckets += 1
+                if bucket_bytes >= large_tensor_cleanup_threshold_bytes:
+                    flush_refs = None
+                    if is_rank0:
+                        flush_refs = self._submit_sampler_cache_flush_after_distributed_bucket(
+                            sampler_idx, bucket_bytes
+                        )
+                        del weight
+                    del buffer
+                    del param
+                    clear_memory()
+                    if is_rank0:
+                        self._wait_sampler_cache_flush_after_distributed_bucket(flush_refs)
                 buffer = []
                 buffer_size = 0
                 cpu_barrier()
 
         if buffer_size > 0:
+            bucket_bytes = buffer_size
             if is_rank0:
                 torch.cuda.synchronize()
                 self._broadcast_weight_bucket(sampler_idx, buffer, flush_cache=True)
                 count_buckets += 1
+            if bucket_bytes >= large_tensor_cleanup_threshold_bytes:
+                flush_refs = None
+                if is_rank0:
+                    flush_refs = self._submit_sampler_cache_flush_after_distributed_bucket(
+                        sampler_idx, bucket_bytes
+                    )
+                    del weight
+                del buffer
+                del param
+                clear_memory()
+                if is_rank0:
+                    self._wait_sampler_cache_flush_after_distributed_bucket(flush_refs)
             cpu_barrier()
 
         log(f"distributed weight update done, {count_buckets} buckets broadcast", rank=0)
         return True
+
+    def _submit_sampler_cache_flush_after_distributed_bucket(self, sampler_idx, bucket_bytes):
+        """Submit sampler-side cache flush after a large sglang distributed bucket."""
+        log(
+            f"flush sampler cache after large distributed weight bucket "
+            f"({bucket_bytes / 1024**3:.3f} GiB)",
+            rank=0,
+        )
+        num_clusters = self.svr_cluster_num_per_sampler[sampler_idx]
+        obj_refs = []
+        for ep_i in range(num_clusters):
+            target_ep = self.rpc_client_lst[sampler_idx].get_target_endpoint(
+                sample_idx=None,
+                ep_idx=ep_i,
+            )
+            obj_refs.append(target_ep.flush_cache.remote({}))
+        return obj_refs
+
+    def _wait_sampler_cache_flush_after_distributed_bucket(self, obj_refs):
+        """Wait for sampler-side cache flush submitted after a large bucket."""
+        ray.get(obj_refs)
+        log("sampler cache flushed after large distributed weight bucket", rank=0)
 
     def _update_weights_by_distributed_vllm(self, sampler_idx, model_engine, replace_zeros=False):
         """Iterate ``export_weights()`` on all ranks and broadcast from rank 0.
@@ -867,8 +886,6 @@ class UpdateWeightDistributedMixin:
         """
         is_rank0 = dist.get_rank() == 0
         if is_rank0:
-            import ray
-
             num_clusters = self.svr_cluster_num_per_sampler[sampler_idx]
             start_refs = []
             for ep_i in range(num_clusters):
@@ -924,7 +941,6 @@ class UpdateWeightDistributedMixin:
         # 跨桶被部分初始化）。与 _update_weights_by_bucketed_ipc_vllm 尾部
         # 是同一个 RPC 入口。
         if is_rank0:
-            import ray
             num_clusters = self.svr_cluster_num_per_sampler[sampler_idx]
             fin_refs = []
             for ep_i in range(num_clusters):
@@ -947,7 +963,6 @@ class UpdateWeightDistributedMixin:
         """Send metadata via Ray, broadcast tensor data via NCCL."""
         backend = self.infer_backend
         assert backend == "sglang", "only sglang backend is supported"
-        import ray
 
         names = [n for n, _ in named_tensors]
         dtypes = [str(p.dtype).replace("torch.", "") for _, p in named_tensors]
@@ -1009,7 +1024,6 @@ class UpdateWeightDistributedMixin:
         """
         backend = self.infer_backend
         assert backend == "vllm", "only vllm backend is supported"
-        import ray
 
         names: list = []
         dtype_names: list = []

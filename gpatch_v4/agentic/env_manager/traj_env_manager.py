@@ -22,8 +22,9 @@ from gpatch_v4.agentic.env_manager.utils import EnvManagerStrMixin, RolloutCache
 from gpatch_v4.agentic.llm_proxy import create_llm_proxy
 from gpatch_v4.client import SamplerClient
 from gpatch_v4.configs.config import AgenticRlConfig
-from gpatch_v4.utils import log
+from gpatch_v4.utils import log, log_debug
 from gpatch_v4.utils.constants import GenerateStopReason
+from gpatch_v4.utils.data_manipulate_utils import aggregate_metrics
 from gpatch_v4.utils.str_utils import contains_renderable_field
 
 
@@ -72,6 +73,7 @@ class TrajEnvManager(EnvManagerStrMixin):
 
     def run(self, seed: int, ppo_step: int, data: Dict[str, Any]) -> Dict[str, List[Any]]:
         """Run a single trajectory and return a rollout_batch dict."""
+        self.sampling_seed_offset = seed * 10 + self.env_config["env_id"]
         rollout_cache = self._reset(seed, ppo_step, data)
         assert rollout_cache is not None
 
@@ -166,11 +168,16 @@ class TrajEnvManager(EnvManagerStrMixin):
         # 注意：sampler 端的 generate_func 必须读这个 key 并用它去 override 引擎默认
         # 的 max_new_tokens。若 generate_func 未实现该逻辑，此处只是冗余信息，无害。
         prompt_token_ids = input_ids[0]
+        max_tokens_per_step = self.env_config["max_tokens_per_step"]
         max_new_tokens_cap = seq_length - input_ids.shape[1]
+        if max_tokens_per_step is not None and max_tokens_per_step > 0:
+            max_new_tokens_cap = min(max_new_tokens_cap, max_tokens_per_step)
+        # seed_offset 用 env id 来标志，让一个轨迹一个seed，不管多少轮，不同轨迹不同 seed
         lm_output = self.llm_proxy.generate(
             {
                 "prompt_token_ids": prompt_token_ids,
                 "max_new_tokens": max_new_tokens_cap,
+                "seed_offset": self.sampling_seed_offset,
             },
             engine_index=self.env_config["engine_index"],
         )
@@ -206,7 +213,12 @@ class TrajEnvManager(EnvManagerStrMixin):
                 "content": self.tokenizer.decode(response_ids, skip_special_tokens=True),
             }
         )
-
+        log_debug(
+            f"make decision input content: {self.tokenizer.decode(input_ids[0], skip_special_tokens=False)}"
+        )
+        log_debug(
+            f"make decision output content: {self.tokenizer.decode(response_ids, skip_special_tokens=False)}"
+        )
         lm_output["stop_reason"] = GenerateStopReason.FINISH
         return lm_output
 
@@ -282,7 +294,7 @@ class TrajEnvManager(EnvManagerStrMixin):
             if contains_renderable_field(self.agent_template, "actions_left"):
                 render_dict["actions_left"] = content["actions_left"]
             if contains_renderable_field(self.agent_template, "max_response_length"):
-                render_dict["max_response_length"] = self.env_config.get("max_tokens_per_step", 512)
+                render_dict["max_response_length"] = self.env_config["max_tokens_per_step"]
             user_content += self.agent_template.format(**render_dict)
             messages.append({"role": "user", "content": user_content})
 
@@ -361,6 +373,7 @@ class TrajEnvManager(EnvManagerStrMixin):
 
         seq_length = self.rl_config.training.seq_length
         pad_multi = self.rl_config.training.pad_to_mulitiple_of
+
         L = tokens.shape[-1]
         pad_to_len = ((L + pad_multi - 1) // pad_multi) * pad_multi
         pos_len = max(seq_length, pad_to_len)
@@ -383,5 +396,25 @@ class TrajEnvManager(EnvManagerStrMixin):
         if rollout_log_probs:
             rlp = torch.tensor(rollout_log_probs, dtype=torch.float)
             result["rollout_log_probs"] = [rlp[1:]]  # shift by 1 to align with logprobs
+
+        # Aggregate per-step env metrics (e.g. success/action_is_valid/format_penalty)
+        # into trajectory-level scalars and surface them on the rollout_batch so
+        # that ``compute_rollout_metrics`` (which scans for keys listed in
+        # ``training.metrics_report``) can all-reduce and report them.
+        history_metrics: List[Dict[str, Any]] = []
+        agg_mode: Dict[str, str] = {}
+        for item in rollout_cache.history:
+            m = item.get("metrics")
+            if isinstance(m, dict) and m:
+                history_metrics.append(m)
+                item_mode = item.get("metrics_agg_mode")
+                if isinstance(item_mode, dict):
+                    agg_mode.update(item_mode)
+        if history_metrics:
+            traj_metrics = aggregate_metrics(history_metrics, agg_mode)
+            for name, val in traj_metrics.items():
+                result[name] = [torch.tensor(float(val), dtype=torch.float)]
+
+        result["num_actions"] = [torch.tensor(float(rollout_cache.step), dtype=torch.float)]
 
         return result

@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 import psutil
 import torch
 
+from gpatch_v4.custom.registry import register_custom_module
 from gpatch_v4.utils.logging_utils import (
     get_default_logger,
     log,
@@ -473,17 +474,20 @@ def import_mod_from_path(py_path: str):
     module
     """
     assert py_path is not None and os.path.exists(py_path), f'invalid path {py_path}'
+    import gpatch_v4.custom  # noqa: F401
+
     md5 = hashlib.md5()
     md5.update(py_path.encode('utf-8'))
     new_mod_name = md5.hexdigest()
-    new_mod_name = f'gpatch_v4.custom.{new_mod_name}'
-    if new_mod_name in sys.modules:
-        new_mod = sys.modules[new_mod_name]
+    full_mod_name = f'gpatch_v4.custom.{new_mod_name}'
+    if full_mod_name in sys.modules:
+        new_mod = sys.modules[full_mod_name]
     else:
-        spec = importlib.util.spec_from_file_location(new_mod_name, py_path)
-        assert spec is not None
+        spec = importlib.util.spec_from_file_location(full_mod_name, py_path)
+        assert spec is not None, f"Failed to import module from path: {py_path}"
         new_mod = importlib.util.module_from_spec(spec)
-        sys.modules[new_mod_name] = new_mod
+        sys.modules[full_mod_name] = new_mod
+        register_custom_module(new_mod_name, py_path)
         spec.loader.exec_module(new_mod)
     return new_mod
 

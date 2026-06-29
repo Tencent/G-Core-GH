@@ -124,8 +124,8 @@ class McoreSwapImpl:
             opt_state_dict_values = optimizer.optimizer.state.values()
 
             for v in opt_state_dict_values:
-                offload_tensor_to_cpu(v['exp_avg'])
-                offload_tensor_to_cpu(v['exp_avg_sq'])
+                offload_tensor_to_cpu(v.get("exp_avg"))
+                offload_tensor_to_cpu(v.get("exp_avg_sq"))
 
         clear_memory()
         logging_memory_usage_details("memory tracking after optimizer offload", rank=0)
@@ -149,8 +149,8 @@ class McoreSwapImpl:
 
             opt_state_dict_values = optimizer.optimizer.state.values()
             for v in opt_state_dict_values:
-                onload_tensor_to_gpu(v['exp_avg'])
-                onload_tensor_to_gpu(v['exp_avg_sq'])
+                onload_tensor_to_gpu(v.get("exp_avg"))
+                onload_tensor_to_gpu(v.get("exp_avg_sq"))
 
         clear_memory()
         logging_memory_usage_details("memory tracking after optimizer onload", rank=0)

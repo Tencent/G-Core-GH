@@ -1,0 +1,160 @@
+# @package _global_
+
+training:
+  training_backend: mcore
+  use_gen_rm_reward: False
+  use_bt_rm_reward: False
+  use_fast_tokenizer: True
+  rollout_gbs: 128
+  rollout_mbs: 1
+  sampling_repeat_n: 16
+  sampling_keep_n: 16
+  train_gbs: 512
+  train_mbs: 1
+  data_parallel_random_init: False
+  save_interval: 1000
+  build_from_mbridge: True
+  num_train_epoches: 2
+  ppo_max_epochs_2: 1
+  seq_length: 4096
+  total_training_step: 10000
+  ppo_step_per_epoch: 256
+  total_ppo_step: 1024
+  
+  metrics_report:
+    - "acc_reward"
+    - "fmt_reward"
+  agentic:
+    train_env_manager:
+      max_traj_per_env: 1
+      group_per_worker: 8
+      group_replicate: 8
+
+    env_cfg_template:
+      training_id: "gcore_mini_program"
+      env_manager_cls: gpatch_v4.agentic.env_manager.step_vl_traj_env_manager.StepVLTrajEnvManager
+      env_type: miniprogram
+      max_steps: 30
+      max_tokens_per_step: 512
+      use_thread_lock: false
+      agent_system_template: "You're a helpful assistant."
+      pre_step_template: "\nTurn {turn_idx}:\nState:\n"
+      next_step_template: |
+        You have {actions_left} actions left. 
+        Always output: <answer> [your answer] </answer> with no extra text. 
+        Strictly follow this format.
+        Max response length: {max_response_length} words (tokens).
+        Decide the next action:
+      env_config:
+        prompt_vlt_path: null
+        prompt_vlt_v1_path: null
+        sandbox_wait_model_base_url: "http://llmproxy-offline.lubanllm.polaris:9000/v1/test"
+        sandbox_wait_model_name: "eval_kangyuqiao-waitmodel_7B_606_Qwen2.5-VL-7B-wait-0702_ck1100_export-1207-00"
+        vlt_base_url: "http://llmproxy-offline.lubanllm.polaris:9000/v1/test"
+        vlt_model_name: "eval_kangyuqiao-user_xiaodezhang_llm_luban_xiaochengxu_qwen25vl32b_v20250818_500_rl_v14_export-1112-14"
+        vlt_base_url_v1: "http://llmproxy-offline.lubanllm.polaris:9000/v1/test"
+        vlt_model_name_v1: "eval_zhongpuwang-user_xiaodezhang_llm_luban_xiaochengxu_qwen25vl32b_v20250827_700_rl_v17_export-0912-19"
+        reward_base_url: "http://llmproxy-offline.lubanllm.polaris:9000/v1/test"
+        reward_model_name: gemini-3-pro-preview
+        data_path: "/mnt/cephfs/user_kangqin/data/final_merged_deduped_by_instr_appid_filtered.jsonl"
+        tag_filter: android_group_4
+        max_steps: 30
+        uin_config_enable_instruction_consistency: false
+
+    reward_normalization:
+      grouping: traj_group_id # 可以tags(env_type)/traj_group_id(group)/batch(rollout_batch)... group_by计算reward/adv
+      method: mean_std # asym_clip / identity / mean_std
+    adv_estimator: step_reinforce
+    whiten_advantages: False
+    advantage_clip: 20
+    step_reward_gamma: 0.99
+    gamma: 1.0
+    mask_negative_samples: True
+
+checkpoint:
+  load_ckpt_path: save_qwen_2_5_1_5b_grpo
+  save_ckpt_path: save_qwen_2_5_1_5b_grpo
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 5.0e-6
+  lr_warmup_steps: 2
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  lr_decay_steps: 1000
+
+data:
+  data_pathes:
+    - "hf-hub/openai/gsm8k-jsonl/train"
+  py_path: "tasks/math_rl_v4/simple_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+policy:
+  dist_config:
+    torch_dist_timeout_minutes: 180
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+  model_arch: "qwen2_5_vl"
+  hf_model_path: "/mnt/geminigmceph/lubaninfra/model_factory/32b_iassft_1215split_grpo_9_checkpoint-800"
+  hf_tokenizer_path: ${policy.hf_model_path}
+  ref_hf_model_path: ${policy.hf_model_path}
+  sampler_client:
+    rpc_type: ray
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+  rollout_gen_type: agentic
+  override_transformer_config:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+  
+
+sampler:
+  backend: sglang
+  model_info:
+    - model_arch: "qwen2_5_vl"
+      hf_model_path: ${policy.hf_model_path}
+      gen_rollout_py_path: "gpatch_v4/agentic/generate_func.py"
+      gen_rollout_fn_name: "generate_func"
+
+  infer_engine_configs:
+    - dist_config:
+        tensor_model_parallel_size: 8
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.7
+      max_running_requests: 128
+      temperature: 1.0
+      top_p: 0.9
+      generate_max_tokens: 512
+
+bt_rm:
+  reward_type: "rule_only"
+  reward_model_info:
+    - model_arch: "qwen2.5-math-rm-72b"
+      hf_model_path: "hf-hub/Qwen/Qwen2.5-Math-RM-72B/"
+      reward_py_path: tasks/math_rl_v4/bt_reward.py
+      parse_reward_fn_name: math_rl_rule_reward
+      reward_weight: 1.0
+  infer_engine_configs:
+    - dist_config:
+        nnodes: -1
+
+# dist_config.nnodes 设置 -1 表示适用所有节点
+
+ppo:
+  grpo_advantage_epsilon: 1.0e-4
+  ppo_ratio_eps: 0.2
+  grpo_kl_loss_beta: 0.04
+
+
+debug:
+  save_first_rollout_data: True
+  debug_engine_update_weight: False

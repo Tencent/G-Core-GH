@@ -602,6 +602,175 @@ def _pack_thd_worker(
         tag += "_replay"
     if ep_backend != "eager":
         tag += f"_{ep_backend}"
+    print(f"[{tag}] rank {rank}: loading {hf_model_path} via meta-device ...", flush=True)
+    _t_start = time.time()
+    model = _build_fork_model(hf_model_path, tokenizer)
+    model = apply_hp(
+        model,
+        ep_2d_mesh,
+        cp_mesh=cp_mesh,
+        amp_fp32=False,
+        attn_backend=attn_backend,
+        indexer_backend=indexer_backend,
+        ep_backend=ep_backend,
+    )
+    model.gradient_checkpointing_enable()
+    model.load_checkpoint_hp(hf_model_path)
+    load_seconds = time.time() - _t_start
+    print(f"[{tag}] rank {rank}: load_checkpoint done in {load_seconds:.1f}s", flush=True)
+
+    # cp_size=1 时 apply_hp 不绑 _cp_group（hp.py:166 cp_size>1 才 _bind_cp）。
+    # 显式分支，避免静默 getattr fallback。
+    cp_group = model._cp_group if CP_SIZE > 1 else None
+    result = _run_fwd_bwd_pack(
+        model, packed_ids, packed_position_ids, packed_labels, psp, rank, tag,
+        cp_group=cp_group,
+        replay_indices=replay_indices,
+    )
+    result["load_seconds"] = load_seconds
+
+    del model, packed_ids, packed_position_ids, packed_labels, psp
+    torch.cuda.empty_cache()
+    dist.destroy_process_group()
+    return result
+
+
+class _LayerPerfTimer:
+
+    def __init__(self, model: torch.nn.Module):
+        self._active = False
+        self._pending: dict[tuple[int, str], list[torch.cuda.Event]] = {}
+        self._events: list[tuple[tuple[int, str], torch.cuda.Event, torch.cuda.Event]] = []
+        self._steps: list[dict[tuple[int, str], float]] = []
+        self._handles = []
+
+        for layer_idx, layer in enumerate(model.model.layers):
+            self._register(layer_idx, "attn", layer.self_attn)
+            self._register(layer_idx, "moe", layer.mlp)
+            self._register(layer_idx, "mhc", layer.attn_hc)
+            self._register(layer_idx, "mhc", layer.ffn_hc)
+
+    def _register(self, layer_idx: int, kind: str, module: torch.nn.Module):
+        key = (layer_idx, kind)
+
+        def start(*_args):
+            self._start(key)
+
+        def finish(*_args):
+            self._finish(key)
+
+        self._handles.append(module.register_forward_pre_hook(start))
+        self._handles.append(module.register_forward_hook(finish))
+        self._handles.append(module.register_full_backward_pre_hook(start))
+        self._handles.append(module.register_full_backward_hook(finish))
+
+    def _start(self, key: tuple[int, str]):
+        if not self._active:
+            return
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        self._pending.setdefault(key, []).append(event)
+
+    def _finish(self, key: tuple[int, str]):
+        if not self._active:
+            return
+        starts = self._pending[key]
+        start = starts.pop()
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        self._events.append((key, start, end))
+
+    def start_step(self):
+        self._active = True
+        self._pending.clear()
+        self._events.clear()
+
+    def finish_step(self):
+        self._active = False
+        totals: dict[tuple[int, str], float] = {}
+        for key, start, end in self._events:
+            totals[key] = totals.get(key, 0.0) + start.elapsed_time(end)
+        self._steps.append(totals)
+        return totals
+
+    def summary(self, skip_steps: int = 1) -> dict[int, dict[str, float]]:
+        steps = self._steps[skip_steps:] or self._steps
+        if not steps:
+            return {}
+        out: dict[int, dict[str, float]] = {}
+        for step in steps:
+            for (layer_idx, kind), elapsed_ms in step.items():
+                layer_out = out.setdefault(layer_idx, {})
+                layer_out[kind] = layer_out.get(kind, 0.0) + elapsed_ms
+        for layer_out in out.values():
+            for kind in layer_out:
+                layer_out[kind] /= len(steps)
+        return out
+
+    def close(self):
+        for handle in self._handles:
+            handle.remove()
+
+
+def _format_layer_perf_by_step(layer_perf: dict[tuple[int, str], float]) -> list[str]:
+    layer_ids = sorted({layer_idx for layer_idx, _ in layer_perf})
+    out = []
+    for layer_idx in layer_ids:
+        parts = []
+        for kind in ("attn", "moe", "mhc"):
+            parts.append(f"{kind}={layer_perf.get((layer_idx, kind), 0.0):.2f}")
+        out.append(f"layer {layer_idx}:  " + "  ".join(parts))
+    return out
+
+
+@ray.remote(num_gpus=1)
+def _bench_thd_worker(
+    hf_model_path: str, rank: int, world_size: int,
+    master_addr: str, master_port: int,
+    n_steps: int = 5,
+    attn_backend: str = "fused",
+    indexer_backend: str = "fused",
+    ep_backend: str = "eager",
+    fake_seq_lens: list[int] | None = None,
+    padded_seq_lens: list[int] | None = None,
+    ep_size: int = 8,
+    cp_size: int = 4,
+):
+    if padded_seq_lens is None:
+        padded_seq_lens = PADDED_SEQ_LENS
+    _setup_dist(rank, world_size, master_addr, master_port)
+    ep_2d_mesh = init_device_mesh(
+        "cuda",
+        mesh_shape=(world_size // ep_size, ep_size),
+        mesh_dim_names=("ep_fsdp", "ep"),
+    )
+    if cp_size > 1:
+        cp_mesh = init_device_mesh(
+            "cuda",
+            mesh_shape=(world_size // cp_size, cp_size),
+            mesh_dim_names=("dp", "cp"),
+        )["cp"]
+    else:
+        cp_mesh = None
+
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    ids_list, labels_list = _make_fake_qa(
+        tokenizer, device=torch.device("cuda"),
+        fake_seq_lens=fake_seq_lens,
+    )
+    config = _truncate_config(DeepseekV4Config.from_pretrained(hf_model_path))
+    # 测试用，一般模型用 self attn，dsv4 attention 占比较小，所以 mfu 30% 左右。
+    # config.sliding_window = 16384
+
+    packed_ids, packed_position_ids, packed_labels, psp = _prep_pack(
+        ids_list, labels_list, tokenizer, config,
+    )
+    assert packed_labels is not None
+
+    tag = f"bench_thd_ep{ep_size}_cp{cp_size}_{attn_backend}"
     print(f"[{tag}] rank {rank}: loading {hf_model_path} via meta-device ...")
     _t_start = time.time()
     model = _build_fork_model(hf_model_path, tokenizer)
@@ -619,20 +788,111 @@ def _pack_thd_worker(
     load_seconds = time.time() - _t_start
     print(f"[{tag}] rank {rank}: load_checkpoint done in {load_seconds:.1f}s")
 
-    # cp_size=1 时 apply_hp 不绑 _cp_group（hp.py:166 cp_size>1 才 _bind_cp）。
-    # 显式分支，避免静默 getattr fallback。
-    cp_group = model._cp_group if CP_SIZE > 1 else None
-    result = _run_fwd_bwd_pack(
-        model, packed_ids, packed_position_ids, packed_labels, psp, rank, tag,
-        cp_group=cp_group,
-        replay_indices=replay_indices,
-    )
-    result["load_seconds"] = load_seconds
+    cp_group = model._cp_group if cp_size > 1 else None
+    actual_cp_size = dist.get_world_size(cp_group) if cp_group is not None else 1
+    cp_rank = dist.get_rank(cp_group) if cp_group is not None else 0
 
+    if actual_cp_size > 1:
+        local_ids, local_labels, _, local_position_ids, local_psp = cp_chunk_data(
+            cp_rank, cp_size,
+            tokens=packed_ids, labels=packed_labels,
+            position_ids=packed_position_ids,
+            packed_seq_params=psp,
+        )
+    else:
+        local_ids = packed_ids
+        local_labels = packed_labels
+        local_position_ids = packed_position_ids
+        local_psp = psp
+    assert local_labels is not None
+
+    global_n = (local_labels != -100).sum()
+    if cp_size > 1:
+        dist.all_reduce(global_n, group=cp_group)
+
+    model.train()
+    torch.cuda.reset_peak_memory_stats()
+    layer_perf = _LayerPerfTimer(model)
+
+    step_times = []
+    for step in range(n_steps):
+        torch.cuda.synchronize()
+        layer_perf.start_step()
+        t0 = time.time()
+
+        outputs = model(
+            input_ids=local_ids,
+            position_ids=local_position_ids,
+            packed_seq_params=local_psp,
+        )
+        logits = outputs.logits
+        loss = F.cross_entropy(
+            logits.float().reshape(-1, logits.size(-1)),
+            local_labels.reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+        ) / global_n
+        reported_loss = loss.detach().clone()
+        if cp_size > 1:
+            dist.all_reduce(reported_loss, group=cp_group)
+        loss.backward()
+
+        total_grad_norm = model.clip_grad_norm_(2.0)
+        model.zero_grad()
+        torch.cuda.synchronize()
+        layer_step_perf = layer_perf.finish_step()
+
+        step_time = time.time() - t0
+        step_times.append(step_time)
+        print(
+            f"[{tag}] rank {rank}: step {step}  "
+            f"loss={reported_loss.item():.4f}  gn={total_grad_norm:.4f}  "
+            f"time={step_time:.3f}s",
+            flush=True,
+        )
+
+        if rank == 0:
+            for line in _format_layer_perf_by_step(layer_step_perf):
+                print(f"[{tag}] rank {rank}: step {step}  {line}", flush=True)
+
+    mem_peak = torch.cuda.max_memory_allocated() / 1024**3
+    avg_step = sum(step_times[1:]) / len(step_times[1:]) if len(step_times) > 1 else step_times[0]
+
+    # 测试 ep8 cp1 seqlen 16k FLOPs 4L: MFU 29%
+    # 测试 ep8 cp1 seqlen 16k FLOPs 4L SW 8k: MFU >50%
+    from gpatch_v4.utils.flops_counter import FlopsCounter, get_device_flops
+    from gpatch_v4.core.constants import MODEL_ARCH
+    counter = FlopsCounter(config, MODEL_ARCH.DEEPSEEK_V4)
+    real_seq_lens = fake_seq_lens if fake_seq_lens is not None else list(FAKE_SEQ_LENS)
+    est_tflops, dev_tflops = counter.estimate_flops(real_seq_lens, avg_step)
+
+    print(
+        f"[{tag}] rank {rank}: {n_steps} steps done, "
+        f"avg={avg_step:.3f}s/step, mem_peak={mem_peak:.2f} GiB, "
+        f"TFLOPs/s={est_tflops:.1f}, device_peak={dev_tflops:.0f} TFLOPs/s, "
+        f"MFU={est_tflops / dev_tflops * 100:.1f}%",
+        flush=True,
+    )
+
+    layer_perf_summary = layer_perf.summary(skip_steps=1)
+    if rank == 0:
+        print(f"[{tag}] rank {rank}: layer perf ms/step fwd+bwd, step0 skipped", flush=True)
+        for layer_idx in sorted(layer_perf_summary):
+            parts = []
+            for kind in ("attn", "moe", "mhc"):
+                parts.append(f"{kind}={layer_perf_summary[layer_idx].get(kind, 0.0):.2f}")
+            print(f"[{tag}] rank {rank}: layer {layer_idx}:  " + "  ".join(parts), flush=True)
+    layer_perf.close()
     del model, packed_ids, packed_position_ids, packed_labels, psp
     torch.cuda.empty_cache()
     dist.destroy_process_group()
-    return result
+    return {
+        "rank": rank,
+        "load_seconds": load_seconds,
+        "step_times": step_times,
+        "mem_peak_gib": mem_peak,
+        "layer_perf_ms": layer_perf_summary,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -921,7 +1181,100 @@ class TestEpCpThd(unittest.TestCase):
         而非 256（否则 T_TOTAL=2432, s_local=608, 608%128≠0）。
         pack_sequences 的 cp_size 参数会自动处理这个对齐。
         """
-        self._pack_runs_impl(attn_backend="fused", indexer_backend="fused",
+        self._pack_runs_impl(attn_backend="fused", indexer_backend="fused", ep_backend="deepep",
                              master_port_base=12700,
                              fake_seq_lens=[1, 2023, 200],
                              padded_seq_lens=[128, 2048, 384])
+
+    # ------------------------------------------------------------------
+    # bench (no baseline, multi-step fwd+bwd only)
+    # ------------------------------------------------------------------
+
+    def _bench_impl(
+        self,
+        n_steps: int = 5,
+        attn_backend: str = "fused",
+        indexer_backend: str = "fused",
+        ep_backend: str = "eager",
+        master_port_base: int = 12800,
+        fake_seq_lens: list[int] | None = None,
+        padded_seq_lens: list[int] | None = None,
+    ):
+        assert os.path.isdir(HF_MODEL_PATH), (
+            f"model dir not found: {HF_MODEL_PATH}"
+        )
+        pg = _create_placement_group(NUM_GPUS)
+        pg_obj, bundle_indices = pg
+        master_addr = ray.get(
+            _get_node_ip.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg_obj,
+                    placement_group_bundle_index=bundle_indices[0],
+                )
+            ).remote()
+        )
+        futures = []
+        for r in range(NUM_GPUS):
+            futures.append(
+                _bench_thd_worker.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg_obj,
+                        placement_group_bundle_index=bundle_indices[r],
+                    )
+                ).remote(
+                    HF_MODEL_PATH,
+                    rank=r,
+                    world_size=NUM_GPUS,
+                    master_addr=master_addr,
+                    master_port=master_port_base,
+                    n_steps=n_steps,
+                    attn_backend=attn_backend,
+                    indexer_backend=indexer_backend,
+                    ep_backend=ep_backend,
+                    fake_seq_lens=fake_seq_lens,
+                    padded_seq_lens=padded_seq_lens,
+                )
+            )
+        results = ray.get(futures)
+        remove_placement_group(pg_obj)
+
+        print("\n" + "=" * 60, flush=True)
+        print(f"Bench summary: {n_steps} steps, fake_seq_lens={fake_seq_lens}", flush=True)
+        for res in results:
+            r = res["rank"]
+            timed_steps = res["step_times"][1:] or res["step_times"]
+            avg = sum(timed_steps) / len(timed_steps)
+            print(
+                f"  rank {r}: load={res['load_seconds']:.1f}s  "
+                f"avg_step={avg:.3f}s  mem_peak={res['mem_peak_gib']:.2f} GiB",
+                flush=True,
+            )
+        layer_ids = sorted({
+            layer_idx
+            for res in results
+            for layer_idx in res["layer_perf_ms"]
+        })
+        print("\nLayer perf: ms/step fwd+bwd, step0 skipped", flush=True)
+        for layer_idx in layer_ids:
+            parts = []
+            for kind in ("attn", "moe", "mhc"):
+                vals = [
+                    res["layer_perf_ms"].get(layer_idx, {}).get(kind, 0.0)
+                    for res in results
+                ]
+                parts.append(
+                    f"{kind}=max {max(vals):.2f} / avg {sum(vals) / len(vals):.2f}"
+                )
+            print(f"  layer {layer_idx}:  " + "  ".join(parts), flush=True)
+
+    def test_bench_long(self):
+        """Perf bench: 16k single seq, 5 fwd+bwd steps, no baseline comparison."""
+        self._bench_impl(
+            n_steps=5,
+            attn_backend="fused",
+            indexer_backend="fused",
+            ep_backend="deepep",
+            master_port_base=12800,
+            fake_seq_lens=[64*1024],
+            padded_seq_lens=[64*1024],
+        )

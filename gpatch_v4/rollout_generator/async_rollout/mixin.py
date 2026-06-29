@@ -26,7 +26,6 @@ class ColocateAgentMixin:
     - ``self.agents_pg`` — gloo process group (or None)
     - ``self._train_actors`` — list of policy train actor handles
     """
-
     def _init_colocate_state(self):
         """Initialise colocate-related instance attributes.
 
@@ -79,6 +78,7 @@ class ColocateAgentMixin:
                 world_size=world_size,
             )
             return dist.group.WORLD
+
         self.agents_pg = _init_pg()
         self.use_colocate = True
         log(
@@ -111,7 +111,7 @@ class ColocateAgentMixin:
             return
         if not self.is_agent_leader:
             return
-        futs = [actor.log_memory.remote(tag) for actor in self._train_actors]
+        futs = [actor.log_memory.remote(tag=tag) for actor in self._train_actors]
         await asyncio.gather(*futs)
 
     @asynccontextmanager

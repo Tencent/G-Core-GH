@@ -286,12 +286,11 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
                 if not debug_skip_rollout:
                     await rc.wait_all_inflight.remote()
 
-                # update_weights is called at every window close
+                # Always offload before exporting weights. Disaggregated runs
+                # still need headroom for mbridge TP gather/merge buffers.
                 update_start = time.monotonic()
                 self._pipeline_ts.setdefault(last_trained_step, {})["update_start"] = update_start
-                await tg.update_weights(
-                    offload=config.placement_type == "colocate", flush_cache=True
-                )
+                await tg.update_weights(offload=True, flush_cache=True)
                 update_done = time.monotonic()
                 self._pipeline_ts.setdefault(last_trained_step, {})["update_done"] = update_done
 

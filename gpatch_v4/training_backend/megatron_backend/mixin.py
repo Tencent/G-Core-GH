@@ -10,7 +10,7 @@ import torch.distributed as dist
 from einops import rearrange
 from transformers import AutoConfig, AutoTokenizer
 
-from megatron.core import mpu, tensor_parallel
+from megatron.core import mpu
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
@@ -96,12 +96,6 @@ from gpatch_v4.utils.common_utils import (
     sync_cuda_and_get_time,
 )
 from gpatch_v4.utils.communication_utils import BroadcastUtils
-from gpatch_v4.utils.dynamic_cp_utils import (
-    RL_TOKEN_KEYS,
-    convert_rl_samples_to_dyn_cp_format,
-    get_batch_for_dyn_cp,
-    run_dyn_cp_schedule,
-)
 from gpatch_v4.utils.training_utils import (
     expand_rollout_batches,
     from_parallel_logits_to_logprobs,
@@ -109,13 +103,13 @@ from gpatch_v4.utils.training_utils import (
     from_parallel_logits_to_token_prob_and_rank,
     from_parallel_logits_to_topk_logprobs,
     get_batches_max_seqlen,
+    get_im_end_metrics_token_id,
     get_iterator_k_split_list,
     get_max_seqlen_within_dp,
     get_max_seqlen_within_ep,
     get_tensor_on_this_cp_rank,
     masked_mean,
     update_square_averaging_token_len,
-    get_im_end_metrics_token_id,
 )
 
 
@@ -471,6 +465,10 @@ class BridgeUtilsMixin:
         extra_kwargs["finalize_model_grads_func"] = finalize_model_grads
         extra_kwargs["attention_backend"] = AttnBackend[self.config.training.attention_backend]
         extra_kwargs["variable_seq_lengths"] = True
+        extra_kwargs["dynamic_context_parallel"] = self.dist_config.dynamic_context_parallel
+        extra_kwargs["max_seqlen_per_dp_cp_rank"] = self.dist_config.max_seqlen_per_dp_cp_rank
+        extra_kwargs["min_dynamic_context_parallel_size"
+                    ] = self.dist_config.min_dynamic_context_parallel_size
         extra_kwargs["moe_token_dispatcher_type"] = self.config.training.moe_token_dispatcher_type
         extra_kwargs["moe_router_load_balancing_type"
                     ] = self.config.training.moe_router_load_balancing_type
@@ -803,7 +801,8 @@ class ForwardStepMixin(RouterReplayMixin):
                 [(values * mask_float).sum(), mask_float.sum()]
             )
             metrics[f"eos/im_end/{suffix}_NL"] = torch.stack(
-                [(values * nl_mask_float).sum(), nl_mask_float.sum()]
+                [(values * nl_mask_float).sum(),
+                 nl_mask_float.sum()]
             )
         return metrics
 
@@ -1295,8 +1294,11 @@ class ForwardStepMixin(RouterReplayMixin):
 
     def rl_forward_step(self, seq_length: int):
         def fwd_output_and_loss_func(seq_length, data_iterator, model):
+            dyn_cp = self.dist_config.dynamic_context_parallel
             if isinstance(self.config, OnPolicyDistillConfig):
                 prepare_data_func = self.prepare_data.opd_train
+            elif dyn_cp:
+                prepare_data_func = self.prepare_data.grpo_train_with_dynamic_cp
             else:
                 prepare_data_func = self.prepare_data.grpo_train
 
@@ -1319,10 +1321,10 @@ class ForwardStepMixin(RouterReplayMixin):
                 for key in ["mask", "advantages", "prev_log_probs", "target"]:
                     assert key in batch
 
-                if not self.policy_config.ppo_pack_seq:
-                    parallel_logits = model(**fwd_kwargs)
-                else:
+                if self.policy_config.ppo_pack_seq and not dyn_cp:
                     parallel_logits = gptmodel_pack_foward(unwrapped_model, batch, fwd_kwargs)
+                else:
+                    parallel_logits = model(**fwd_kwargs)
 
                 if isinstance(parallel_logits, tuple):
                     parallel_logits = parallel_logits[0]
@@ -1343,11 +1345,13 @@ class ForwardStepMixin(RouterReplayMixin):
 
                     parallel_logits_clone = parallel_logits.clone()
                     advantages = advantages.float()
+                    ignore_cp = self.policy_config.ppo_pack_seq or dyn_cp
 
                     curr_log_probs = from_parallel_logits_to_logprobs(
                         vocab_parallel_logits=parallel_logits,
                         target=target,
-                        ignore_cp=self.policy_config.ppo_pack_seq,
+                        ignore_cp=ignore_cp,
+                        pre_shifted=dyn_cp,
                     )
 
                     # Top-K path: gather current model's log-probs at the
@@ -1372,7 +1376,7 @@ class ForwardStepMixin(RouterReplayMixin):
                     )
 
                     scaled_entropy, per_token_entropy = vocab_parallel_entropy(
-                        parallel_logits_clone, mask, ignore_cp=self.policy_config.ppo_pack_seq
+                        parallel_logits_clone, mask, ignore_cp=ignore_cp, pre_shifted=dyn_cp
                     )
 
                     dumped_topk_logprobs = None
@@ -1414,12 +1418,28 @@ class ForwardStepMixin(RouterReplayMixin):
                     bwd_loss, metrics_dict = policy_loss_fn(self.config, loss_input)
                     metrics_dict.update(im_end_metrics)
 
+                    if dyn_cp:
+                        # Each microbatch's tokens stay sharded across its local
+                        # CP group, so average the scalar report metrics over that
+                        # group (gradients are handled by finalize_model_grads).
+                        lcp = batch["local_cp_size"]
+                        lcp_val = lcp.item() if isinstance(lcp, torch.Tensor) else int(lcp)
+                        if lcp_val > 1:
+                            dyn_cp_group = mpu.get_dynamic_data_context_parallel_groups(
+                                group_size=lcp_val
+                            )
+                            for _v in metrics_dict.values():
+                                if isinstance(_v, torch.Tensor) and _v.dim() == 0:
+                                    torch.distributed.all_reduce(
+                                        _v, group=dyn_cp_group, op=torch.distributed.ReduceOp.AVG
+                                    )
+
                     if self.calc_per_token_loss:
                         total_tokens = mask.sum()
                         loss_sum = bwd_loss * total_tokens
 
                         cp_size = mpu.get_context_parallel_world_size()
-                        if cp_size > 1 and not self.policy_config.ppo_pack_seq:
+                        if cp_size > 1 and not ignore_cp:
                             per_rank_tokens = total_tokens / cp_size
                         else:
                             per_rank_tokens = total_tokens
@@ -1571,154 +1591,85 @@ class ForwardStepMixin(RouterReplayMixin):
         )
         metrics["dumped_loss_fn_metrics"] = dumped_loss_fn_metrics[0]
 
-    def _run_dyn_cp_training(
-        self,
-        batch: List[Dict[str, Any]],
-        num_microbatches: int,
-        *,
-        converter,
-        forward_step_func,
-        metric_prefix: str,
-        log_tag: str,
-        forward_only: bool = False,
-    ) -> Dict[str, Any]:
-        """Shared Dynamic CP pipeline for both RL (GRPO/PPO) and SFT paths.
-
-        Convert samples → run scheduler → fwd/bwd → aggregate per-microbatch
-        metrics on the last rank → broadcast to every rank over the CPU group.
-        """
-        # Dynamic CP currently does not support per-sample dump_metrics: the
-        # per-token fields are reshuffled across DPxCP via all_to_all and
-        # multiple original samples are packed into one THD microbatch, so the
-        # shape/order the dump path expects no longer holds.
-        assert not getattr(self, "should_dump_metrics", False), (
-            "Dynamic CP is not compatible with ppo_dump_metrics_interval > 0"
-        )
-        # MTP path is not yet wired through get_batch_for_dyn_cp.
-        assert self.config.policy.model_arch != "deepseek_v3", (
-            "Dynamic CP does not yet support MTP-using architectures (deepseek_v3)"
-        )
-
-        dyn_cp_cfg = self.dist_config
-        max_seqlen = dyn_cp_cfg.max_seqlen_per_dp_cp_rank
-        min_cp = dyn_cp_cfg.min_dynamic_context_parallel_size
-
-        log(
-            f"[{log_tag}] batch_size={len(batch)} max_seqlen_per_rank={max_seqlen} min_cp={min_cp}",
-            rank=0,
-        )
-
-        dyn_cp_samples = converter(batch)
-        max_seqlen_actual = max(int(s["original_seq_len"].item()) for s in dyn_cp_samples)
-        (
-            dyn_cp_data_iter,
-            dyn_cp_num_micro,
-            dyn_cp_seqlen_sum,
-            dyn_cp_seqlen_sq_sum,
-        ) = run_dyn_cp_schedule(
-            dyn_cp_samples,
-            num_microbatches,
-            max_seqlen_per_dp_cp_rank=max_seqlen,
-            min_cp_size=min_cp,
-        )
-        log(f"[{log_tag}] scheduled num_micro_batches={dyn_cp_num_micro}", rank=0)
-
-        metrics_micro_batch = get_forward_backward_func()(
-            forward_step_func=forward_step_func,
-            data_iterator=dyn_cp_data_iter,
-            model=self.model,
-            num_microbatches=dyn_cp_num_micro,
-            forward_only=forward_only,
-            seq_length=max_seqlen,
-            decoder_seq_length=max_seqlen,
-            micro_batch_size=1,
-        )
-
-        aggregated = self._aggregate_metrics(metrics_micro_batch)
-
-        metrics: Dict[str, Any] = {}
-        if is_last_rank():
-            metrics = {
-                f"{metric_prefix}/seq_length": max_seqlen_actual,
-                f"{metric_prefix}/dyn_cp_max_seqlen_per_rank": max_seqlen,
-                f"{metric_prefix}/dyn_cp_num_micro_batches": dyn_cp_num_micro,
-                f"{metric_prefix}/dyn_cp_seqlen_sum": dyn_cp_seqlen_sum,
-                f"{metric_prefix}/dyn_cp_seqlen_sq_sum": dyn_cp_seqlen_sq_sum,
-            }
-            for key, val in aggregated.items():
-                metrics[f"{metric_prefix}/{key}"] = val
-
-        obj_list = [metrics]
-        torch.distributed.broadcast_object_list(
-            obj_list, get_last_rank(cpu_group()), group=cpu_group()
-        )
-        result = obj_list[0]
-        return result
-
-    def _update_policy_dyn_cp(self, batch: List[Dict[str, Any]], num_microbatches: int):
-        """Policy update with Dynamic Context Parallel scheduling."""
-        return self._run_dyn_cp_training(
-            batch,
-            num_microbatches,
-            converter=convert_rl_samples_to_dyn_cp_format,
-            forward_step_func=self.rl_forward_step_dyn_cp(),
-            metric_prefix="policy",
-            log_tag="TRAIN-DYN-CP",
-            forward_only=False,
-        )
-
     def _update_policy(self, batch: List[Dict[str, Any]], num_microbatches: int):
-        if self.dist_config.dynamic_context_parallel:
-            return self._update_policy_dyn_cp(batch, num_microbatches)
-
         policy_config = self.policy_config
-
-        seq_length = get_batches_max_seqlen(batch, self.training_config.pad_to_mulitiple_of)
-        if policy_config.dynamic_mbs_target_seqlen is not None:
-            seq_length = get_max_seqlen_within_dp(seq_length)
-        else:
-            seq_length = get_max_seqlen_within_ep(seq_length)
-
+        dyn_cp = self.dist_config.dynamic_context_parallel
+        batch_size = len(batch)
         dynamic_num_microbatches = 0
         dynamic_mbs = 0
-        batch_size = len(batch)
+        dyn_cp_max_local_cp = None
 
-        if policy_config.dynamic_mbs_target_seqlen is not None:
-            dynamic_mbs = policy_config.dynamic_mbs_target_seqlen // seq_length * self.training_config.train_mbs
-            if dynamic_mbs == 0:
-                dynamic_mbs = 1
-            dynamic_mbs = min(policy_config.dynamic_mbs_limit, dynamic_mbs)
-            while dynamic_mbs >= 1:
-                if batch_size % dynamic_mbs == 0:
-                    dynamic_num_microbatches = batch_size // dynamic_mbs
-                    break
-                else:
-                    dynamic_mbs -= 1
-            if dynamic_num_microbatches > 0:
-                assert dynamic_num_microbatches * dynamic_mbs == batch_size, \
-                    f"{dynamic_mbs=} {dynamic_num_microbatches=} {batch_size=} mismatch!"
+        if dyn_cp:
+            assert not self.should_dump_metrics, (
+                "Dynamic CP is not compatible with ppo_dump_metrics_interval > 0"
+            )
+            assert self.config.policy.model_arch != "deepseek_v3", (
+                "Dynamic CP does not yet support MTP-using architectures (deepseek_v3)"
+            )
+            assert not isinstance(self.config, OnPolicyDistillConfig), (
+                "Dynamic CP does not yet support On-Policy Distill (OPD)"
+            )
+            # batch is already rerouted into packed THD microbatches upstream.
+            max_seqlens = []
+            local_cp_sizes = []
+            for b in batch:
+                # Use actual max sub-seqlen from packed microbatches.
+                ms = b.get('max_seqlen', None)
+                if ms is not None:
+                    max_seqlens.append(ms.item() if torch.is_tensor(ms) else int(ms))
+                lcp = b.get('local_cp_size', None)
+                if lcp is not None:
+                    local_cp_sizes.append(lcp.item() if torch.is_tensor(lcp) else int(lcp))
+            seq_length = max(max_seqlens) if max_seqlens else self.dist_config.max_seqlen_per_dp_cp_rank
+            dyn_cp_max_local_cp = max(local_cp_sizes) if local_cp_sizes else 1
+            actual_num_microbatches = num_microbatches
+            micro_batch_size = 1
+        else:
+            seq_length = get_batches_max_seqlen(batch, self.training_config.pad_to_mulitiple_of)
+            if policy_config.dynamic_mbs_target_seqlen is not None:
+                seq_length = get_max_seqlen_within_dp(seq_length)
+            else:
+                seq_length = get_max_seqlen_within_ep(seq_length)
 
-        enable_dynamic_mbs = True if dynamic_num_microbatches > 0 else False
+            if policy_config.dynamic_mbs_target_seqlen is not None:
+                dynamic_mbs = policy_config.dynamic_mbs_target_seqlen // seq_length * self.training_config.train_mbs
+                if dynamic_mbs == 0:
+                    dynamic_mbs = 1
+                dynamic_mbs = min(policy_config.dynamic_mbs_limit, dynamic_mbs)
+                while dynamic_mbs >= 1:
+                    if batch_size % dynamic_mbs == 0:
+                        dynamic_num_microbatches = batch_size // dynamic_mbs
+                        break
+                    else:
+                        dynamic_mbs -= 1
+                if dynamic_num_microbatches > 0:
+                    assert dynamic_num_microbatches * dynamic_mbs == batch_size, \
+                        f"{dynamic_mbs=} {dynamic_num_microbatches=} {batch_size=} mismatch!"
+
+            actual_num_microbatches = (
+                dynamic_num_microbatches if dynamic_num_microbatches > 0 else num_microbatches
+            )
+            micro_batch_size = (
+                dynamic_mbs if dynamic_num_microbatches > 0 else self.training_config.train_mbs
+            )
+
+        enable_dynamic_mbs = dynamic_num_microbatches > 0
         log(
             f"[TRAIN] {seq_length=} {batch_size=} {num_microbatches=} {enable_dynamic_mbs=} {dynamic_num_microbatches=} {dynamic_mbs=}",
             rank=0
         )
-
-        data_iter = get_iterator_k_split_list(
-            batch, dynamic_num_microbatches if enable_dynamic_mbs else num_microbatches
-        )
-
+        data_iter = get_iterator_k_split_list(batch, actual_num_microbatches)
         fwd_bwd_function = get_forward_backward_func()
 
         metrics_micro_batch = fwd_bwd_function(
             forward_step_func=self.rl_forward_step(seq_length),
             data_iterator=data_iter,
             model=self.model,
-            num_microbatches=dynamic_num_microbatches if enable_dynamic_mbs else num_microbatches,
+            num_microbatches=actual_num_microbatches,
             forward_only=False,
             seq_length=seq_length,
             decoder_seq_length=seq_length,
-            micro_batch_size=dynamic_mbs if enable_dynamic_mbs else self.training_config.train_mbs,
+            micro_batch_size=micro_batch_size,
         )
 
         metrics = {}
@@ -1757,17 +1708,26 @@ class ForwardStepMixin(RouterReplayMixin):
                     token_level_accumulated[key] = values.sum(dim=0)
                 else:
                     # [scalar, ...] metrics
-                    scalar_accumulated[key] = values.mean()
+                    if key.endswith("_min"):
+                        scalar_accumulated[key] = values.min()
+                    elif key.endswith("_max"):
+                        scalar_accumulated[key] = values.max()
+                    else:
+                        scalar_accumulated[key] = values.mean()
 
             if token_level_accumulated:
                 tk_keys = sorted(token_level_accumulated.keys())
                 all_vals = torch.stack([token_level_accumulated[k] for k in tk_keys])
-                torch.distributed.all_reduce(all_vals, group=mpu.get_data_parallel_group())
+                torch.distributed.all_reduce(
+                    all_vals, group=mpu.get_data_parallel_group(with_context_parallel=dyn_cp)
+                )
                 for i, k in enumerate(tk_keys):
                     token_level_accumulated[k] = all_vals[i]
 
             if is_last_rank():
                 metrics = {"policy/seq_length": seq_length}
+                if dyn_cp_max_local_cp is not None:
+                    metrics["policy/dyn_cp_local_cp_max"] = dyn_cp_max_local_cp
                 for key, val in token_level_accumulated.items():
                     metric_key = key if key.startswith("eos/") else f"policy/{key}"
                     metrics[metric_key] = (val[0] / val[1].clamp(min=1)).cpu().item()
@@ -1775,9 +1735,7 @@ class ForwardStepMixin(RouterReplayMixin):
                     metric_key = key if key.startswith("eos/") else f"policy/{key}"
                     metrics[metric_key] = val.cpu().item()
 
-        aux_metrics = self._collect_aux_metrics(
-            dynamic_num_microbatches if enable_dynamic_mbs else num_microbatches
-        )
+        aux_metrics = self._collect_aux_metrics(actual_num_microbatches)
         metrics.update(aux_metrics)
         obj_list = [metrics]
         torch.distributed.broadcast_object_list(
@@ -2220,9 +2178,12 @@ class ForwardStepMixin(RouterReplayMixin):
             collect_non_loss_data=True,
             decoder_seq_length=seq_length,
         )
+        values = torch.cat(values_list).squeeze(-1) if len(values_list) > 0 else None
+        if values is not None and mpu.get_context_parallel_world_size() > 1:
+            values = all_gather_from_context_parallel_region(values)
+
         # [bs, seq_len - 1]
-        values = torch.cat(values_list).squeeze(-1
-                                               )[:, :-1].clone() if len(values_list) > 0 else None
+        values = values[:, :-1].clone() if values is not None else None
 
         # Broadcast it from last PP stage to everything else.
         values = BroadcastUtils.broadcast_2d_tensor_within_pp(values)
@@ -2260,7 +2221,10 @@ class ForwardStepMixin(RouterReplayMixin):
 
             def loss_func(values):
                 # [bs, seq_len - 1]
-                values = values.squeeze(dim=-1)[:, :-1]
+                values = values.squeeze(dim=-1)
+                if mpu.get_context_parallel_world_size() > 1 and not self.policy_config.ppo_pack_seq:
+                    values = all_gather_from_context_parallel_region(values)
+                values = values[:, :-1]
                 fn = get_policy_loss_fn("ppo_value_loss")
                 old_values = batch["values"]
                 returns = batch["returns"]

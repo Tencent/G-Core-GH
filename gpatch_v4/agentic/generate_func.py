@@ -1,4 +1,3 @@
-import copy
 import uuid
 from typing import Any, Dict, List, Tuple
 
@@ -38,7 +37,15 @@ class SamplerGenerateFuncAgentic(SamplerGenerateFunc):
             logit_bias=logit_bias,
         )
 
-        tmp_sampling_params = copy.deepcopy(sampling_params)
+        seed_offset_raw = batched_data.get("seed_offset", None)
+        if seed_offset_raw is not None:
+            assert isinstance(seed_offset_raw, list) and len(seed_offset_raw) == 1
+            seed_offset = int(seed_offset_raw[0])
+        else:
+            seed_offset = None
+        tmp_sampling_params = infer_engine.copy_sampling_params_with_seed_offset(
+            sampling_params, seed_offset
+        )
 
         # 支持 caller (e.g. TrajEnvManager._make_decision) 按需 cap 单次请求的 max_new_tokens，
         # 用来从源头保证 trajectory 累计 tokens 不超过 seq_length。
@@ -48,7 +55,14 @@ class SamplerGenerateFuncAgentic(SamplerGenerateFunc):
             assert isinstance(override_max_new_tokens, list) and len(override_max_new_tokens) == 1
             override = int(override_max_new_tokens[0])
             assert override > 0, f"max_new_tokens must be positive, got {override}"
-            tmp_sampling_params.max_new_tokens = min(tmp_sampling_params.max_new_tokens, override)
+            # vllm 用 max_tokens，sglang 用 max_new_tokens，自动兼容两种 backend
+            _max_tokens_field = "max_new_tokens" if hasattr(
+                tmp_sampling_params, "max_new_tokens"
+            ) else "max_tokens"
+            setattr(
+                tmp_sampling_params, _max_tokens_field,
+                min(getattr(tmp_sampling_params, _max_tokens_field), override)
+            )
 
         llm_input = dict(prompt_token_ids=prompt_token_ids)
         if images is not None:

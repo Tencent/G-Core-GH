@@ -72,6 +72,9 @@ def get_tool_parser(name: str) -> type[BaseToolParser]:
     return TOOL_PARSER_REGISTRY[register_name]
 
 
-from gpatch_v4.agentic.tools.tool_parsers.sglang_tool_parsers import SGLangToolParser
+try:
+    from gpatch_v4.agentic.tools.tool_parsers.sglang_tool_parsers import SGLangToolParser  # noqa: F401
+except ImportError:
+    pass  # sglang not installed; SGLangToolParser unavailable
 
 __all__ = ["BaseToolParser", "register_tool_parser", "get_tool_parser"]

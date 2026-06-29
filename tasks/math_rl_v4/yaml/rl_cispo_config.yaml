@@ -1,0 +1,110 @@
+# @package _global_
+
+training:
+  training_backend: mcore
+  use_gen_rm_reward: False
+  use_bt_rm_reward: True
+  use_fast_tokenizer: True
+  rollout_gbs: 256
+  rollout_mbs: 1
+  sampling_repeat_n: 8
+  sampling_keep_n: 8
+  train_gbs: 256
+  train_mbs: 1
+  data_parallel_random_init: False
+  save_interval: 100
+  eval_interval: 0
+  eval_before_train: False
+  build_from_mbridge: True
+  num_train_epoches: 1
+  ppo_max_epochs_2: 1
+  seq_length: 10240
+  metrics_report:
+    - "acc_reward"
+    - "fmt_reward"
+
+checkpoint:
+  load_ckpt_path: qwen3_4b_dapo17k_cispo
+  save_ckpt_path: qwen3_4b_dapo17k_cispo
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 1.0e-6
+  lr_warmup_steps: 2
+  lr_decay_style: "cosine"
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "hf-hub/zhuzilin/dapo-math-17k/"
+
+  py_path: "tasks/math_rl_v4/dapo_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, overlong response will be penalized, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+policy:
+  dist_config:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+  model_arch: qwen3
+  hf_model_path: "hf-hub/Qwen/Qwen3-4B"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3-4B"
+  ref_hf_model_path: "hf-hub/Qwen/Qwen3-4B"
+  sampler_client:
+    rpc_type: ray
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+  balance_dp_seqlen: True
+  smart_pad_infer: True
+  smart_pad_train: True
+
+sampler:
+  backend: sglang
+  model_info:
+    - model_arch: qwen3
+      hf_model_path: "hf-hub/Qwen/Qwen3-4B"
+
+  infer_engine_configs:
+    - dist_config:
+        tensor_model_parallel_size: 2
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.7
+      max_running_requests: 128
+      temperature: 1.0
+      top_p: 1.0
+      generate_max_tokens: 8192
+
+bt_rm:
+  reward_type: "rule_only"
+  reward_model_info:
+    - model_arch: "qwen3"
+      hf_model_path: "hf-hub/Qwen/Qwen3-4B"
+      reward_py_path: tasks/math_rl_v4/bt_reward_dapo.py
+      parse_reward_fn_name: dapo_math_rule_reward
+      reward_weight: 1.0
+  infer_engine_configs:
+    - dist_config:
+        nnodes: -1
+
+ppo:
+  advantage_type: "grpo"
+  loss_func: "cispo"
+  grpo_advantage_epsilon: 1.0e-4
+  grpo_kl_loss_beta: 0.0
+  ppo_ratio_eps: 0.0
+  ppo_clip_ratio_low: 10
+  ppo_clip_ratio_high: 0.2
+  ppo_entropy_bonus: 0.0
+  ppo_logps_ratio_clamp: 20.0
+
+debug:
+  save_first_rollout_data: True
+  debug_engine_update_weight: False

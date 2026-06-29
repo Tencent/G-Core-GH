@@ -23,6 +23,7 @@ def myfa_sw_sinks_fwd(
     is_causal=True,
     window_size=None,
     has_sinks=True,
+    has_q_offsets=False,
     dtype=torch.bfloat16,
     acc_dtype=torch.float32,
     threads=128,
@@ -32,6 +33,7 @@ def myfa_sw_sinks_fwd(
 ):
     assert D == tl.math.next_power_of_2(D)
     if window_size is not None:
+        assert is_causal, "non-causal + sliding window is not supported"
         assert window_size % BLOCK_K == 0
     groups = HQ // HK
     B = T.dynamic('B', torch.int32)
@@ -44,12 +46,11 @@ def myfa_sw_sinks_fwd(
         K: T.Tensor((B, LK, HK, D), dtype),
         V: T.Tensor((B, LK, HK, D), dtype),
         SINKS: T.Tensor((HQ, ), dtype),
+        Q_OFFSETS: T.Tensor((B, ), torch.int32),
         O: T.Tensor((B, LQ, HQ, D), dtype),
         LSE: T.Tensor((B, HQ, LQ), acc_dtype),
     ):
         with T.Kernel(B, HQ, T.ceildiv(LQ, BLOCK_Q), threads=threads) as (b_i, h_i, q_idx):
-            kv_h_i = h_i // groups
-
             q = T.alloc_shared((BLOCK_Q, D), dtype)
             k = T.alloc_shared((BLOCK_K, D), dtype)
             v = T.alloc_shared((BLOCK_K, D), dtype)
@@ -70,24 +71,25 @@ def myfa_sw_sinks_fwd(
                 sinks = T.alloc_fragment((BLOCK_Q, ), dtype)
                 for i in T.Parallel(BLOCK_Q):
                     sinks[i] = SINKS[h_i]
+            kv_h_i = h_i // groups
 
             q_beg = q_idx * BLOCK_Q
             q_end = q_beg + BLOCK_Q
             T.copy(Q[b_i, q_beg:q_end, h_i, :], q)
+            if has_q_offsets:
+                q_offset = Q_OFFSETS[b_i]
+            else:
+                q_offset = LK - LQ
 
             if is_causal:
                 if window_size is not None:
-                    k_loop_start = T.max(0, (q_beg - window_size + 1) // BLOCK_K)
+                    k_loop_start = T.max(0, (q_offset + q_beg - window_size + 1) // BLOCK_K)
                 else:
                     k_loop_start = 0
-                k_loop_end = T.min(T.ceildiv(q_end, BLOCK_K), T.ceildiv(LK, BLOCK_K))
+                k_loop_end = T.min(T.ceildiv(q_offset + q_end, BLOCK_K), T.ceildiv(LK, BLOCK_K))
             else:
-                if window_size is not None:
-                    k_loop_start = T.max(0, (q_beg - window_size + 1) // BLOCK_K)
-                else:
-                    k_loop_start = 0
+                k_loop_start = 0
                 k_loop_end = T.ceildiv(LK, BLOCK_K)
-
             loop_range = k_loop_end - k_loop_start
 
             for k_local in T.Pipelined(loop_range, num_stages=num_stages):
@@ -101,33 +103,27 @@ def myfa_sw_sinks_fwd(
                     if window_size is not None:
                         for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
                             acc_s[i, j] = T.if_then_else(
-                                (k_beg + j < LK) and (q_beg + i >= k_beg + j) and
-                                (k_beg + j >= q_beg + i - window_size + 1),
+                                (k_beg + j < LK) and (q_beg + i < LQ) and
+                                (q_beg + i + q_offset >= k_beg + j) and
+                                (k_beg + j >= q_beg + i + q_offset - window_size + 1),
                                 0.0,
                                 -T.infinity(acc_s.dtype),
                             )
                     else:
                         for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
                             acc_s[i, j] = T.if_then_else(
-                                (k_beg + j < LK) and (q_beg + i >= k_beg + j),
+                                (k_beg + j < LK) and (q_beg + i < LQ) and
+                                (q_beg + i + q_offset >= k_beg + j),
                                 0.0,
                                 -T.infinity(acc_s.dtype),
                             )
                 else:
-                    if window_size is not None:
-                        for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
-                            acc_s[i, j] = T.if_then_else(
-                                (k_beg + j < LK) and (k_beg + j >= q_beg + i - window_size + 1),
-                                0.0,
-                                -T.infinity(acc_s.dtype),
-                            )
-                    else:
-                        for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
-                            acc_s[i, j] = T.if_then_else(
-                                k_beg + j < LK,
-                                0.0,
-                                -T.infinity(acc_s.dtype),
-                            )
+                    for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
+                        acc_s[i, j] = T.if_then_else(
+                            (k_beg + j < LK) and (q_beg + i < LQ),
+                            0.0,
+                            -T.infinity(acc_s.dtype),
+                        )
 
                 # s = qk^T
                 T.gemm(q, k, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
@@ -158,7 +154,7 @@ def myfa_sw_sinks_fwd(
                 T.copy(acc_s, acc_s_cast)
 
                 # l(SE) and fix l
-                T.reduce_sum(acc_s, tmp_sum, dim=1, clear=True)  # sum exp(s)
+                T.reduce_sum(acc_s, tmp_sum, dim=1, clear=True)
                 for i in T.Parallel(BLOCK_Q):
                     se[i] = se[i] * alpha[i] + tmp_sum[i]
 
@@ -284,6 +280,7 @@ def myfa_sw_sinks_bwd(
     scaling=1.0,
     is_causal=True,
     window_size=None,
+    has_q_offsets=False,
     dtype=torch.bfloat16,
     acc_dtype=torch.float32,
     threads=128,
@@ -293,6 +290,7 @@ def myfa_sw_sinks_bwd(
 ):
     assert D == tl.math.next_power_of_2(D)
     if window_size is not None:
+        assert is_causal, "non-causal + sliding window is not supported"
         assert window_size % BLOCK_K == 0
     groups = HQ // HK
     B = T.dynamic('B', torch.int32)
@@ -304,6 +302,7 @@ def myfa_sw_sinks_bwd(
         Q: T.Tensor((B, LQ, HQ, D), dtype),
         K: T.Tensor((B, LK, HK, D), dtype),
         V: T.Tensor((B, LK, HK, D), dtype),
+        Q_OFFSETS: T.Tensor((B, ), torch.int32),
         LSE: T.Tensor((B, HQ, LQ), acc_dtype),
         dO: T.Tensor((B, LQ, HQ, D), dtype),
         DELTA: T.Tensor((B, HQ, LQ), acc_dtype),
@@ -312,8 +311,6 @@ def myfa_sw_sinks_bwd(
         dV: T.Tensor((B, LK, HK, D), acc_dtype),
     ):
         with T.Kernel(B, HQ, T.ceildiv(LK, BLOCK_K), threads=threads) as (b_i, h_i, k_idx):
-            kv_h_i = h_i // groups
-
             q = T.alloc_shared((BLOCK_Q, D), dtype)
             k = T.alloc_shared((BLOCK_K, D), dtype)
             v = T.alloc_shared((BLOCK_K, D), dtype)
@@ -331,23 +328,27 @@ def myfa_sw_sinks_bwd(
 
             k_beg = k_idx * BLOCK_K
             k_end = k_beg + BLOCK_K
+            kv_h_i = h_i // groups
             T.copy(K[b_i, k_beg:k_end, kv_h_i, :], k)
             T.copy(V[b_i, k_beg:k_end, kv_h_i, :], v)
             T.clear(dk)
             T.clear(dv)
+            if has_q_offsets:
+                q_offset = Q_OFFSETS[b_i]
+            else:
+                q_offset = LK - LQ
 
             if is_causal:
-                q_loop_start = k_beg // BLOCK_Q
+                q_loop_start = T.max(0, (k_beg - q_offset) // BLOCK_Q)
             else:
                 q_loop_start = 0
             if window_size is not None:
                 q_loop_end = T.min(
-                    T.ceildiv(k_end + window_size, BLOCK_Q),
+                    T.ceildiv(k_end - q_offset + window_size, BLOCK_Q),
                     T.ceildiv(LQ, BLOCK_Q),
                 )
             else:
                 q_loop_end = T.ceildiv(LQ, BLOCK_Q)
-
             loop_range = q_loop_end - q_loop_start
 
             for q_local in T.Pipelined(loop_range, num_stages=num_stages):
@@ -372,33 +373,27 @@ def myfa_sw_sinks_bwd(
                     if window_size is not None:
                         for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
                             p[i, j] = T.if_then_else(
-                                (k_beg + j < LK) and (q_beg + i >= k_beg + j) and
-                                (k_beg + j >= q_beg + i - window_size + 1),
+                                (k_beg + j < LK) and (q_beg + i < LQ) and
+                                (q_beg + i + q_offset >= k_beg + j) and
+                                (k_beg + j >= q_beg + i + q_offset - window_size + 1),
                                 p[i, j],
                                 0.,
                             )
                     else:
                         for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
                             p[i, j] = T.if_then_else(
-                                (k_beg + j < LK) and (q_beg + i >= k_beg + j),
+                                (k_beg + j < LK) and (q_beg + i < LQ) and
+                                (q_beg + i + q_offset >= k_beg + j),
                                 p[i, j],
                                 0.,
                             )
                 else:
-                    if window_size is not None:
-                        for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
-                            p[i, j] = T.if_then_else(
-                                (k_beg + j < LK) and (k_beg + j >= q_beg + i - window_size + 1),
-                                p[i, j],
-                                0.,
-                            )
-                    else:
-                        for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
-                            p[i, j] = T.if_then_else(
-                                k_beg + j < LK,
-                                p[i, j],
-                                0.,
-                            )
+                    for i, j in T.Parallel(BLOCK_Q, BLOCK_K):
+                        p[i, j] = T.if_then_else(
+                            (k_beg + j < LK) and (q_beg + i < LQ),
+                            p[i, j],
+                            0.,
+                        )
 
                 # dP = dO @ V^T
                 T.copy(dO[b_i, q_beg:q_end, h_i, :], do)
@@ -438,16 +433,20 @@ def myfa_sw_sinks_bwd(
 
 class MyfaSwSinks(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, sinks, is_causal, window_size):
+    def forward(ctx, q, k, v, sinks, q_offsets, is_causal, window_size):
         b, sq, HQ, d = q.shape
         _, sk, HK, _ = k.shape
+        assert is_causal or window_size is None, "non-causal + sliding window is not supported"
         # TODO @astrachang 我晚点会去掉这个限制
         assert sq % 64 == 0, f"seq_len_q={sq} must be divisible by BLOCK_Q (64)"
         assert sk % 64 == 0, f"seq_len_k={sk} must be divisible by BLOCK_K (64)"
         scaling = 1.0 / math.sqrt(d)
         has_sinks = sinks is not None
+        has_q_offsets = q_offsets is not None
         if not has_sinks:
             sinks = torch.empty(HQ, dtype=q.dtype, device=q.device)
+        if not has_q_offsets:
+            q_offsets = torch.empty(b, dtype=torch.int32, device=q.device)
         fwd_kernel = myfa_sw_sinks_fwd.compile(
             HQ=HQ,
             HK=HK,
@@ -456,23 +455,26 @@ class MyfaSwSinks(torch.autograd.Function):
             is_causal=is_causal,
             window_size=window_size,
             has_sinks=has_sinks,
+            has_q_offsets=has_q_offsets,
         )
-        o, lse = fwd_kernel(q, k, v, sinks)
-        ctx.save_for_backward(q, k, v, sinks, o, lse)
+        o, lse = fwd_kernel(q, k, v, sinks, q_offsets)
+        ctx.save_for_backward(q, k, v, sinks, q_offsets, o, lse)
         ctx.scaling = scaling
         ctx.is_causal = is_causal
         ctx.window_size = window_size
         ctx.has_sinks = has_sinks
+        ctx.has_q_offsets = has_q_offsets
         return o
 
     @staticmethod
     def backward(ctx, dO):
-        q, k, v, sinks, o, lse = ctx.saved_tensors
+        q, k, v, sinks, q_offsets, o, lse = ctx.saved_tensors
         _, _, HQ, d = q.shape
         HK = k.shape[2]
         scaling = ctx.scaling
         is_causal = ctx.is_causal
         window_size = ctx.window_size
+        has_q_offsets = ctx.has_q_offsets
         dt = q.dtype
 
         bwd_pre_kernel = myfa_sw_sinks_bwd_pre.compile(HQ=HQ, D=d, dtype=dt)
@@ -485,6 +487,7 @@ class MyfaSwSinks(torch.autograd.Function):
             scaling=scaling,
             is_causal=is_causal,
             window_size=window_size,
+            has_q_offsets=has_q_offsets,
             dtype=dt,
         )
         dQ = torch.zeros_like(q, dtype=torch.float32)
@@ -504,7 +507,7 @@ class MyfaSwSinks(torch.autograd.Function):
             dtype=torch.float32,
             device=q.device,
         )
-        bwd_kernel(q, k, v, lse, dO, delta, dQ, dK, dV)
+        bwd_kernel(q, k, v, q_offsets, lse, dO, delta, dQ, dK, dV)
         dQ = dQ.to(q.dtype)
         dK = dK.to(k.dtype)
         dV = dV.to(v.dtype)
@@ -514,8 +517,8 @@ class MyfaSwSinks(torch.autograd.Function):
             dsink_kernel = myfa_sw_sinks_bwd_dsink.compile(HQ=HQ, dtype=dt)
             dsinks = dsink_kernel(sinks, delta, lse).sum(0).sum(1)
 
-        return dQ, dK, dV, dsinks, None, None
+        return dQ, dK, dV, dsinks, None, None, None
 
 
-def myfa_sw_sinks(q, k, v, sinks=None, is_causal=True, window_size=None):
-    return MyfaSwSinks.apply(q, k, v, sinks, is_causal, window_size)
+def myfa_sw_sinks(q, k, v, sinks=None, q_offsets=None, is_causal=True, window_size=None):
+    return MyfaSwSinks.apply(q, k, v, sinks, q_offsets, is_causal, window_size)

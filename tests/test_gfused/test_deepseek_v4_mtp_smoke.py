@@ -267,13 +267,23 @@ def _mtp_smoke_worker(
 
     # ----- Compute MTP loss only (we are testing MTP, not the main LM) -----
     loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
-    mtp_total_loss, mtp_per_depth_loss, _, _ = calculate_mtp_loss(
+    mtp_depth_nums = calculate_mtp_loss(
         mtp_per_depth_h=outputs.mtp_per_depth_h,
         labels=full_labels,
         lm_head=model.lm_head,
         loss_fct=loss_fct,
         loss_mask=None,
-        scaling_factor=float(config.mtp_loss_scaling_factor),
+    )
+    # Build per-depth loss and total from numerators (single rank, no CP,
+    # so local valid-token count == global denominator).
+    mtp_per_depth_loss = []
+    for num in mtp_depth_nums:
+        den = (full_labels != -100).sum().float().clamp_min(1.0)
+        mtp_per_depth_loss.append(num / den)
+    mtp_scale = float(config.mtp_loss_scaling_factor)
+    mtp_total_loss = (
+        torch.stack(mtp_per_depth_loss).sum()
+        * (mtp_scale / max(len(mtp_per_depth_loss), 1))
     )
     assert torch.isfinite(mtp_total_loss), (
         f"MTP total loss not finite: {mtp_total_loss.item()}"
@@ -356,6 +366,383 @@ def _mtp_smoke_worker(
     }
 
     del model, outputs, optimizer
+    torch.cuda.empty_cache()
+    dist.destroy_process_group()
+    return result
+
+
+def _make_fake_segments(fake_seq_lens, tokenizer, device, seed=42):
+    """Generate deterministic fake segments (shared by BSHD and THD workers)."""
+    pad_id = tokenizer.pad_token_id
+    vocab = tokenizer.vocab_size
+    ids_list, labels_list = [], []
+    for i, s in enumerate(fake_seq_lens):
+        rng = torch.Generator().manual_seed(seed + i)
+        ids = torch.randint(0, vocab, (s,), generator=rng).to(device)
+        ids = torch.where(ids == pad_id, (ids + 1) % vocab, ids)
+        lab = torch.roll(ids, shifts=-1)
+        lab[-1] = -100
+        ids_list.append(ids)
+        labels_list.append(lab)
+    return ids_list, labels_list
+
+
+def _build_model_for_mtp(hf_model_path, ep_2d_mesh, cp_mesh=None):
+    config = DeepseekV4Config.from_pretrained(hf_model_path)
+    _truncate_config(config)
+    config.mtp_loss_scaling_factor = 0.1
+    prev_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    try:
+        with torch.device("meta"):
+            model = DeepseekV4ForCausalLM(config)
+    finally:
+        torch.set_default_dtype(prev_dtype)
+    model = apply_hp(model, ep_2d_mesh, cp_mesh=cp_mesh, amp_fp32=False)
+    model.gradient_checkpointing_enable()
+    model.load_checkpoint_hp(hf_model_path)
+    model.train()
+    return model, config
+
+
+@ray.remote(num_gpus=1)
+def _mtp_bshd_perseg_worker(
+    hf_model_path: str,
+    rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
+    ep_size: int,
+    fake_seq_lens: list[int],
+    seed: int = 42,
+) -> dict:
+    """BSHD baseline: per-segment independent forward, accumulate MTP loss.
+
+    Captures per-segment routing decisions and concatenates them into
+    ``[T_TOTAL, top_k]`` per router layer for THD replay.
+    """
+    from gpatch_v4.models.deepseek_v4.router_replay import capture_routing_decisions
+
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
+    torch.cuda.set_device(0)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    ep_2d_mesh = init_device_mesh(
+        "cuda",
+        mesh_shape=(world_size // ep_size, ep_size),
+        mesh_dim_names=("ep_fsdp", "ep"),
+    )
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    ids_list, labels_list = _make_fake_segments(
+        fake_seq_lens, tokenizer, torch.device("cuda"), seed,
+    )
+    model, config = _build_model_for_mtp(hf_model_path, ep_2d_mesh)
+    pad_mul = max(config.compress_rates.values())
+    loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+    mtp_scale = float(config.mtp_loss_scaling_factor)
+
+    total_n_valid = torch.zeros((), device="cuda")
+    for lab in labels_list:
+        masked_lab = lab.clone()
+        masked_lab[-1] = -100
+        total_n_valid += (masked_lab != -100).sum()
+
+    accum_depth_loss_vals: list[float] = []
+    reported_loss = 0.0
+    per_seg_routing: list[list[torch.Tensor]] = []
+    for seg_i, (ids, lab) in enumerate(zip(ids_list, labels_list)):
+        s = ids.shape[0]
+        s_padded = ((s + pad_mul - 1) // pad_mul) * pad_mul
+        seg_ids = torch.full((1, s_padded), tokenizer.pad_token_id, dtype=torch.long, device="cuda")
+        seg_labels = torch.full((1, s_padded), -100, dtype=torch.long, device="cuda")
+        seg_ids[0, :s] = ids
+        seg_labels[0, :s] = lab
+        seg_labels[0, s - 1] = -100
+
+        with capture_routing_decisions(model) as recorded:
+            outputs = model(input_ids=seg_ids)
+        assert outputs.mtp_per_depth_h is not None
+        per_seg_routing.append([t.detach().cpu() for t in recorded if t is not None])
+
+        depth_nums = calculate_mtp_loss(
+            mtp_per_depth_h=outputs.mtp_per_depth_h,
+            labels=seg_labels,
+            lm_head=model.lm_head,
+            loss_fct=loss_fct,
+            loss_mask=None,
+            cp_group=None,
+        )
+        seg_depth_losses = [num / total_n_valid for num in depth_nums]
+        seg_mtp_loss = (
+            torch.stack(seg_depth_losses).sum()
+            * (mtp_scale / max(len(seg_depth_losses), 1))
+        )
+        seg_mtp_loss.backward()
+        reported_loss += seg_mtp_loss.item()
+        if not accum_depth_loss_vals:
+            accum_depth_loss_vals = [d.item() for d in seg_depth_losses]
+        else:
+            for d_i, d in enumerate(seg_depth_losses):
+                accum_depth_loss_vals[d_i] += d.item()
+
+    total_grad_norm = model.clip_grad_norm_(2.0)
+
+    # cat 段→T 维度：[seg][router_layer] → [router_layer][T_TOTAL, top_k]
+    n_router_layers = len(per_seg_routing[0])
+    recorded_routing = []
+    for layer_i in range(n_router_layers):
+        recorded_routing.append(
+            torch.cat([per_seg_routing[s][layer_i] for s in range(len(per_seg_routing))], dim=0)
+        )
+
+    result = {
+        "rank": rank,
+        "mtp_total_loss": reported_loss,
+        "mtp_per_depth_loss": accum_depth_loss_vals,
+        "total_grad_norm": total_grad_norm,
+        "recorded_routing": recorded_routing,
+    }
+    print(
+        f"[mtp_bshd_perseg] rank {rank}: mtp_total_loss={reported_loss:.6f}, "
+        f"total_grad_norm={total_grad_norm:.4f}, "
+        f"n_router_layers={n_router_layers}"
+    )
+    del model, outputs
+    torch.cuda.empty_cache()
+    dist.destroy_process_group()
+    return result
+
+
+@ray.remote(num_gpus=1)
+def _mtp_thd_worker(
+    hf_model_path: str,
+    rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
+    ep_size: int,
+    fake_seq_lens: list[int],
+    seed: int = 42,
+    replay_indices: list[torch.Tensor] | None = None,
+) -> dict:
+    """MTP + THD pack-seq: pack multiple segments, run forward + MTP loss bwd.
+
+    When ``replay_indices`` is provided (``[router_layer][T_TOTAL, top_k]``),
+    forces the same routing decisions as the BSHD baseline.
+    """
+    from contextlib import nullcontext
+
+    from gpatch_v4.models.deepseek_v4.router_replay import router_replay_ctx
+    from gpatch_v4.models.deepseek_v4.thd import pack_sequences
+
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
+    torch.cuda.set_device(0)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    ep_2d_mesh = init_device_mesh(
+        "cuda",
+        mesh_shape=(world_size // ep_size, ep_size),
+        mesh_dim_names=("ep_fsdp", "ep"),
+    )
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    ids_list, labels_list = _make_fake_segments(
+        fake_seq_lens, tokenizer, torch.device("cuda"), seed,
+    )
+    model, config = _build_model_for_mtp(hf_model_path, ep_2d_mesh)
+    pad_mul = max(config.compress_rates.values())
+
+    packed_ids, packed_pos, packed_labels, psp = pack_sequences(
+        ids_list, labels_list,
+        config=config,
+        pad_to_multiple_of=pad_mul,
+        cp_size=1,
+        pad_token_id=tokenizer.pad_token_id,
+        label_ignore_index=-100,
+    )
+
+    if replay_indices is not None and len(replay_indices) > 0:
+        cuda_replay = [t.cuda() for t in replay_indices]
+        ctx = router_replay_ctx(model, cuda_replay)
+    else:
+        ctx = nullcontext()
+
+    with ctx:
+        outputs = model(
+            input_ids=packed_ids,
+            position_ids=packed_pos,
+            packed_seq_params=psp,
+        )
+        assert outputs.mtp_per_depth_h is not None
+
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+        mtp_scale = float(config.mtp_loss_scaling_factor)
+        n_valid = (packed_labels != -100).sum().float().clamp_min(1.0)
+
+        mtp_depth_nums = calculate_mtp_loss(
+            mtp_per_depth_h=outputs.mtp_per_depth_h,
+            labels=packed_labels,
+            lm_head=model.lm_head,
+            loss_fct=loss_fct,
+            loss_mask=None,
+            cp_group=None,
+            packed_seq_params=psp,
+        )
+        mtp_per_depth_loss = [num / n_valid for num in mtp_depth_nums]
+        mtp_total_loss = (
+            torch.stack(mtp_per_depth_loss).sum()
+            * (mtp_scale / max(len(mtp_per_depth_loss), 1))
+        )
+        mtp_total_loss.backward()
+    total_grad_norm = model.clip_grad_norm_(2.0)
+
+    result = {
+        "rank": rank,
+        "mtp_total_loss": mtp_total_loss.item(),
+        "mtp_per_depth_loss": [x.item() for x in mtp_per_depth_loss],
+        "total_grad_norm": total_grad_norm,
+    }
+    print(
+        f"[mtp_thd] rank {rank}: mtp_total_loss={mtp_total_loss.item():.6f}, "
+        f"total_grad_norm={total_grad_norm:.4f}"
+    )
+    del model, outputs
+    torch.cuda.empty_cache()
+    dist.destroy_process_group()
+    return result
+
+
+CP_SIZE_FOR_MTP_CP_TEST = 4
+
+
+@ray.remote(num_gpus=1)
+def _mtp_thd_cp_worker(
+    hf_model_path: str,
+    rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
+    ep_size: int,
+    cp_size: int,
+    fake_seq_lens: list[int],
+    seed: int = 42,
+    replay_indices: list[torch.Tensor] | None = None,
+) -> dict:
+    """MTP + THD + CP: pack segments, CP-chunk, run forward + MTP loss bwd."""
+    from contextlib import nullcontext
+
+    from gpatch_v4.models.deepseek_v4.cp import cp_chunk_data
+    from gpatch_v4.models.deepseek_v4.router_replay import router_replay_ctx
+    from gpatch_v4.models.deepseek_v4.thd import pack_sequences
+
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
+    torch.cuda.set_device(0)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    ep_2d_mesh = init_device_mesh(
+        "cuda",
+        mesh_shape=(world_size // ep_size, ep_size),
+        mesh_dim_names=("ep_fsdp", "ep"),
+    )
+    cp_full_mesh = init_device_mesh(
+        "cuda",
+        mesh_shape=(world_size // cp_size, cp_size),
+        mesh_dim_names=("dp", "cp"),
+    )
+    cp_mesh = cp_full_mesh["cp"]
+
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    ids_list, labels_list = _make_fake_segments(
+        fake_seq_lens, tokenizer, torch.device("cuda"), seed,
+    )
+    model, config = _build_model_for_mtp(hf_model_path, ep_2d_mesh, cp_mesh=cp_mesh)
+    pad_mul = max(config.compress_rates.values())
+
+    packed_ids, packed_pos, packed_labels, psp = pack_sequences(
+        ids_list, labels_list,
+        config=config,
+        pad_to_multiple_of=pad_mul,
+        cp_size=cp_size,
+        pad_token_id=tokenizer.pad_token_id,
+        label_ignore_index=-100,
+    )
+
+    cp_rank = dist.get_rank() % cp_size
+    local_ids, local_labels, _, local_pos, local_psp = cp_chunk_data(
+        cp_rank, cp_size,
+        tokens=packed_ids,
+        labels=packed_labels,
+        position_ids=packed_pos,
+        packed_seq_params=psp,
+    )
+
+    if replay_indices is not None and len(replay_indices) > 0:
+        s_local = local_ids.shape[1]
+        cp_replay = [
+            t[cp_rank * s_local:(cp_rank + 1) * s_local].cuda()
+            for t in replay_indices
+        ]
+        ctx = router_replay_ctx(model, cp_replay)
+    else:
+        ctx = nullcontext()
+
+    with ctx:
+        outputs = model(
+            input_ids=local_ids,
+            position_ids=local_pos,
+            packed_seq_params=local_psp,
+        )
+        assert outputs.mtp_per_depth_h is not None
+
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+        mtp_scale = float(config.mtp_loss_scaling_factor)
+
+        n_valid = (local_labels != -100).sum()
+        dist.all_reduce(n_valid, group=model._cp_group)
+        n_valid = n_valid.float().clamp_min(1.0)
+
+        mtp_depth_nums = calculate_mtp_loss(
+            mtp_per_depth_h=outputs.mtp_per_depth_h,
+            labels=local_labels,
+            lm_head=model.lm_head,
+            loss_fct=loss_fct,
+            loss_mask=None,
+            cp_group=model._cp_group,
+            packed_seq_params=local_psp,
+        )
+        mtp_per_depth_loss = [num / n_valid for num in mtp_depth_nums]
+        mtp_total_loss = (
+            torch.stack(mtp_per_depth_loss).sum()
+            * (mtp_scale / max(len(mtp_per_depth_loss), 1))
+        )
+        reported_loss = mtp_total_loss.detach().clone()
+        dist.all_reduce(reported_loss, group=model._cp_group)
+        mtp_total_loss.backward()
+
+    total_grad_norm = model.clip_grad_norm_(2.0)
+
+    result = {
+        "rank": rank,
+        "mtp_total_loss": reported_loss.item(),
+        "mtp_per_depth_loss": [x.item() for x in mtp_per_depth_loss],
+        "total_grad_norm": total_grad_norm,
+    }
+    print(
+        f"[mtp_thd_cp] rank {rank}: mtp_total_loss={reported_loss.item():.6f}, "
+        f"total_grad_norm={total_grad_norm:.4f}"
+    )
+    del model, outputs
     torch.cuda.empty_cache()
     dist.destroy_process_group()
     return result
@@ -492,6 +879,224 @@ class TestDeepseekV4MtpSmoke(unittest.TestCase):
             )
 
         print("\nPASSED")
+
+    def test_mtp_bshd_vs_thd(
+        self,
+        world_size: int = NUM_GPUS,
+        ep_size: int = EP_SIZE,
+        master_port: int = 12700,
+    ):
+        """BSHD vs THD pack-seq: MTP loss and grad should be close."""
+        assert os.path.isdir(HF_MODEL_PATH)
+
+        # 3 段不等长，pad 到 128 倍数
+        fake_seq_lens = [100, 80, 120]
+
+        pg = placement_group(
+            [{"GPU": 1, "CPU": 1}] * world_size, strategy="PACK",
+        )
+        ray.get(pg.ready())
+
+        try:
+            master_addr = ray.get(
+                _get_node_ip.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg, placement_group_bundle_index=0,
+                    )
+                ).remote()
+            )
+
+            # 1. BSHD baseline — 每段独立 forward，累加 MTP loss
+            bshd_futures = [
+                _mtp_bshd_perseg_worker.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg, placement_group_bundle_index=r,
+                    )
+                ).remote(
+                    HF_MODEL_PATH,
+                    rank=r,
+                    world_size=world_size,
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    ep_size=ep_size,
+                    fake_seq_lens=fake_seq_lens,
+                )
+                for r in range(world_size)
+            ]
+            bshd_results = ray.get(bshd_futures)
+        finally:
+            remove_placement_group(pg)
+
+        self.tearDown()
+
+        # 重启 Ray
+        self.setUp()
+
+        pg2 = placement_group(
+            [{"GPU": 1, "CPU": 1}] * world_size, strategy="PACK",
+        )
+        ray.get(pg2.ready())
+
+        try:
+            master_addr2 = ray.get(
+                _get_node_ip.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg2, placement_group_bundle_index=0,
+                    )
+                ).remote()
+            )
+
+            # 2. THD pack-seq with router replay from BSHD rank 0
+            replay = bshd_results[0].get("recorded_routing")
+            thd_futures = [
+                _mtp_thd_worker.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg2, placement_group_bundle_index=r,
+                    )
+                ).remote(
+                    HF_MODEL_PATH,
+                    rank=r,
+                    world_size=world_size,
+                    master_addr=master_addr2,
+                    master_port=master_port + 1,
+                    ep_size=ep_size,
+                    fake_seq_lens=fake_seq_lens,
+                    replay_indices=replay,
+                )
+                for r in range(world_size)
+            ]
+            thd_results = ray.get(thd_futures)
+        finally:
+            remove_placement_group(pg2)
+
+        bshd_r0 = bshd_results[0]
+        thd_r0 = thd_results[0]
+
+        print("\n" + "=" * 60)
+        print("  MTP: BSHD vs THD pack-seq")
+        print("=" * 60)
+        print(f"  BSHD: mtp_total_loss={bshd_r0['mtp_total_loss']:.6f}  grad_norm={bshd_r0['total_grad_norm']:.4f}")
+        print(f"  THD:  mtp_total_loss={thd_r0['mtp_total_loss']:.6f}  grad_norm={thd_r0['total_grad_norm']:.4f}")
+
+        loss_rel = abs(bshd_r0["mtp_total_loss"] - thd_r0["mtp_total_loss"]) / (
+            abs(bshd_r0["mtp_total_loss"]) + 1e-8
+        )
+        gn_rel = abs(bshd_r0["total_grad_norm"] - thd_r0["total_grad_norm"]) / (
+            abs(bshd_r0["total_grad_norm"]) + 1e-8
+        )
+        print(f"  loss rel_diff={loss_rel:.6f}  grad_norm rel_diff={gn_rel:.6f}")
+        print("=" * 60 + "\n")
+
+        self.assertLess(loss_rel, 0.005, f"MTP loss rel_diff {loss_rel:.6f} > 0.5%")
+        self.assertLess(gn_rel, 0.01, f"MTP grad_norm rel_diff {gn_rel:.6f} > 1%")
+
+    def test_mtp_thd_vs_thd_cp(
+        self,
+        world_size: int = NUM_GPUS,
+        ep_size: int = EP_SIZE,
+        cp_size: int = CP_SIZE_FOR_MTP_CP_TEST,
+        master_port: int = 12700,
+    ):
+        """THD CP=1 vs THD CP=4: MTP loss and grad should be close."""
+        assert os.path.isdir(HF_MODEL_PATH)
+
+        # segments must pad to multiples of 128 AND total T divisible by cp_size*128
+        fake_seq_lens = [100, 200, 100]
+
+        # 1. THD CP=1 (baseline, with router capture)
+        pg = placement_group(
+            [{"GPU": 1, "CPU": 1}] * world_size, strategy="PACK",
+        )
+        ray.get(pg.ready())
+
+        try:
+            master_addr = ray.get(
+                _get_node_ip.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg, placement_group_bundle_index=0,
+                    )
+                ).remote()
+            )
+            thd_futures = [
+                _mtp_bshd_perseg_worker.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg, placement_group_bundle_index=r,
+                    )
+                ).remote(
+                    HF_MODEL_PATH,
+                    rank=r,
+                    world_size=world_size,
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    ep_size=ep_size,
+                    fake_seq_lens=fake_seq_lens,
+                )
+                for r in range(world_size)
+            ]
+            thd_results = ray.get(thd_futures)
+        finally:
+            remove_placement_group(pg)
+
+        self.tearDown()
+        self.setUp()
+
+        # 2. THD CP=4 (with router replay from baseline rank 0)
+        pg2 = placement_group(
+            [{"GPU": 1, "CPU": 1}] * world_size, strategy="PACK",
+        )
+        ray.get(pg2.ready())
+
+        try:
+            master_addr2 = ray.get(
+                _get_node_ip.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg2, placement_group_bundle_index=0,
+                    )
+                ).remote()
+            )
+            replay = thd_results[0].get("recorded_routing")
+            cp_futures = [
+                _mtp_thd_cp_worker.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg2, placement_group_bundle_index=r,
+                    )
+                ).remote(
+                    HF_MODEL_PATH,
+                    rank=r,
+                    world_size=world_size,
+                    master_addr=master_addr2,
+                    master_port=master_port + 1,
+                    ep_size=ep_size,
+                    cp_size=cp_size,
+                    fake_seq_lens=fake_seq_lens,
+                    replay_indices=replay,
+                )
+                for r in range(world_size)
+            ]
+            cp_results = ray.get(cp_futures)
+        finally:
+            remove_placement_group(pg2)
+
+        thd_r0 = thd_results[0]
+        cp_r0 = cp_results[0]
+
+        print("\n" + "=" * 60)
+        print("  MTP: THD CP=1 vs THD CP=4")
+        print("=" * 60)
+        print(f"  THD:    mtp_total_loss={thd_r0['mtp_total_loss']:.6f}  grad_norm={thd_r0['total_grad_norm']:.4f}")
+        print(f"  THD+CP: mtp_total_loss={cp_r0['mtp_total_loss']:.6f}  grad_norm={cp_r0['total_grad_norm']:.4f}")
+
+        loss_rel = abs(thd_r0["mtp_total_loss"] - cp_r0["mtp_total_loss"]) / (
+            abs(thd_r0["mtp_total_loss"]) + 1e-8
+        )
+        gn_rel = abs(thd_r0["total_grad_norm"] - cp_r0["total_grad_norm"]) / (
+            abs(thd_r0["total_grad_norm"]) + 1e-8
+        )
+        print(f"  loss rel_diff={loss_rel:.6f}  grad_norm rel_diff={gn_rel:.6f}")
+        print("=" * 60 + "\n")
+
+        self.assertLess(loss_rel, 0.005, f"MTP loss rel_diff {loss_rel:.6f} > 0.5%")
+        self.assertLess(gn_rel, 0.02, f"MTP grad_norm rel_diff {gn_rel:.6f} > 2%")
 
 
 if __name__ == "__main__":

@@ -73,7 +73,6 @@ training:
   train_gbs: 128
 
   agentic:
-    adv_estimator: grpo
     reward_normalization:
       grouping: traj_group_id    # 按轨迹组归一化
       method: mean_std

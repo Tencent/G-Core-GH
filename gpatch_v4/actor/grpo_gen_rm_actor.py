@@ -162,6 +162,7 @@ class GrpoGenRmActor(BaseActor, TokenizerMixin):
             placement_type=config.placement_type,
             pg_bundle_indices=pg_bundle_indices,
             base_gpu_id=base_gpu_id,
+            seed=infer_engine_config.engine_seed,
             **extra_infer_engine_config,
         )
         self.build_tokenizer()

@@ -36,6 +36,7 @@ class InferEngineConfig(BaseInferEngineConfig):
     min_p : float
         ``0.0`` disables min-p.
     generate_max_tokens : int
+    engine_seed: int
     seed : int
     allow_auto_truncate : bool
         Let sglang auto-truncate long prompts.
@@ -94,7 +95,8 @@ class InferEngineConfig(BaseInferEngineConfig):
     top_p: float = field(default=1.0, metadata={"help": "ppo top-p"})
     min_p: float = field(default=0.0, metadata={"help": "min-p sampling, 0 disables"})
     generate_max_tokens: int = field(default=128, metadata={"help": "generate max tokens"})
-    seed: int = field(default=42, metadata={"help": "seed"})
+    seed: Optional[int] = field(default=42, metadata={"help": "prompt seed"})
+    engine_seed: Optional[int] = field(default=42, metadata={"help": "engine seed"})
     allow_auto_truncate: bool = field(
         default=False, metadata={"help": "sglang allow auto truncate"}
     )

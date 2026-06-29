@@ -923,6 +923,400 @@ def gspo_loss_func(config, loss_input: PolicyLossInput):
     return (bwd_loss, metrics)
 
 
+@register_loss("cispo")
+def cispo_loss_func(config, loss_input: PolicyLossInput):
+    """CISPO loss (arXiv 2506.13585, MiniMax-M1 §3.1).
+
+    Clipped IS-weight Policy Optimization: clips the importance sampling
+    weight and stop-gradients it, so gradient flows only through ``log π``.
+    All tokens contribute gradients regardless of IS ratio magnitude.
+
+    ``L = -sg(clip(r, 1-ε_low, 1+ε_high)) · A · log π``
+
+    Recommended: set ``ppo_clip_ratio_low`` large (e.g. 1.0) to disable the
+    lower bound and only tune ``ppo_clip_ratio_high``.
+    """
+    ppo_config = config.ppo
+    advantages = loss_input.advantages
+    prev_log_probs = loss_input.prev_log_probs
+    ref_log_probs = loss_input.ref_log_probs
+    curr_log_probs = loss_input.curr_log_probs
+    response_mask = loss_input.response_mask
+    scaled_entropy = loss_input.scaled_entropy
+    rollout_log_probs = loss_input.rollout_log_probs
+    per_token_entropy = loss_input.per_token_entropy
+    dumped_topk_logprobs = loss_input.dumped_topk_logprobs
+    dumped_topk_token_ids = loss_input.dumped_topk_token_ids
+    sample_mask = loss_input.sample_mask
+
+    # ------------------------------------------------------------------
+    # 1. Token-level importance ratio
+    # ------------------------------------------------------------------
+    if ppo_config.skip_prev_logps:
+        log_ratio = curr_log_probs - curr_log_probs.detach()
+        effective_prev = curr_log_probs.detach()
+    else:
+        log_ratio = curr_log_probs - prev_log_probs
+        effective_prev = prev_log_probs
+
+    if ppo_config.ppo_logps_ratio_clamp is not None:
+        ratios = torch.clamp(
+            log_ratio, min=-ppo_config.ppo_logps_ratio_clamp, max=ppo_config.ppo_logps_ratio_clamp
+        ).exp()
+    else:
+        ratios = log_ratio.exp()
+
+    # ------------------------------------------------------------------
+    # 2. Off-policy correction (shared with GRPO)
+    # ------------------------------------------------------------------
+    correction_ratio, response_mask, extra_metrics = compute_off_policy_correction_weights(
+        config.ppo.enable_off_policy_correction,
+        config,
+        effective_prev,
+        rollout_log_probs,
+        response_mask.float(),
+    )
+
+    # ------------------------------------------------------------------
+    # 3. CISPO: clip IS weight, stop-gradient, multiply with A * log π
+    # ------------------------------------------------------------------
+    clip_ratio_low = ppo_config.ppo_clip_ratio_low if ppo_config.ppo_clip_ratio_low is not None else ppo_config.ppo_ratio_eps
+    clip_ratio_high = ppo_config.ppo_clip_ratio_high if ppo_config.ppo_clip_ratio_high is not None else ppo_config.ppo_ratio_eps
+    clipped_ratio = ratios.clamp(1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
+    # stop-gradient the clipped ratio
+    clipped_ratio_sg = clipped_ratio.detach()
+
+    actor_loss = -clipped_ratio_sg * advantages * curr_log_probs
+
+    if config.ppo.enable_off_policy_correction:
+        actor_loss = actor_loss * correction_ratio
+
+    actor_loss = masked_mean(actor_loss, response_mask)
+    loss = actor_loss - scaled_entropy * ppo_config.ppo_entropy_bonus
+
+    # ------------------------------------------------------------------
+    # 4. KL regularization (same as GRPO)
+    # paper 里说不要 kl_loss 了，虽然代码这里保留了这一块的，但是建议 kl_loss_beta 设置为 0
+    # ------------------------------------------------------------------
+    use_absolute_kl = False
+    use_low_var_kl = True
+    if isinstance(config, OnPolicyDistillConfig):
+        use_absolute_kl = True
+        use_low_var_kl = False
+    if ref_log_probs is not None:
+        kl_loss = masked_mean(
+            calculate_kl_loss(
+                cur_log_probs=curr_log_probs,
+                ref_log_probs=ref_log_probs,
+                use_absolute_kl=use_absolute_kl,
+                use_low_var_kl=use_low_var_kl,
+                clamp_kl_loss=ppo_config.ppo_dual_clip_ratio_c is not None,
+                clamp_kl_val=ppo_config.ppo_clamp_kl_val,
+            ), response_mask
+        )
+        loss = loss + kl_loss * ppo_config.grpo_kl_loss_beta
+    else:
+        kl_loss = torch.zeros_like(loss)
+
+    # ------------------------------------------------------------------
+    # 5. Backward loss (global retention ratio compensation)
+    # ------------------------------------------------------------------
+    bwd_loss = loss.clone()
+
+    global_retention_ratio = loss_input.global_retention_ratio
+    if hasattr(config, "debug") and getattr(config.debug, "ignore_global_retention_ratio", False):
+        global_retention_ratio = None
+    if global_retention_ratio is not None:
+        global_retention_ratio_scalar = global_retention_ratio.flatten()[0].clamp(min=1e-6)
+        bwd_loss = bwd_loss / global_retention_ratio_scalar
+
+    # ------------------------------------------------------------------
+    # 6. Metrics
+    # ------------------------------------------------------------------
+    with torch.no_grad():
+        numel = response_mask.sum()
+        ppo_ratio = masked_mean(ratios.detach(), response_mask)
+        ppo_ratio_clamped = masked_mean(clipped_ratio_sg, response_mask)
+        scaled_entropy = scaled_entropy.detach()
+
+        mask_bool = response_mask.bool()
+        is_clamped = (clipped_ratio_sg != ratios.detach()) & mask_bool
+        clipfrac = is_clamped.sum().float() / numel.clamp(min=1)
+        is_upper_clamped = (ratios.detach() > 1.0 + clip_ratio_high) & mask_bool
+        is_lower_clamped = (ratios.detach() < 1.0 - clip_ratio_low) & mask_bool
+
+        if loss_input.should_dump_metrics:
+            dumped_curr_logprobs = curr_log_probs.clone().detach().to(
+                dtype=torch.bfloat16, device="cpu"
+            )
+            dumped_per_token_entropy = per_token_entropy.clone().detach().to(
+                dtype=torch.bfloat16, device="cpu"
+            )
+            ratios_tmp = ratios.detach()
+            ratios_clamped_tmp = clipped_ratio_sg
+            dumped_ppo_ratio_unclamped = ratios_tmp.to(dtype=torch.bfloat16, device="cpu")
+            dumped_is_ppo_ratio_clamped = (
+                (ratios_tmp == ratios_clamped_tmp) & mask_bool
+            ).cpu()
+            dumped_mask = response_mask.detach().bool().to(device="cpu")
+
+    metrics = {
+        "loss": torch.stack([loss.detach() * numel, numel]),
+        "policy_loss": torch.stack([actor_loss.detach() * numel, numel]),
+        "ppo_ratio": torch.stack([ppo_ratio * numel, numel]),
+        "ppo_ratio_clamped": torch.stack([ppo_ratio_clamped * numel, numel]),
+        "scaled_entropy": torch.stack([scaled_entropy * numel, numel]),
+        "grpo_kl_loss": torch.stack([kl_loss.detach() * numel, numel]),
+        "ppo_ratio_clamped_upper_frac": torch.stack([is_upper_clamped.sum().float(), numel]),
+        "ppo_ratio_clamped_lower_frac": torch.stack([is_lower_clamped.sum().float(), numel]),
+        "cispo/clipfrac": clipfrac,
+    }
+
+    if extra_metrics:
+        metrics.update(extra_metrics)
+    if sample_mask is not None:
+        metrics["valid_sample_ratio"] = masked_mean(
+            sample_mask.float().detach(), torch.ones_like(sample_mask, dtype=torch.float)
+        )
+
+    if global_retention_ratio is not None:
+        grr_scalar = global_retention_ratio.flatten()[0].clamp(min=1e-6)
+        metrics["loss_dead_aware"] = torch.stack([loss.detach() / grr_scalar * numel, numel])
+        metrics["policy_loss_dead_aware"] = torch.stack(
+            [actor_loss.detach() / grr_scalar * numel, numel]
+        )
+
+    reduce_metrics_across_data_parallel_group(metrics)
+
+    if loss_input.should_dump_metrics:
+        metrics.update(
+            {
+                "curr_logprobs": dumped_curr_logprobs,
+                "per_token_entropy": dumped_per_token_entropy,
+                "topk_logprobs": dumped_topk_logprobs,
+                "topk_token_ids": dumped_topk_token_ids,
+                "ppo_ratio_unclamped": dumped_ppo_ratio_unclamped,
+                "is_ppo_ratio_clamped": dumped_is_ppo_ratio_clamped,
+                "mask": dumped_mask,
+            }
+        )
+
+    return (bwd_loss, metrics)
+
+
+@register_loss("sapo")
+def sapo_loss_func(config, loss_input: PolicyLossInput):
+    """SAPO loss (arXiv 2511.20347): Soft Adaptive Policy Optimization.
+
+    Replaces the GRPO/GSPO hard clip with a smooth, temperature-controlled soft
+    gate on the token-level importance ratio ``r = exp(curr - prev)``::
+
+        f(r) = (4 / τ) * sigmoid(τ * (r - 1)),   τ = τ_pos if A > 0 else τ_neg
+
+    The per-token surrogate is ``f(r) * A`` (``r`` carries gradient). Its gradient
+    kernel ``sech^2(τ/2 * (r - 1)) = 4·σ·(1-σ)`` preserves gradients near the
+    on-policy point (r=1) and attenuates smoothly as the ratio deviates, instead
+    of truncating like a hard clip. Asymmetric temperatures (``τ_neg > τ_pos``)
+    make negative-token gradients decay faster, improving stability.
+
+    Aggregation follows the paper Eq.(5): seq-mean-token-mean (each sequence is
+    weighted equally), identical to ``gspo_loss_func``. There is no hard / dual
+    clipping; ``ppo_clip_ratio_*`` and ``ppo_dual_clip_ratio_c`` are inert here.
+    """
+    ppo_config = config.ppo
+    advantages = loss_input.advantages
+    prev_log_probs = loss_input.prev_log_probs
+    ref_log_probs = loss_input.ref_log_probs
+    curr_log_probs = loss_input.curr_log_probs
+    response_mask = loss_input.response_mask
+    scaled_entropy = loss_input.scaled_entropy
+    rollout_log_probs = loss_input.rollout_log_probs
+    per_token_entropy = loss_input.per_token_entropy
+    dumped_topk_logprobs = loss_input.dumped_topk_logprobs
+    dumped_topk_token_ids = loss_input.dumped_topk_token_ids
+    sample_mask = loss_input.sample_mask
+
+    # ------------------------------------------------------------------
+    # 1. Token-level importance ratio (supports skip_prev_logps)
+    # ------------------------------------------------------------------
+    if ppo_config.skip_prev_logps:
+        effective_prev = curr_log_probs.detach()
+    else:
+        effective_prev = prev_log_probs
+    log_ratio = curr_log_probs - effective_prev
+    if ppo_config.ppo_logps_ratio_clamp is not None:
+        log_ratio = torch.clamp(
+            log_ratio,
+            min=-ppo_config.ppo_logps_ratio_clamp,
+            max=ppo_config.ppo_logps_ratio_clamp,
+        )
+    ratios = log_ratio.exp()
+
+    # ------------------------------------------------------------------
+    # 2. Off-policy correction (shared with GRPO/GSPO)
+    # ------------------------------------------------------------------
+    correction_ratio, response_mask, extra_metrics = compute_off_policy_correction_weights(
+        config.ppo.enable_off_policy_correction,
+        config,
+        effective_prev,
+        rollout_log_probs,
+        response_mask.float(),
+    )
+
+    # ------------------------------------------------------------------
+    # 3. SAPO soft gate (no hard clip)
+    #    f(r) = (4 / τ) * sigmoid(τ * (r - 1)),  τ chosen by advantage sign
+    # ------------------------------------------------------------------
+    # TODO: gate 计算独立出来，后面可能有其他 gate 方法？
+    tau = torch.where(
+        advantages > 0,
+        torch.as_tensor(ppo_config.sapo_tau_pos, dtype=ratios.dtype, device=ratios.device),
+        torch.as_tensor(ppo_config.sapo_tau_neg, dtype=ratios.dtype, device=ratios.device),
+    )
+    sigmoid_gate = torch.sigmoid(tau * (ratios - 1.0))
+    gate = (4.0 / tau) * sigmoid_gate
+    actor_loss = -advantages * gate
+
+    if config.ppo.enable_off_policy_correction:
+        actor_loss = actor_loss * correction_ratio
+
+    # ------------------------------------------------------------------
+    # 4. Sequence-level loss aggregation (paper Eq.(5))
+    #    L = (1/G) Σ_i (1/|y_i|) Σ_t l_{i,t}
+    # ------------------------------------------------------------------
+    # TODO: CP? Seq level 计算正确性
+    seq_losses = (
+        torch.sum(actor_loss * response_mask, dim=-1) /
+        torch.sum(response_mask, dim=-1).clamp(min=1)
+    )
+    if sample_mask is not None:
+        actor_loss = (seq_losses * sample_mask).sum() / sample_mask.sum().clamp(min=1)
+    else:
+        actor_loss = torch.mean(seq_losses)
+
+    loss = actor_loss - scaled_entropy * ppo_config.ppo_entropy_bonus
+
+    # ------------------------------------------------------------------
+    # 5. KL regularization (token-level, same as GRPO/GSPO)
+    # ------------------------------------------------------------------
+    use_absolute_kl = False
+    use_low_var_kl = True
+    if isinstance(config, OnPolicyDistillConfig):
+        use_absolute_kl = True
+        use_low_var_kl = False
+    if ref_log_probs is not None:
+        kl_loss = masked_mean(
+            calculate_kl_loss(
+                cur_log_probs=curr_log_probs,
+                ref_log_probs=ref_log_probs,
+                use_absolute_kl=use_absolute_kl,
+                use_low_var_kl=use_low_var_kl,
+                clamp_kl_loss=ppo_config.ppo_dual_clip_ratio_c is not None,
+                clamp_kl_val=ppo_config.ppo_clamp_kl_val,
+            ),
+            response_mask,
+        )
+        loss = loss + kl_loss * ppo_config.grpo_kl_loss_beta
+    else:
+        kl_loss = torch.zeros_like(loss)
+
+    # ------------------------------------------------------------------
+    # 6. Metrics (gspo-style seq-level loss + SAPO gate diagnostics)
+    # ------------------------------------------------------------------
+    bwd_loss = loss.clone()  # TODO: 为什么需要clone
+
+    global_retention_ratio = loss_input.global_retention_ratio
+    if hasattr(config, "debug") and getattr(config.debug, "ignore_global_retention_ratio", False):
+        # DEBUG: skip the 1/global_retention_ratio compensation for grad-scaling experiments.
+        global_retention_ratio = None
+    if global_retention_ratio is not None:
+        # TODO (@yeazhao): 该 1/retention 补偿只在「有效 micro-batch = 单样本」时严格等于全局
+        # mean-over-alive：此时死样本各自占满 1/M 计数、贡献 0，自然归一化是 ÷N_total，
+        # ÷retention 正好升级为 ÷N_valid。但 train_mbs>1 或 dynamic_mbs/smart_pad 把多个
+        # 样本打包进同一 micro-batch 时，local 除数是该 mb 的存活数，单个全局标量无法修复
+        # 各 mb 存活数不均带来的偏差（异质性），结果有偏。代码里没有任何 train_mbs==1 的约束。
+        # 严格做法应改走全局计数归一（calculate_per_token_loss）或 local 除以含死样本的样本总数。
+        global_retention_ratio_scalar = global_retention_ratio.flatten()[0].clamp(min=1e-6)
+        bwd_loss = bwd_loss / global_retention_ratio_scalar
+
+    with torch.no_grad():
+        numel = response_mask.sum()
+        ones = torch.tensor(1.0, device=loss.device)
+        mask_bool = response_mask.bool()
+
+        ppo_ratio_sum = (ratios.detach() * response_mask).sum()
+
+        # SAPO gate diagnostics (0-dim scalars; DP-reduced by key-name convention).
+        gate_det = gate.detach()
+        # Gradient kernel sech^2(τ/2·(r-1)) = 4·σ·(1-σ); 1.0 at r=1, → 0 off-policy.
+        grad_kernel = 4.0 * sigmoid_gate.detach() * (1.0 - sigmoid_gate.detach())
+        valid_gate = gate_det[mask_bool]
+        valid_kernel = grad_kernel[mask_bool]
+        if valid_gate.numel() > 0:
+            gate_mean = valid_gate.mean()
+            gate_min = valid_gate.min()
+            gate_max = valid_gate.max()
+            grad_kernel_mean = valid_kernel.mean()
+            strong_attenuation_frac = (valid_kernel < 0.5).float().mean()
+        else:
+            zero = torch.tensor(0.0, device=loss.device)
+            gate_mean = gate_min = gate_max = grad_kernel_mean = strong_attenuation_frac = zero
+
+        if loss_input.should_dump_metrics:
+            dumped_curr_logprobs = curr_log_probs.clone().detach().to(
+                dtype=torch.bfloat16, device="cpu"
+            )
+            dumped_per_token_entropy = per_token_entropy.clone().detach().to(
+                dtype=torch.bfloat16, device="cpu"
+            )
+            dumped_ratios = ratios.detach().to(dtype=torch.bfloat16, device="cpu")
+            dumped_mask = response_mask.detach().bool().to(device="cpu")
+
+    metrics = {
+        "loss": torch.stack([loss.detach(), ones]),
+        "policy_loss": torch.stack([actor_loss.detach(), ones]),
+        "ppo_ratio": torch.stack([ppo_ratio_sum, numel]),
+        "scaled_entropy": torch.stack([scaled_entropy.detach() * numel, numel]),
+        "grpo_kl_loss": torch.stack([kl_loss.detach() * numel, numel]),
+        # on-policy 理论 =2/sapo_tau_pos (adv>=0) =2/sapo_tau_neg (adv<0)，越小 ratio 差别越大
+        "sapo/gate_mean": gate_mean,
+        # >= 0 | 越偏离 2/sapo_tau_pos(neg) ratio 差别越大
+        "sapo/gate_min": gate_min,
+        # <= 4/sapo_tau_pos(eng)，越小 ratio 差别越大
+        "sapo/gate_max": gate_max,
+        # <=1 | on-policy 理论=1 | 越小 ratio 差别越大
+        "sapo/grad_kernel_mean": grad_kernel_mean,
+        # <=1 | on-policy 理论=0 | 越大 ratio 差别越大
+        "sapo/strong_attenuation_frac": strong_attenuation_frac,
+    }
+    if extra_metrics:
+        metrics.update(extra_metrics)
+    if sample_mask is not None:
+        metrics["valid_sample_ratio"] = masked_mean(
+            sample_mask.float().detach(), torch.ones_like(sample_mask, dtype=torch.float)
+        )
+
+    if global_retention_ratio is not None:
+        grr_scalar = global_retention_ratio.flatten()[0].clamp(min=1e-6)
+        metrics["loss_dead_aware"] = torch.stack([loss.detach() / grr_scalar, ones])
+        metrics["policy_loss_dead_aware"] = torch.stack([actor_loss.detach() / grr_scalar, ones])
+    reduce_metrics_across_data_parallel_group(metrics)
+
+    if loss_input.should_dump_metrics:
+        metrics.update(
+            {
+                "curr_logprobs": dumped_curr_logprobs,
+                "per_token_entropy": dumped_per_token_entropy,
+                "topk_logprobs": dumped_topk_logprobs,
+                "topk_token_ids": dumped_topk_token_ids,
+                "ppo_ratio_unclamped": dumped_ratios,
+                "mask": dumped_mask,
+            }
+        )
+
+    return (bwd_loss, metrics)
+
+
 @register_loss("fipo")
 def fipo_loss_func(config, loss_input: PolicyLossInput):
     """FIPO loss (arXiv 2603.19835): Future-KL Influenced Policy Optimization.
@@ -1208,6 +1602,7 @@ def ce_loss(
     return_src_loss: bool = False,
     skip_cp_reduce: bool = False,
     cp_group=None,
+    loss_weights: Optional[torch.Tensor] = None,
 ):
     labels = labels.transpose(0, 1).contiguous()
     logits = logits.transpose(0, 1).clone(memory_format=torch.contiguous_format)
@@ -1240,8 +1635,13 @@ def ce_loss(
 
     losses = loss.view(-1).float()
     loss_mask = loss_mask.view(-1).float()
-    loss = torch.sum(losses * loss_mask)
 
+    if loss_weights is not None:
+        weighted_mask = loss_mask * loss_weights.view(-1).float()
+    else:
+        weighted_mask = loss_mask
+
+    loss = torch.sum(losses * weighted_mask)
     total_tokens = loss_mask.sum()
     loss = torch.cat([loss.view(1), total_tokens.view(1)])
 
@@ -1271,6 +1671,7 @@ def cross_entroy_loss_func(
     batch = loss_input.batch
     labels = batch["labels"]
     loss_mask = batch["loss_mask"]
+    loss_weights = batch.get("loss_weights", None)
 
     if loss_input.linear_ce_input is not None:
         assert config.training.use_linear_ce
@@ -1281,6 +1682,7 @@ def cross_entroy_loss_func(
             loss_mask,
             skip_cp_reduce=loss_input.skip_cp_loss_reduce,
             cp_group=loss_input.cp_group,
+            loss_weights=loss_weights,
         )
     else:
         logits = loss_input.logits.float()
@@ -1291,6 +1693,7 @@ def cross_entroy_loss_func(
             loss_mask,
             skip_cp_reduce=loss_input.skip_cp_loss_reduce,
             cp_group=loss_input.cp_group,
+            loss_weights=loss_weights,
         )
     #TODO: check loss nan or not
 
@@ -1332,6 +1735,7 @@ def linear_ce_loss(
     return_src_loss: bool = False,
     skip_cp_reduce: bool = False,
     cp_group=None,
+    loss_weights: Optional[torch.Tensor] = None,
 ):
     """Compute linear (fused) cross-entropy loss from hidden states.
 
@@ -1374,8 +1778,13 @@ def linear_ce_loss(
 
     losses = loss.view(-1).float()
     loss_mask = loss_mask.view(-1).float()
-    loss = torch.sum(losses * loss_mask)
 
+    if loss_weights is not None:
+        weighted_mask = loss_mask * loss_weights.view(-1).float()
+    else:
+        weighted_mask = loss_mask
+
+    loss = torch.sum(losses * weighted_mask)
     total_tokens = loss_mask.sum()
     loss = torch.cat([loss.view(1), total_tokens.view(1)])
 
@@ -1484,6 +1893,7 @@ def off_policy_loss_func(
 
     labels = batch["labels"]
     loss_mask = batch["loss_mask"]
+    loss_weights = batch.get("loss_weights", None)
     kl_alpha_mask = batch.get("kl_alpha_mask", None)
     if kl_alpha_mask is not None:
         assert kl_alpha_mask.shape[0] == labels.shape[
@@ -1495,7 +1905,8 @@ def off_policy_loss_func(
         labels,
         loss_mask,
         kl_alpha_mask=kl_alpha_mask if
-        (config.training.enable_teacher_kl_loss and config.distill.enable_data_with_alpha) else None
+        (config.training.enable_teacher_kl_loss and config.distill.enable_data_with_alpha) else None,
+        loss_weights=loss_weights,
     )
     ce_numel = loss[1].detach()  # token count for metrics
     if loss[1] != 0:
@@ -1645,14 +2056,39 @@ def square_averaging_cross_entroy_loss_func(
     config,
     loss_input: FinetuneLossInput,
 ):
-    """LM cross-entropy loss.
+    """LM cross-entropy loss with square-averaging weighting.
+
+    Each sample is weighted by ``1 / sqrt(num_answer_tokens)`` so that
+    short-answer samples are not overwhelmed by long-answer ones.
+
+    When ``calculate_per_token_loss=True`` (required by dynamic CP), this
+    function returns 3 elements ``(loss_sum, effective_num_tokens, metrics)``
+    so that ``forward_step_calc_loss`` takes the per-token-loss branch and
+    avoids the ``output_tensor *= cp_group_size`` multiplication that would
+    otherwise double the gradient under CP=2.
+
+    To preserve the exact square-averaging normalisation while keeping
+    ``num_tokens`` as an integer (required by
+    ``torch.distributed.broadcast``), both ``loss_sum`` and
+    ``effective_num_tokens`` are scaled by ``_SA_SCALE = 10_000``:
+
+    - ``loss_sum = weighted_sum * _SA_SCALE``
+    - ``effective_num_tokens = int(W / cp_size * _SA_SCALE)``
+
+    where ``W = square_averaging_weights.sum()``.  After
+    ``finalize_model_grads`` divides by ``total_num_tokens``, the
+    ``_SA_SCALE`` factor cancels and the gradient equals the correct
+    square-averaging gradient ``Σ(weighted_sum) / Σ(W)``.
 
     Args:
         labels (Tensor): ``[B, S]``.
         logits (Tensor): ``[B, S, V]`` from the output layer.
         loss_mask (Tensor): ``[B, S]``.
     Returns:
-        Tensor: ``[B, S]``.
+        When ``calculate_per_token_loss=True``:
+            ``(loss_sum, effective_num_tokens, metrics)`` – 3-element tuple.
+        Otherwise:
+            ``(loss, metrics)`` – 2-element tuple (legacy behaviour).
     """
     batch = loss_input.batch
     labels = batch["labels"]
@@ -1684,18 +2120,87 @@ def square_averaging_cross_entroy_loss_func(
         torch.tensor(0.0, dtype=loss_weight.dtype, device=loss_weight.device)
     )
 
-    losses = losses.float() * loss_weight
-    # losses.sum() 包括了 mbs 序列之和，计算 loss 时应该求 mean
-    # 所以 square_averaging_weights 直接多个求 sum 就可以了
-    loss = losses.sum().view(1).clone() / square_averaging_weights.sum().view(1)
-    if (not loss_input.skip_cp_loss_reduce and dist.get_world_size(_cp_group) > 1):
-        torch.distributed.all_reduce(loss, group=_cp_group)
+    weighted_losses = losses.float() * loss_weight
     #TODO: check loss nan or not
 
-    reporting_loss = loss.clone().detach()
-    reporting_loss = average_losses_across_data_parallel_group([reporting_loss])
-    # 最后的 loss 是 loss.view(1).clone() / square_averaging_weights
-    return (loss, {"lm_loss": reporting_loss})
+    # ``skip_cp_loss_reduce`` is set to ``calc_per_token_loss`` by the
+    # finetune backend, so it serves as a reliable proxy for whether
+    # per-token-loss normalisation is active.
+    calculate_per_token_loss = loss_input.skip_cp_loss_reduce
+
+    if calculate_per_token_loss:
+        # --- Per-token-loss path (required by dynamic CP) ---
+        # Return (loss_sum, effective_num_tokens, metrics) so that
+        # forward_step_calc_loss takes the 3-element branch and avoids the
+        # ``output_tensor *= cp_group_size`` bug.
+        #
+        # To preserve the square-averaging normalisation semantics
+        # (divide by Σ 1/√N_i instead of by total token count), we encode
+        # the square-averaging weight sum into ``num_tokens``.
+        #
+        # Because ``num_tokens`` must be an integer (``forward_step_calc_loss``
+        # initialises it as ``torch.tensor(0, dtype=torch.int)`` and
+        # ``torch.distributed.broadcast`` requires matching dtypes), we scale
+        # both ``loss_sum`` and ``effective_num_tokens`` by a constant
+        # ``_SA_SCALE`` so that the weight sum can be represented as an
+        # integer:
+        #
+        #   effective_num_tokens = int(W / cp_size * _SA_SCALE)   (int)
+        #   loss_sum            = weighted_sum * _SA_SCALE        (float tensor)
+        #
+        # After ``finalize_model_grads`` all-reduces num_tokens across the
+        # dp_cp_group and calls ``scale_gradients(1 / total_num_tokens)``,
+        # the gradient becomes:
+        #
+        #   _SA_SCALE * Σ_dp grad(weighted_sum_dp)
+        #   ─────────────────────────────────────── = Σ_dp grad(weighted_sum_dp) / Σ_dp W_dp
+        #   _SA_SCALE * Σ_dp W_dp
+        #
+        # which is exactly the correct global square-averaging gradient.
+        # The _SA_SCALE factor cancels out perfectly.
+        #
+        # Dividing by cp_size avoids double-counting because
+        # square_averaging_weights is per-sample (identical across CP ranks)
+        # whereas loss_mask is per-token (different across CP ranks).
+        _SA_SCALE = 10_000
+
+        cp_size = dist.get_world_size(_cp_group)
+
+        loss_sum = weighted_losses.sum().view(1).clone() * _SA_SCALE
+
+        effective_num_tokens_float = square_averaging_weights.sum() / cp_size * _SA_SCALE
+        effective_num_tokens = torch.tensor(int(effective_num_tokens_float.item()), dtype=torch.int)
+
+        # Do NOT do CP all-reduce on loss_sum/effective_num_tokens when
+        # skip_cp_loss_reduce is True (the dynamic-CP case).  Each CP rank
+        # keeps its local values and finalize_model_grads aggregates
+        # num_tokens across the dp_cp_group.
+        if not loss_input.skip_cp_loss_reduce and cp_size > 1:
+            # Non-dynamic-CP fallback: CP AVG on [loss_sum, effective_num_tokens]
+            loss_for_reduce = torch.stack([loss_sum.float(), effective_num_tokens.float()])
+            torch.distributed.all_reduce(
+                loss_for_reduce, group=_cp_group, op=torch.distributed.ReduceOp.AVG
+            )
+            loss_sum = loss_for_reduce[0].view(1)
+            effective_num_tokens = loss_for_reduce[1].to(torch.int)
+
+        # Reporting loss: weighted mean for display purposes (unscaled)
+        reporting_loss = (weighted_losses.sum() / square_averaging_weights.sum()).clone().detach()
+        reporting_loss = average_losses_across_data_parallel_group([reporting_loss])
+        metrics = {"lm_loss": reporting_loss}
+
+        return (loss_sum, effective_num_tokens, metrics)
+    else:
+        # --- Legacy path (calculate_per_token_loss=False) ---
+        # losses.sum() 包括了 mbs 序列之和，计算 loss 时应该求 mean
+        # 所以 square_averaging_weights 直接多个求 sum 就可以了
+        loss = weighted_losses.sum().view(1).clone() / square_averaging_weights.sum().view(1)
+        if (not loss_input.skip_cp_loss_reduce and dist.get_world_size(_cp_group) > 1):
+            torch.distributed.all_reduce(loss, group=_cp_group)
+
+        reporting_loss = loss.clone().detach()
+        reporting_loss = average_losses_across_data_parallel_group([reporting_loss])
+        return (loss, {"lm_loss": reporting_loss})
 
 
 @register_loss("ppo_value_loss")

@@ -129,6 +129,10 @@ class DebugConfig(MappingProtocol):
                 )
         },
     )
+    disable_save_checkpoint: bool = field(
+        default=False,
+        metadata={"help": "DEBUG: skip all checkpoint saves (including final save on exit)."},
+    )
     ignore_global_retention_ratio: bool = field(
         default=False,
         metadata={

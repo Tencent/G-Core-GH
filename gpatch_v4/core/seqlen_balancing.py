@@ -1,5 +1,8 @@
 import heapq
 
+import torch
+from torch import distributed as dist
+
 
 def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool) -> list[list[int]]:
     """Partition items into k groups using the Karmarkar-Karp differencing method.
@@ -165,3 +168,81 @@ def get_seqlen_balanced_partitions(seqlen_list: list[int], k_partitions: int, eq
         seqlen_list=seqlen_list, k_partitions=k_partitions, equal_size=equal_size
     )
     return _check_and_sort_partitions(partitions)
+
+
+def convert_mbs_for_pack_seq(
+    samples: list[dict],
+    max_token_len: int,
+    pad_each_doc_to_multi_of: int = 128,
+    dp_group=None,
+) -> list[list[dict]]:
+    """Group variable-length samples into micro-batches by token budget.
+
+    Each sample's padded length (rounded up to ``pad_each_doc_to_multi_of``) is
+    used to estimate the packed token count. Samples are partitioned into
+    ``num_mb = ceil(total_padded / max_token_len)`` groups using
+    Karmarkar-Karp balanced partitioning, then ``num_mb`` is aligned across
+    DP ranks via ``all_reduce(MAX)`` to prevent EP / CP collective deadlocks.
+
+    Example::
+
+        # 8 samples with seq_length [120, 500, 300, 80, 450, 200, 350, 90],
+        # pad_each_doc_to_multi_of=128 → padded [128, 512, 384, 128, 512, 256, 384, 128]
+        # total_padded = 2432, max_token_len = 1024
+        # num_mb = ceil(2432 / 1024) = 3
+        # KK partitions into 3 balanced groups:
+        #   group 0: [512, 256, 128]  → 896 tokens
+        #   group 1: [512, 128, 128]  → 768 tokens
+        #   group 2: [384, 384]       → 768 tokens
+
+    Parameters
+    ----------
+    samples : list[dict]
+        Each dict MUST contain ``"sequence_lengths"`` (int or 0-d tensor).
+    max_token_len : int
+        Max packed token count per micro-batch (typically ``seq_length``).
+    pad_each_doc_to_multi_of : int
+        Per-segment padding granularity (DSV4 HCA requires 128).
+        表示特定模型的输入要 pad 到某个大小，但不是整体的 pad 大小。比如 cp 要求 pad 到 1024，但 dsv4 只要 pad 到 128，
+        避免 pack seq 的时候估计不准确。
+    dp_group : dist.ProcessGroup | None
+        Data-parallel group for cross-rank alignment.
+
+    Returns
+    -------
+    list[list[dict]]
+        ``num_mb`` groups; each group is a non-empty list of sample dicts.
+    """
+    n = len(samples)
+    assert n > 0, "samples must be non-empty"
+
+    def _padded_len(s):
+        raw = s["sequence_lengths"]
+        raw = int(raw) if isinstance(raw, int) else raw.item()
+        return (
+            (raw + pad_each_doc_to_multi_of - 1) // pad_each_doc_to_multi_of
+        ) * pad_each_doc_to_multi_of
+
+    padded_lens = [_padded_len(s) for s in samples]
+    total_padded = sum(padded_lens)
+
+    assert max_token_len >= max(padded_lens), (
+        f"max_token_len ({max_token_len}) < longest padded sample "
+        f"({max(padded_lens)}); samples should be truncated to seq_length "
+        f"before grouping"
+    )
+    num_mb = max(1, (total_padded + max_token_len - 1) // max_token_len)
+
+    if dp_group is not None and dist.is_initialized():
+        mb_t = torch.tensor([num_mb], dtype=torch.long, device="cuda")
+        dist.all_reduce(mb_t, op=dist.ReduceOp.MAX, group=dp_group)
+        num_mb = int(mb_t.item())
+
+    num_mb = min(num_mb, n)
+
+    partitions = get_seqlen_balanced_partitions(
+        seqlen_list=padded_lens,
+        k_partitions=num_mb,
+        equal_size=False,
+    )
+    return [[samples[i] for i in part] for part in partitions]

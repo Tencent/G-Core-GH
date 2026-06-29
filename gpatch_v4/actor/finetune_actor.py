@@ -360,8 +360,8 @@ class FinetuneActor(
             for cur_epoch_train_step in range(
                 start_steps_per_epoch, training_config.train_step_per_epoch
             ):
-                timers("train_step_total", log_level=0).start(barrier=True)
                 await asyncio.sleep(0.01)
+                timers("train_step_total", log_level=0).start(barrier=True)
                 self.last_progress_time = time.time()
 
                 if eval_before_train_flag and self.config.training.total_eval_step > 0:
@@ -435,7 +435,7 @@ class FinetuneActor(
                     self._eval_loop(train_step)
 
                 train_step += 1
-                if train_step % training_config.save_interval == 0:
+                if train_step % training_config.save_interval == 0 and not self.config.debug.disable_save_checkpoint:
                     self.model_engine.save_checkpoint(train_step)
 
                 if train_step == training_config.exit_step:
@@ -450,9 +450,9 @@ class FinetuneActor(
         self.train_step_finished = True
 
         cpu_barrier()
-        # Only save final checkpoint if it wasn't already saved in the training loop
-        if train_step % training_config.save_interval != 0:
-            self.model_engine.save_checkpoint(train_step)
+        if not self.config.debug.disable_save_checkpoint:
+            if train_step % training_config.save_interval != 0:
+                self.model_engine.save_checkpoint(train_step)
 
         if is_last_rank():
             TrainReporterSingleton.finish()

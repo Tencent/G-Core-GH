@@ -14,6 +14,7 @@ import torch
 from packaging import version
 
 from gpatch_v4.configs.infer_engine_config import InferEngineConfig
+from gpatch_v4.orches.flashinfer_cudart_fix import patch_ctypes_for_cudart_stub
 from gpatch_v4.utils.common_utils import log
 from gpatch_v4.utils.logging_utils import (
     configure_third_party_logging,
@@ -123,11 +124,19 @@ class InferEngine:
 
     SEED_ATTR: str = NotImplemented  # "seed" for vLLM, "sampling_seed" for sglang
 
-    def copy_sampling_params_with_seed_offset(self, sampling_params, offset: int):
-        """Return a deep copy of *sampling_params* with ``seed += offset``."""
+    def copy_sampling_params_with_seed_offset(self, sampling_params, offset: Optional[int] = None):
+        """Return a deep copy of *sampling_params* with ``seed += offset``.
+
+        If the current seed is ``None`` (random sampling), the copy is
+        returned without modifying the seed.
+        注意，允许 current 为 None，也就是 infer_engine_config.seed 为 None，当设置为 None 的时候，对齐
+        Roll 的行为
+        """
         params = copy.deepcopy(sampling_params)
         attr = self.SEED_ATTR
-        setattr(params, attr, getattr(params, attr) + offset)
+        current = getattr(params, attr)
+        if current is not None and offset is not None:
+            setattr(params, attr, current + offset)
         return params
 
     def set_sampling_params_seed(self, sampling_params, seed: int):
@@ -227,6 +236,16 @@ class InferEngine:
     async def sleep(self, *args, **kwargs):
         raise NotImplementedError(f"infer_engine does not implement sleep")
 
+    async def release_kv_cache_for_weight_update(self):
+        raise NotImplementedError(
+            f"infer_engine does not implement release_kv_cache_for_weight_update"
+        )
+
+    async def resume_kv_cache_after_weight_update(self):
+        raise NotImplementedError(
+            f"infer_engine does not implement resume_kv_cache_after_weight_update"
+        )
+
     def update_engine_weight_by_model_idx(self, rm_model_idx):
         raise NotImplementedError(
             f"infer_engine does not implement update_gen_rm_weight_by_model_idx"
@@ -325,6 +344,7 @@ class InferEngine:
         pg_bundle_indices=None,
         base_gpu_id: Optional[int] = None,
         enable_mtp: bool = False,
+        seed: int = None,
         **extra_infer_engine_config
     ):
         """Factory method to create an InferEngine from engine arguments.
@@ -364,14 +384,16 @@ class InferEngine:
 
         if infer_engine_impl == "vllm":
             assert not enable_mtp, "enable mtp is not supported by vllm"
-            import vllm
-            from vllm.engine.arg_utils import AsyncEngineArgs
-            from vllm.v1.engine.async_llm import AsyncLLM
+            with patch_ctypes_for_cudart_stub():
+                import vllm
+                from vllm.engine.arg_utils import AsyncEngineArgs
+                from vllm.platforms import current_platform
+                from vllm.v1.engine.async_llm import AsyncLLM
 
+            from gpatch_v4.generation_backend.vllm_engine import VllmEngine
             from gpatch_v4.orches.flashinfer_cudart_fix import (
                 build_compilation_config_patch,
             )
-            from gpatch_v4.generation_backend.vllm_engine import VllmEngine
 
             # Must be called AFTER import vllm, because vllm's module-level
             # dictConfig() calls _clearExistingHandlers() which removes all
@@ -406,8 +428,9 @@ class InferEngine:
             )
             if use_mp:
                 gpu_ids_str = ",".join(str(base_gpu_id + i) for i in range(mp_size))
-                os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids_str
-                log(f"vllm mp backend: CUDA_VISIBLE_DEVICES={gpu_ids_str}")
+                env_name = current_platform.device_control_env_var  # 返回当前平台的 env var 名字
+                os.environ[env_name] = gpu_ids_str
+                log(f"vllm mp backend: {env_name}={gpu_ids_str}")
 
             attention_backend = InferEngine._map_sgl_attention_backend_to_vllm_attention_backend(
                 attention_backend
@@ -424,6 +447,7 @@ class InferEngine:
             engine_args = AsyncEngineArgs(
                 model=model_path,
                 dtype=dtype,
+                seed=seed,
                 compilation_config=vllm_compilation_config,
                 distributed_executor_backend="mp" if use_mp else "ray",
                 tensor_parallel_size=tensor_parallel_size,
@@ -560,6 +584,7 @@ class InferEngine:
                 nnodes=nnodes,
                 node_rank=node_rank,
                 base_gpu_id=base_gpu_id,
+                random_seed=seed,
                 mem_fraction_static=gpu_memory_utilization,
                 trust_remote_code=True,
                 enable_memory_saver=True,

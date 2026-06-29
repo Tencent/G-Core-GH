@@ -4,8 +4,6 @@
 import asyncio
 import copy
 import io
-import math
-import os
 
 import numpy as np
 
@@ -319,6 +317,26 @@ class SglangEngine(InferEngine):
         obj = ReleaseMemoryOccupationReqInput(*args, **kwargs)
         await self.infer_engine.tokenizer_manager.release_memory_occupation(obj, None)
 
+    async def release_kv_cache_for_weight_update(self):
+        """Release KV cache only before distributed weight update."""
+        if not self.wake_up_tag["kv_cache"]:
+            log("release_kv_cache_for_weight_update: kv_cache already released", rank=0)
+            return
+        self.wake_up_tag["kv_cache"] = False
+        obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+        await self.infer_engine.tokenizer_manager.release_memory_occupation(obj, None)
+        log("SglangEngine release_kv_cache_for_weight_update done", rank=0)
+
+    async def resume_kv_cache_after_weight_update(self):
+        """Resume KV cache after distributed weight update."""
+        if self.wake_up_tag["kv_cache"]:
+            log("resume_kv_cache_after_weight_update: kv_cache already active", rank=0)
+            return
+        self.wake_up_tag["kv_cache"] = True
+        obj = ResumeMemoryOccupationReqInput(tags=["kv_cache"])
+        await self.infer_engine.tokenizer_manager.resume_memory_occupation(obj, None)
+        log("SglangEngine resume_kv_cache_after_weight_update done", rank=0)
+
     @override
     def update_engine_weight_by_model_idx(self, rm_model_idx):
         """Switch to a different reward model's weights.
@@ -391,7 +409,8 @@ class SglangEngine(InferEngine):
     ):
         """Receive weights via NCCL broadcast from the training rank."""
         obj = UpdateWeightsFromDistributedReqInput(**update_info)
-        return await self.infer_engine.tokenizer_manager.update_weights_from_distributed(obj, None)
+        ret = await self.infer_engine.tokenizer_manager.update_weights_from_distributed(obj, None)
+        return ret
 
     async def destroy_weights_update_group(self, group_name):
         """Destroy the NCCL process group created by ``init_weights_update_group``."""

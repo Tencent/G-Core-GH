@@ -419,15 +419,21 @@ class DeepseekV4Indexer(nn.Module):
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
 
         # ReLU(q·kᵀ) * weights, then top-k
-        if self.config.indexer_backend == 'fused' and packed_seq_params is None:
+        if self.config.indexer_backend == 'fused':
             weights = self.weights_proj(local_hidden_states).float() * self.weights_scaling
             q_sbhd = rearrange(q, 'b s h d -> s b h d').contiguous().to(torch.bfloat16)
             k_sbd = rearrange(compressed_kv, 'b t d -> t b d').contiguous().to(torch.bfloat16)
             w_sbh = rearrange(weights, 'b s h -> s b h').contiguous()
-            positions = position_ids[0].to(torch.int32)
-            cu_ks, cu_ke = _make_causal_cu_seqlens(
-                s_local, compressed_kv.shape[1], self.compress_rate, device, positions=positions,
-            )
+            if packed_seq_params is None:
+                positions = position_ids[0].to(torch.int32)
+                cu_ks, cu_ke = _make_causal_cu_seqlens(
+                    s_local, compressed_kv.shape[1], self.compress_rate, device, positions=positions,
+                )
+            else:
+                per_m = packed_seq_params.layout.per_m[self.compress_rate]
+                seg_starts = (packed_seq_params.cu_seqlens_q_padded[:-1] // self.compress_rate).to(device)
+                cu_ks = seg_starts[packed_seq_params.layout.seg_id_per_token].to(torch.int32)
+                cu_ke = per_m.causal_threshold_per_token.to(device=device, dtype=torch.int32)
             index_scores = batched_indexer_fwd(q_sbhd, k_sbd, w_sbh, cu_ks, cu_ke)  # [B, S, T]
         else:
             scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))  # [B, S, H, T]
@@ -1294,6 +1300,94 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
                 init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
+def _build_swa_topk(
+    s_local: int,
+    sliding_window: int,
+    cp_rank: int,
+    batch_size: int,
+    packed_seq_params: PackedSeqParams | None,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build ``[B, s_local, W]`` int32 sliding-window KV indices for fused attention.
+
+    Handles both BSHD (``packed_seq_params=None``) and THD
+    (cross-seg positions masked to ``-1``).
+    """
+    assert sliding_window <= s_local
+    ta = torch.arange(s_local, device=device).view(1, -1, 1)
+    tb = torch.arange(sliding_window, device=device).view(1, 1, -1)
+    if cp_rank == 0:
+        tb = tb - (sliding_window - 1)
+    swa_topk = (ta + tb).clamp(min=-1)
+
+    if packed_seq_params is not None:
+        seg_id_q = packed_seq_params.layout.seg_id_per_token
+        seg_id_kv = packed_seq_params.layout.seg_id_per_token_with_prefix
+        safe_idx = swa_topk.clamp(min=0).long()
+        cross_seg = seg_id_q.view(1, -1, 1) != seg_id_kv[safe_idx.view(-1)].view(
+            1, s_local, sliding_window
+        )
+        swa_topk = swa_topk.masked_fill(cross_seg, -1)
+
+    swa_topk = swa_topk.expand(batch_size, -1, -1).int()
+    return swa_topk
+
+
+def _build_attn_mask_or_swa_topk(
+    config,
+    inputs_embeds: torch.Tensor,
+    cp_active: bool,
+    cp_rank: int,
+    attention_mask=None,
+    past_key_values=None,
+    position_ids=None,
+    packed_seq_params: PackedSeqParams | None = None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Build either a dense causal mask (eager) or SWA topk indices (fused).
+
+    Shared by the backbone ``DeepseekV4Model.forward`` and the MTP path
+    in ``DeepseekV4ForCausalLM.forward``.
+    """
+    causal_mask = None
+    swa_topk = None
+    if config.attn_backend == 'eager':
+        if cp_active:
+            s_local = inputs_embeds.shape[1]
+            assert config.sliding_window <= s_local
+            swa_prefix_len = 0 if cp_rank == 0 else config.sliding_window - 1
+            causal_mask = build_cp_causal_mask(
+                s_local, cp_rank, swa_prefix_len, config.sliding_window,
+                packed_seq_params=packed_seq_params,
+                dtype=inputs_embeds.dtype, device=inputs_embeds.device,
+            )
+        elif isinstance(attention_mask, dict):
+            assert NotImplementedError('not supported')
+        else:
+            causal_mask = create_sliding_window_causal_mask(
+                config=config,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+            )
+            if packed_seq_params is not None:
+                seg_id = packed_seq_params.layout.seg_id_per_token
+                cross_seg = seg_id.unsqueeze(0) != seg_id.unsqueeze(1)
+                causal_mask = causal_mask.masked_fill(
+                    cross_seg.view(1, 1, *cross_seg.shape), float("-inf"),
+                )
+    else:
+        swa_topk = _build_swa_topk(
+            s_local=inputs_embeds.shape[1],
+            sliding_window=config.sliding_window,
+            cp_rank=cp_rank,
+            batch_size=inputs_embeds.shape[0],
+            packed_seq_params=packed_seq_params,
+            device=inputs_embeds.device,
+        )
+    return causal_mask, swa_topk
+
+
 @auto_docstring
 class DeepseekV4Model(DeepseekV4PreTrainedModel):
     def __init__(self, config: DeepseekV4Config):
@@ -1372,66 +1466,16 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             # `create_masks_for_generate`; all V4 layer types use the same sliding-window
             # mask, so use the prebuilt one directly. Otherwise build it here.
 
-        causal_mask = None
-        swa_topk = None
-        if self.config.attn_backend == 'eager':
-            if cp_active:
-                # 每层 sliding_window / s_local / cp_rank 一致，mask 一处算好
-                # 分发给所有 attention layer，避免重复算（NUM_LAYERS=4 时浪费
-                # 4 次）。``swa_ring_kv`` 在 rank 0 不送 prefix，rank > 0 送
-                # ``min(sliding_window-1, s_local)``。
-                s_local = inputs_embeds.shape[1]
-                assert self.config.sliding_window <= s_local
-                swa_prefix_len = 0 if self.cp_rank == 0 else self.config.sliding_window - 1
-                causal_mask = build_cp_causal_mask(
-                    s_local, self.cp_rank, swa_prefix_len, self.config.sliding_window,
-                    packed_seq_params=packed_seq_params,
-                    dtype=inputs_embeds.dtype, device=inputs_embeds.device,
-                )
-            elif isinstance(attention_mask, dict):
-                assert NotImplementedError('not supported')
-            else:
-                causal_mask = create_sliding_window_causal_mask(
-                    config=self.config,
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values,
-                    position_ids=position_ids,
-                )
-                if packed_seq_params is not None:
-                    seg_id = packed_seq_params.layout.seg_id_per_token
-                    cross_seg = seg_id.unsqueeze(0) != seg_id.unsqueeze(1)
-                    causal_mask = causal_mask.masked_fill(
-                        cross_seg.view(1, 1, *cross_seg.shape), float("-inf"),
-                    )
-        else:
-            # cp_rank == 0（无 prefix，buffer = local kv），W=4::
-            #     swa_topk[i] = [i-3, i-2, i-1, i]  # 序列起点不足处 clamp 成 -1
-            #     [[-1, -1, -1, 0],
-            #      [-1, -1,  0, 1],
-            #       ...
-            #      [ 4,  5,  6, 7]]
-            # cp_rank > 0（buffer = [prefix(W-1) ++ local kv]），W=4::
-            #     swa_topk[i] = [i, i+1, i+2, i+3]  # prefix 保证历史够，无 -1
-            s_local = inputs_embeds.shape[1]
-            SW = self.config.sliding_window
-            assert SW <= s_local
-            device = inputs_embeds.device
-            ta = torch.arange(s_local, device=device).view(1, -1, 1)
-            tb = torch.arange(SW, device=device).view(1, 1, -1)
-            if self.cp_rank == 0:
-                tb = tb - (SW - 1)
-            swa_topk = (ta + tb).clamp(min=-1)
-
-            if packed_seq_params is not None:
-                seg_id_q = packed_seq_params.layout.seg_id_per_token  # [s_local]
-                seg_id_kv = packed_seq_params.layout.seg_id_per_token_with_prefix
-                safe_idx = swa_topk.clamp(min=0).long()
-                cross_seg = seg_id_q.view(1, -1, 1) != seg_id_kv[safe_idx.view(-1)].view(1, s_local, SW)
-                swa_topk = swa_topk.masked_fill(cross_seg, -1)
-
-            swa_topk = swa_topk.expand(inputs_embeds.shape[0], -1, -1).int()
-            assert swa_topk.shape == (inputs_embeds.shape[0], s_local, SW) and swa_topk.dtype == torch.int32
+        causal_mask, swa_topk = _build_attn_mask_or_swa_topk(
+            config=self.config,
+            inputs_embeds=inputs_embeds,
+            cp_active=cp_active,
+            cp_rank=self.cp_rank,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+        )
 
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         position_embeddings = {
@@ -1567,6 +1611,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
         if labels is not None:
             loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
 
+        # TODO 这里 trainer 加一下
         aux_loss = None
         if output_router_logits:
             aux_loss = load_balancing_loss_func(
@@ -1583,62 +1628,32 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
             assert input_ids is not None, "MTP training path requires input_ids."
             mtp_hc_hidden = outputs.mtp_hc_hidden
             mtp_inputs_embeds = self.model.embed_tokens(input_ids)
-            mtp_position_ids = position_ids
-            if mtp_position_ids is None:
-                mtp_position_ids = torch.arange(
+            position_ids = position_ids
+            if position_ids is None:
+                position_ids = torch.arange(
                     mtp_inputs_embeds.shape[1], device=mtp_inputs_embeds.device
                 ).unsqueeze(0)
 
-            if packed_seq_params is not None:
-                raise NotImplementedError(
-                    "DeepSeek-V4 MTP+CP currently supports only non-packed sequence inputs."
-                )
-
-            mtp_causal_mask = None
-            mtp_swa_topk = None
-            if self.config.attn_backend == 'eager':
-                cp_active = self.model.cp_group is not None and self.model.cp_size > 1
-                if cp_active:
-                    s_local = mtp_inputs_embeds.shape[1]
-                    assert self.config.sliding_window <= s_local
-                    swa_prefix_len = 0 if self.model.cp_rank == 0 else self.config.sliding_window - 1
-                    mtp_causal_mask = build_cp_causal_mask(
-                        s_local,
-                        self.model.cp_rank,
-                        swa_prefix_len,
-                        self.config.sliding_window,
-                        packed_seq_params=packed_seq_params,
-                        dtype=mtp_inputs_embeds.dtype,
-                        device=mtp_inputs_embeds.device,
-                    )
-                else:
-                    mtp_causal_mask = create_sliding_window_causal_mask(
-                        config=self.config,
-                        inputs_embeds=mtp_inputs_embeds,
-                        attention_mask=attention_mask,
-                        past_key_values=None,
-                        position_ids=mtp_position_ids,
-                    )
-            else:
-                # fused sparse attn: 同主干，构建 sliding-window 下标 [B, S, W]。
-                s_local = mtp_inputs_embeds.shape[1]
-                SW = self.config.sliding_window
-                assert SW <= s_local
-                device = mtp_inputs_embeds.device
-                ta = torch.arange(s_local, device=device).view(1, -1, 1)
-                tb = torch.arange(SW, device=device).view(1, 1, -1)
-                if self.model.cp_rank == 0:
-                    tb = tb - (SW - 1)
-                mtp_swa_topk = (ta + tb).clamp(min=-1).expand(mtp_inputs_embeds.shape[0], -1, -1).int()
+            mtp_cp_active = self.model.cp_group is not None and self.model.cp_size > 1
+            mtp_causal_mask, mtp_swa_topk = _build_attn_mask_or_swa_topk(
+                config=self.config,
+                inputs_embeds=mtp_inputs_embeds,
+                cp_active=mtp_cp_active,
+                cp_rank=self.model.cp_rank,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+            )
 
             mtp_per_depth_h = self.mtp(
                 hidden_states=mtp_hc_hidden,
                 input_ids=input_ids,
                 embed_fn=self.model.embed_tokens,
                 cp_group=self.model.cp_group,
-                position_ids=mtp_position_ids,
+                position_ids=position_ids,
                 attention_mask=mtp_causal_mask,
                 swa_topk=mtp_swa_topk,
+                packed_seq_params=packed_seq_params,
             )
 
         result = MoeCausalLMOutputWithPast(

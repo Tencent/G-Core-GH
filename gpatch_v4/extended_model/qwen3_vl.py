@@ -4,9 +4,7 @@ import torch
 from typing_extensions import override
 
 from megatron.core import mpu, parallel_state
-from megatron.core.datasets.data_schedule import DefaultDynamicCPScheduler
 from megatron.core.datasets.data_schedule_utils import (
-    _get_global_seqlens_and_ids,
     get_thd_partitioned_indices,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -26,8 +24,8 @@ from gpatch_v4.utils import (
 )
 from gpatch_v4.utils.dynamic_cp_utils import (
     _round_up,
-    sft_dyn_cp_schedule_default,
-    sft_dyn_cp_schedule_smart_padding,
+    dyn_cp_schedule_default,
+    dyn_cp_schedule_smart_padding,
 )
 
 
@@ -326,6 +324,136 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         return batch, fwd_kwargs
 
+    @override
+    def ppo_value_train(
+        self,
+        batches: List[Dict[str, Any]],
+        seqlen: int,
+        pad_token_id: int,
+        ppo_pack_seq: bool,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        assert not ppo_pack_seq, f"not support ppo packed seq now"
+
+        tokens_l = []
+        position_ids_l = []
+        image_input_mask_l = []
+        values_l = []
+        returns_l = []
+        mask_l = []
+
+        vision_grid_thw_l = []
+        vision_data_l = []
+        input_features_l = []
+        feature_attention_mask_l = []
+        audio_feature_l = []
+        non_blocking = True
+        for batch in batches:
+            assert batch["tokens"].shape[-1] <= seqlen
+            tokens_l.append(pad_or_truncate_last_dim(batch["tokens"], seqlen, pad_token_id))
+            assert batch["position_ids"].shape[-1] >= seqlen, "小于 seqlen 时，不能 Pad 0"
+            position_ids_l.append(pad_or_truncate_last_dim(batch["position_ids"], seqlen, 0))
+            image_input_mask_l.append(
+                pad_or_truncate_last_dim(batch["image_input_mask"], seqlen, 0)
+            )
+
+            values_l.append(pad_or_truncate_last_dim(batch["values"], seqlen - 1, 0.0))
+            returns_l.append(pad_or_truncate_last_dim(batch["returns"], seqlen - 1, 0.0))
+            mask_l.append(pad_or_truncate_last_dim(batch["mask"], seqlen - 1, 0))
+
+            if "vision_data" in batch and batch["vision_data"] is not None:
+                vision_grid_thw_l.append(batch["vision_grid_thw"])
+                vision_data_l.append(batch["vision_data"])
+
+            if "input_features" in batch and batch["input_features"] is not None:
+                input_features_l.append(batch["input_features"].cuda(non_blocking=non_blocking))
+                feature_attention_mask_l.append(
+                    batch["feature_attention_mask"].cuda(non_blocking=non_blocking)
+                )
+
+            if "audio_feature" in batch and batch["audio_feature"] is not None:
+                audio_feature_l.append(batch["audio_feature"])
+
+        tokens = torch.stack(tokens_l).view(len(tokens_l), -1).cuda(non_blocking=non_blocking)
+        position_ids = torch.cat(position_ids_l, dim=1).cuda(non_blocking=non_blocking)
+
+        values = torch.stack(values_l)
+        returns = torch.stack(returns_l)
+        mask = torch.stack(mask_l)
+
+        image_input_mask = None
+        cp_img_num, images_padded, vision_data, vision_grid_thw = None, None, None, None
+        if len(vision_data_l) > 0:
+            cp_img_num, images_padded, vision_data, vision_grid_thw = self._padding_images(
+                vision_data_l, vision_grid_thw_l
+            )
+            image_input_mask = torch.cat(image_input_mask_l, dim=0).cuda(non_blocking=non_blocking)
+            vision_data = vision_data.cuda(non_blocking=non_blocking)
+            vision_grid_thw = vision_grid_thw.cuda(non_blocking=non_blocking)
+
+        input_features = None
+        feature_attention_mask = None
+        if len(input_features_l) > 0:
+            input_features = input_features_l
+            feature_attention_mask = feature_attention_mask_l
+
+        audio_feature = None
+        if len(audio_feature_l) > 0:
+            audio_feature = torch.cat(audio_feature_l, dim=0).cuda(non_blocking=non_blocking)
+
+        batch = {
+            "input_ids": tokens,
+            "position_ids": position_ids,
+            "pixel_values": vision_data,
+            "image_grid_thw": vision_grid_thw,
+            "image_input_mask": image_input_mask,
+            "images_padded": images_padded,
+            "cp_img_num": cp_img_num,
+            "values": values,
+            "returns": returns,
+            "mask": mask,
+            "input_features": input_features,
+            "feature_attention_mask": feature_attention_mask,
+            "audio_feature": audio_feature,
+        }
+        if mpu.is_pipeline_last_stage():
+            for k in ["mask", "values", "returns"]:
+                batch[k] = batch[k].cuda(non_blocking=non_blocking)
+
+        fwd_kwargs = dict(
+            input_ids=batch["input_ids"],
+            position_ids=batch["position_ids"],
+            pixel_values=batch["pixel_values"],
+            image_grid_thw=batch["image_grid_thw"],
+            image_input_mask=batch["image_input_mask"],
+            images_padded=batch["images_padded"],
+            cp_img_num=batch["cp_img_num"],
+            labels=None,
+        )
+        if batch["input_features"] is not None:
+            fwd_kwargs["input_features"] = batch["input_features"]
+            fwd_kwargs["feature_attention_mask"] = batch["feature_attention_mask"]
+
+        if audio_feature is not None:
+            fwd_kwargs["audio_feature"] = audio_feature
+
+        return batch, fwd_kwargs
+
+    @override
+    def prepare_loss_weights(
+        self,
+        loss_weights: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        if loss_weights.shape[-1] <= seq_len:
+            loss_weights = pad_or_truncate_last_dim(loss_weights, seq_len + 1, 0.0)
+            loss_weights = loss_weights[1:]
+        else:
+            loss_weights = loss_weights[1:]
+            loss_weights = loss_weights[-seq_len:]
+        return loss_weights
+
     def _prepare_tokens_and_labels(
         self,
         tokens: torch.Tensor,
@@ -379,6 +507,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         audio_feature_l = []
         meta_info_l = []
         non_blocking = True
+        loss_weights_list = []
+        loss_weights = None
         for batch in batches:
             attention_mask = pad_or_truncate_last_dim(batch["attention_mask"], seq_len, 0)
             tokens, labels = self._prepare_tokens_and_labels(
@@ -419,6 +549,11 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             if "square_averaging_weight" in batch:
                 square_averaging_weight_list.append(batch["square_averaging_weight"])
 
+            if "loss_weights" in batch:
+                lw = batch["loss_weights"]
+                lw = self.prepare_loss_weights(lw, seq_len)
+                loss_weights_list.append(lw)
+
             if "meta_info" in batch:
                 meta_info_l.append(batch["meta_info"])
 
@@ -436,6 +571,12 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 len(square_averaging_weight_list), -1
             ).cuda(non_blocking=True)
 
+        if len(loss_weights_list) > 0:
+            assert len(loss_weights_list) == len(tokens_l)
+            loss_weights = torch.stack(loss_weights_list).view(
+                len(loss_weights_list), -1
+            ).cuda(non_blocking=non_blocking)
+
         image_input_mask = None
         cp_img_num, images_padded, vision_data, vision_grid_thw = None, None, None, None
         if len(vision_data_l) > 0:
@@ -450,6 +591,10 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         if mpu.get_context_parallel_world_size() > 1:
             labels = get_tensor_on_this_cp_rank(labels, 1, key_name="labels")
             loss_mask = get_tensor_on_this_cp_rank(loss_mask, 1, key_name="loss_mask")
+            if loss_weights is not None:
+                loss_weights = get_tensor_on_this_cp_rank(
+                    loss_weights, 1, key_name="loss_weights"
+                )
 
         input_features = None
         feature_attention_mask = None
@@ -481,6 +626,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             "cp_img_num": cp_img_num,
             "images_padded": images_padded,
             "square_averaging_weights": square_averaging_weights,
+            "loss_weights": loss_weights,
             "input_features": input_features,
             "feature_attention_mask": feature_attention_mask,
             "video_second_per_grid": video_second_per_grid,
@@ -605,7 +751,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 f"Adjust gbs or context_parallel_size."
             )
             new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum = (
-                sft_dyn_cp_schedule_smart_padding(
+                dyn_cp_schedule_smart_padding(
                     gbs_batches,
                     dp_group,
                     cp_size,
@@ -629,7 +775,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 "position_ids",
             ]
             new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum = (
-                sft_dyn_cp_schedule_default(
+                dyn_cp_schedule_default(
                     gbs_batches,
                     dp_group,
                     tp_group,
@@ -771,6 +917,215 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         # Store cp_group in batch so the loss function can use it for CP reduction.
         batch["cp_group"] = cp_group
 
+        return batch, fwd_kwargs
+
+    @override
+    def grpo_reroute_data_for_dynamic_cp(
+        self,
+        gbs_batches: List[Dict[str, Any]],
+        pad_token_id: int,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float]:
+        dp_group = mpu.get_data_parallel_group()
+        tp_group = mpu.get_tensor_model_parallel_group()
+        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+
+        dp_cp_size = dp_cp_group.size()
+        tp_size = tp_group.size()
+        dp_cp_pad = 2 * dp_cp_size if dp_cp_size > 1 else 1
+        tp_pad = tp_size if tp_size > 1 else 1
+        pad_div = dp_cp_pad * tp_pad
+
+        dp_size = dp_group.size()
+        cp_size = dp_cp_group.size() // dp_size
+
+        dist_config = self.config.policy.dist_config
+
+        first = gbs_batches[0]
+        has_rollout = first.get("rollout_log_probs") is not None
+        has_sample_mask = first.get("sample_mask") is not None
+        global_retention_ratio = first.get("global_retention_ratio")
+
+        dtype_map = {"vision_data": torch.float32, "vision_grid_thw": torch.int64}
+        vision_data_last_dim = None
+        for i, batch in enumerate(gbs_batches):
+            if vision_data_last_dim is None and batch.get("vision_data") is not None:
+                vision_data_last_dim = batch["vision_data"].shape[-1]
+                assert dtype_map["vision_data"] == batch["vision_data"].dtype
+                assert dtype_map["vision_grid_thw"] == batch["vision_grid_thw"].dtype
+
+            tokens = batch["tokens"]
+            shifted_tokens = tokens[:-1]
+            shifted_labels = tokens[1:]
+            actual_len = shifted_tokens.shape[-1]
+            pad_len = _round_up(actual_len, pad_div)
+
+            # tokens / image_input_mask / position_ids index absolute positions, so the
+            # pre-shift (dropping the last token) needs no extra slicing here.
+            sample = dict(
+                tokens=pad_or_truncate_last_dim(shifted_tokens, pad_len, pad_token_id),
+                labels=pad_or_truncate_last_dim(shifted_labels, pad_len, 0),
+                loss_mask=pad_or_truncate_last_dim(batch["mask"], pad_len, 0).to(torch.float32),
+                position_ids=pad_or_truncate_last_dim(batch["position_ids"], pad_len,
+                                                      0).permute(1, 2, 0).reshape(-1).contiguous(),
+                image_input_mask=pad_or_truncate_last_dim(batch["image_input_mask"], pad_len,
+                                                          0).reshape(-1),
+                advantages=pad_or_truncate_last_dim(batch["advantages"], pad_len,
+                                                    0).to(torch.float32),
+                prev_log_probs=pad_or_truncate_last_dim(batch["logprobs"], pad_len,
+                                                        0).to(torch.float32),
+                ref_log_probs=pad_or_truncate_last_dim(batch["ref_logprobs"], pad_len,
+                                                       0).to(torch.float32),
+                original_seq_len=torch.tensor([actual_len], dtype=torch.int32),
+                padded_seq_len=torch.tensor([pad_len], dtype=torch.int32),
+                vision_data=batch["vision_data"].reshape(-1)
+                if batch.get("vision_data") is not None else None,
+                vision_grid_thw=batch["vision_grid_thw"].reshape(-1)
+                if batch.get("vision_grid_thw") is not None else None,
+            )
+            if has_rollout:
+                sample["rollout_log_probs"] = pad_or_truncate_last_dim(
+                    batch["rollout_log_probs"], pad_len, 0
+                ).to(torch.float32)
+            if has_sample_mask:
+                sm = batch["sample_mask"]
+                if sm.dim() == 0:
+                    sm = sm.unsqueeze(0)
+                sm = sm.expand(actual_len).to(torch.float32).contiguous()
+                sample["sample_mask"] = pad_or_truncate_last_dim(sm, pad_len, 0)
+            gbs_batches[i] = sample
+
+        # Schedule and pack with default dynamic CP scheduler.
+        dev = torch.cuda.current_device()
+        packed_keys = [
+            "tokens", "labels", "loss_mask", "image_input_mask", "position_ids",
+            "advantages", "prev_log_probs", "ref_log_probs",
+        ]
+        if has_rollout:
+            packed_keys.append("rollout_log_probs")
+        if has_sample_mask:
+            packed_keys.append("sample_mask")
+
+        cat_keys = ["vision_data", "vision_grid_thw"]
+        global_id_seqlens_keys = (
+            packed_keys + cat_keys + ["original_seq_len", "padded_seq_len"]
+        )
+        new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum = dyn_cp_schedule_default(
+            gbs_batches, dp_group, tp_group, dp_cp_group,
+            cp_size, dp_size, dist_config, dev,
+            packed_keys=packed_keys,
+            cat_keys=cat_keys,
+            global_id_seqlens_keys=global_id_seqlens_keys,
+            dtype_map=dtype_map,
+        )
+
+        # Restore vision tensors to their original shapes.
+        for sample in new_samples:
+            if sample.get("vision_data") is not None:
+                sample["vision_data"] = sample["vision_data"].reshape(-1, vision_data_last_dim)
+            if sample.get("vision_grid_thw") is not None:
+                sample["vision_grid_thw"] = sample["vision_grid_thw"].reshape(-1, 3)
+            if global_retention_ratio is not None:
+                sample["global_retention_ratio"] = global_retention_ratio
+
+        return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum
+
+    @override
+    def grpo_train_with_dynamic_cp(
+        self,
+        batches: List[Dict[str, Any]],
+        seqlen: int,
+        pad_token_id: int,
+        ppo_pack_seq: bool,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        assert len(batches) == 1, "grpo_train_with_dynamic_cp only supports one batch"
+        batch = batches[0]
+        # restore to gpu before forward.
+        for k, v in list(batch.items()):
+            if isinstance(v, torch.Tensor) and not v.is_cuda:
+                batch[k] = v.cuda(non_blocking=True)
+        assert "local_cp_size" in batch
+
+        lcp = batch.get("local_cp_size")
+        if lcp is not None:
+            lcp_val = lcp.item() if isinstance(lcp, torch.Tensor) else int(lcp)
+            cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=lcp_val)
+        else:
+            cp_group = parallel_state.get_context_parallel_group()
+
+        rl_token_keys = [
+            key for key in ("advantages", "prev_log_probs", "ref_log_probs", "rollout_log_probs",
+                            "sample_mask") if key in batch
+        ]
+
+        total_tokens = batch["tokens"].size(0)
+        cp_size = cp_group.size()
+        if cp_size > 1:
+            cp_rank = cp_group.rank()
+            # Pass cu_seqlens_padded as cu_seqlens to work around a TE bug in
+            # thd_get_partitioned_indices.
+            index = get_thd_partitioned_indices(
+                batch["cu_seqlens_padded"], total_tokens, cp_size, cp_rank
+            )
+            # tokens / image_input_mask need the full sequence; only loss-side
+            # fields are CP-split.
+            for key in ["labels", "loss_mask"] + rl_token_keys:
+                batch[key] = batch[key].index_select(0, index)
+            # position_ids is flattened mrope [3 * total_tokens]; reshape to the
+            # token axis before slicing.
+            pos_ids = batch["position_ids"].view(1, total_tokens, 3)
+            batch["position_ids"] = pos_ids.index_select(1, index).view(-1).contiguous()
+
+        tp_size = parallel_state.get_tensor_model_parallel_group().size()
+        assert batch["tokens"].size(0) % tp_size == 0, (
+            f"post-CP tokens ({batch['tokens'].size(0)}) not aligned to tp_size={tp_size}"
+        )
+
+        cp_tokens = batch["labels"].size(0)
+        batch["tokens"] = batch["tokens"].view(1, total_tokens).contiguous()
+        batch["image_input_mask"] = batch["image_input_mask"].view(1, total_tokens).contiguous()
+        batch["labels"] = batch["labels"].view(1, cp_tokens).contiguous()
+        batch["loss_mask"] = batch["loss_mask"].view(1, cp_tokens).contiguous()
+        batch["position_ids"] = batch["position_ids"].view(1, cp_tokens,
+                                                           3).permute(2, 0, 1).contiguous()
+        for key in rl_token_keys:
+            batch[key] = batch[key].view(1, cp_tokens).contiguous()
+
+        cu_seqlens_padded = batch["cu_seqlens_padded"]
+        max_seqlen = batch["max_seqlen"].item()
+        local_cp_size = batch["local_cp_size"].item()
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_padded,
+            cu_seqlens_kv=cu_seqlens_padded,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            local_cp_size=local_cp_size,
+            cp_group=cp_group,
+        )
+
+        batch["mask"] = batch.pop("loss_mask")
+        batch["target"] = batch.pop("labels")
+        if batch.get("global_retention_ratio") is not None:
+            batch["global_retention_ratio"] = batch["global_retention_ratio"].cuda()
+
+        fwd_kwargs = dict(
+            input_ids=batch["tokens"],
+            position_ids=batch["position_ids"],
+            attention_mask=None,
+            labels=None,
+            pixel_values=batch["vision_data"],
+            image_grid_thw=batch["vision_grid_thw"],
+            image_input_mask=batch["image_input_mask"],
+            images_padded=None,
+            cp_img_num=None,
+            packed_seq_params=packed_seq_params,
+        )
         return batch, fwd_kwargs
 
     @override

@@ -3,10 +3,9 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-try:
-    from gpatch_v4.models.deepseek_v4.mtp import mtp_roll_tensor_cp
-except ImportError:
-    mtp_roll_tensor_cp = None
+from gpatch_v4.models.deepseek_v4.mtp import mtp_roll_tensor
+
+# TODO: 这个文件需要重构，目前是 deepseek v4 强绑定的。
 
 
 def calculate_mtp_loss(
@@ -17,42 +16,48 @@ def calculate_mtp_loss(
     loss_fct,
     loss_mask: torch.Tensor | None = None,
     cp_group=None,
-    scaling_factor: float = 0.1,
+    packed_seq_params=None,
     ignore_index: int = -100,
-) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-    """Compute per-depth MTP CE using shared lm_head.
+) -> list[torch.Tensor]:
+    """Compute per-depth MTP masked-loss numerators using shared lm_head.
 
-    Notes
-    -----
-    `labels` is the shifted next-token label in gpatch_v4 SFT path.
-    For depth `k`, MTP predicts one additional token into the future, so we
-    roll labels by `-(k+1)` and mask the trailing `k+1` positions.
+    Returns the **local** (this CP rank's) per-depth loss numerator
+    ``sum(ce * mask)``. The caller is responsible for dividing by a global
+    denominator (see ``mtp_per_depth_valid_count``).
+
+    Parameters
+    ----------
+    labels : torch.Tensor
+        Shape ``[bsz, s_local]``; shifted next-token labels (possibly CP-chunked).
+    packed_seq_params : PackedSeqParams, optional
+        When provided (THD mode), roll is segment-aware.
+
+    Returns
+    -------
+    list[torch.Tensor]
+        Per-depth masked loss numerators (length = ``len(mtp_per_depth_h)``).
     """
     num_depth = len(mtp_per_depth_h)
     if num_depth == 0:
-        z = labels.new_zeros((), dtype=torch.float32)
-        return z, [], [], []
+        return []
 
     bsz, seq = labels.shape
     cp_size = 1 if cp_group is None else dist.get_world_size(cp_group)
     cp_rank = 0 if cp_group is None else dist.get_rank(cp_group)
 
-    per_depth_loss: list[torch.Tensor] = []
     per_depth_num: list[torch.Tensor] = []
-    per_depth_den: list[torch.Tensor] = []
     rolled_labels = labels
+    roll_kwargs = dict(cp_group=cp_group, packed_seq_params=packed_seq_params)
     rolled_mask = loss_mask
     for depth, hidden in enumerate(mtp_per_depth_h):
         logits = lm_head(hidden)
-        rolled_labels, _ = mtp_roll_tensor_cp(
-            rolled_labels,
-            shifts=-1,
-            dim=1,
-            cp_group=cp_group,
-        )
-        rolled_labels = rolled_labels.clone()
         trail = depth + 1
-        mask_global_tailing(rolled_labels, trail, ignore_index, seq, cp_size, cp_rank)
+        rolled_labels = mtp_roll_tensor(
+            rolled_labels,
+            **roll_kwargs,
+            trail=trail,
+            fill_value=ignore_index,
+        ).clone()
 
         depth_loss = loss_fct(
             logits.view(-1, logits.shape[-1]),
@@ -60,43 +65,71 @@ def calculate_mtp_loss(
         ).view(bsz, seq)
 
         if rolled_mask is not None:
-            rolled_mask, _ = mtp_roll_tensor_cp(
+            rolled_mask = mtp_roll_tensor(
                 rolled_mask,
-                shifts=-1,
-                dim=1,
-                cp_group=cp_group,
-            )
-            rolled_mask = rolled_mask.clone()
-            mask_global_tailing(rolled_mask, trail, 0, seq, cp_size, cp_rank)
+                **roll_kwargs,
+                trail=trail,
+                fill_value=0,
+            ).clone()
             valid_mask = (rolled_labels != ignore_index).to(depth_loss.dtype)
-            depth_loss = depth_loss * rolled_mask.to(depth_loss.dtype) * valid_mask
-            num = depth_loss.sum()
-            den = valid_mask.mul(rolled_mask.to(valid_mask.dtype)).sum().clamp_min(1.0)
-            depth_loss = num / den
+            dloss = (depth_loss * rolled_mask.to(depth_loss.dtype) * valid_mask).sum()
         else:
             valid = (rolled_labels != ignore_index).to(depth_loss.dtype)
-            num = (depth_loss * valid).sum()
-            den = valid.sum().clamp_min(1.0)
-            depth_loss = num / den
+            dloss = (depth_loss * valid).sum()
 
-        per_depth_loss.append(depth_loss)
-        per_depth_num.append(num)
-        per_depth_den.append(den)
+        per_depth_num.append(dloss)
 
-    total = torch.stack(per_depth_loss).sum() * (float(scaling_factor) / float(num_depth))
-    return total, per_depth_loss, per_depth_num, per_depth_den
+    return per_depth_num
 
 
-def mask_global_tailing(
-    x: torch.Tensor, trail: int, fill_value: int | float, local_seq: int, cp_size: int, cp_rank: int
-) -> None:
-    if trail <= 0:
-        return
-    if cp_size == 1:
-        x[:, -trail:] = fill_value
-        return
-    s_full = local_seq * cp_size
-    g0 = s_full - trail
-    local_from = max(0, g0 - cp_rank * local_seq)
-    if local_from < local_seq:
-        x[:, local_from:] = fill_value
+def mtp_per_depth_valid_count(
+    labels_full: torch.Tensor,
+    loss_mask_full: torch.Tensor,
+    num_depth: int,
+    cp_size: int,
+    cp_rank: int,
+    packed_seq_params=None,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """This CP rank's per-depth MTP valid-token count, from the FULL labels.
+
+    For BSHD: plain left-roll on the full sequence + contiguous CP chunk.
+    For THD: segment-aware roll via ``mtp_roll_tensor`` on the full packed
+    labels (no CP exchange needed since we operate on the unchunked tensor).
+
+    Parameters
+    ----------
+    labels_full : torch.Tensor
+        Shape ``[bsz, s_full]``; shifted next-token labels before CP chunking.
+    loss_mask_full : torch.Tensor
+        Shape ``[bsz, s_full]``; loss mask before CP chunking.
+    packed_seq_params : PackedSeqParams, optional
+        Packing metadata for THD mode. Either global or CP-sliced works
+        because only ``cu_seqlens_q_padded`` is used, which stays global
+        across CP chunks.
+    """
+    _, s_full = labels_full.shape
+    assert s_full % cp_size == 0, f"{s_full=} not divisible by {cp_size=}"
+    s_local = s_full // cp_size
+    lo, hi = cp_rank * s_local, (cp_rank + 1) * s_local
+
+    counts: list[torch.Tensor] = []
+    rolled_labels = labels_full
+    rolled_mask = loss_mask_full
+    for depth in range(num_depth):
+        trail = depth + 1
+        rolled_labels = mtp_roll_tensor(
+            rolled_labels,
+            packed_seq_params=packed_seq_params,
+            trail=trail,
+            fill_value=ignore_index,
+        )
+        rolled_mask = mtp_roll_tensor(
+            rolled_mask,
+            packed_seq_params=packed_seq_params,
+            trail=trail,
+            fill_value=0,
+        )
+        valid = (rolled_labels != ignore_index) & (rolled_mask != 0)
+        counts.append(valid[:, lo:hi].sum())
+    return torch.stack(counts)

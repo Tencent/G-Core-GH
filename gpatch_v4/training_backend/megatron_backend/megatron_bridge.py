@@ -125,9 +125,10 @@ class LinearForLastLayer(torch.nn.Linear):
 
 def make_value_model(model):
     for model_chunk in _ensure_model_list(model):
+        model_chunk.share_embeddings_and_output_weights = False
         config = get_model_config(model_chunk)
         if hasattr(model_chunk, "output_layer"):
-            model.output_layer = LinearForLastLayer(
+            model_chunk.output_layer = LinearForLastLayer(
                 input_size=config.hidden_size,
                 output_size=1,
                 config=config,

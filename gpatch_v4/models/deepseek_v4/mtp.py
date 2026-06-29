@@ -8,6 +8,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from transformers.modeling_layers import GradientCheckpointingLayer
 
+from .cp import _ring_all_to_all
 from .modeling_deepseek_v4 import (
     DeepseekV4Attention,
     DeepseekV4HyperConnection,
@@ -17,100 +18,160 @@ from .modeling_deepseek_v4 import (
 )
 
 
-def roll_tensor(
+def mtp_roll_tensor(
     tensor: torch.Tensor,
-    shifts: int = -1,
-    dim: int = -1,
     cp_group=None,
+    packed_seq_params=None,
+    trail: int = 1,
+    fill_value: int | float = 0,
 ) -> torch.Tensor:
-    """Roll ``tensor`` along ``dim`` by ``shifts`` and zero the wrapped slice."""
-    if cp_group is not None:
-        return mtp_roll_tensor_cp(
-            tensor,
-            shifts=shifts,
-            dim=dim,
-            cp_group=cp_group,
-        )[0]
-    rolled = torch.roll(tensor, shifts=shifts, dims=dim)
-    if shifts == 0 or tensor.shape[dim] == 0:
+    """Left-shift ``tensor`` by 1 along the sequence dim and fill the
+    last ``trail`` positions per segment with ``fill_value``.
+
+    Three paths: THD (segment-aware via ``packed_seq_params``),
+    CP (P2P boundary exchange via ``cp_group``), or plain roll.
+    """
+    cp_size = 1 if cp_group is None else dist.get_world_size(cp_group)
+    cp_rank = 0 if cp_size <= 1 else dist.get_rank(cp_group)
+
+    if packed_seq_params is not None:
+        rolled = _roll_tensor_thd(tensor, packed_seq_params=packed_seq_params, cp_group=cp_group)
+        cu = packed_seq_params.cu_seqlens_q_padded
+        s_local = tensor.shape[1]
+        global_start = cp_rank * s_local
+        global_end = global_start + s_local
+        for seg_i in range(cu.shape[0] - 1):
+            seg_start_g = int(cu[seg_i].item())
+            seg_end_g = int(cu[seg_i + 1].item())
+            trail_start_g = max(seg_start_g, seg_end_g - trail)
+            # Intersect [trail_start_g, seg_end_g) with local [global_start, global_end)
+            lo = max(trail_start_g, global_start) - global_start
+            hi = min(seg_end_g, global_end) - global_start
+            if lo < hi:
+                rolled[:, lo:hi] = fill_value
         return rolled
-    n = abs(shifts)
-    if shifts < 0:
-        idx = torch.arange(tensor.shape[dim] - n, tensor.shape[dim], device=tensor.device)
+    elif cp_group is not None:
+        rolled = _roll_tensor_cp(tensor, cp_group=cp_group)[0]
+        local_seq = tensor.shape[1]
+        s_full = local_seq * cp_size
+        g0 = s_full - trail
+        local_from = max(0, g0 - cp_rank * local_seq)
+        if local_from < local_seq:
+            rolled[:, local_from:] = fill_value
+        return rolled
     else:
-        idx = torch.arange(0, n, device=tensor.device)
-    return rolled.index_fill(dim, idx, 0)
+        rolled = torch.roll(tensor, shifts=-1, dims=1)
+        idx = torch.arange(tensor.shape[1] - trail, tensor.shape[1], device=tensor.device)
+        return rolled.index_fill(1, idx, fill_value)
 
 
-def mtp_roll_tensor_cp(
+def _roll_tensor_cp(
     tensor: torch.Tensor,
-    *,
-    shifts: int = -1,
-    dim: int = -1,
     cp_group=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Roll along sequence dim with DSV4 contiguous-CP boundary exchange.
+    """Left-shift by 1 along dim=1 with DSV4 contiguous-CP boundary exchange.
 
-    Designed for MTP's left-shift (`shifts=-1`) on tensors whose sequence axis
-    is partitioned contiguously across CP ranks (`cp_chunk_data` contract).
+    ``cp_size == 1``: ``torch.roll(..., -1)`` + zero tail.
 
-    For ``cp_size == 1`` (or ``cp_group is None``), behavior matches
-    ``torch.roll(..., -1)`` followed by zeroing the wrapped tail slot.
-
-    For ``cp_size > 1`` and ``shifts == -1``:
-    - local roll left by one token,
-    - replace the local tail token with the *next rank's pre-roll first token*,
-    - last CP rank fills the local tail token with zero.
+    ``cp_size > 1``: local roll left by one, replace the local tail token
+    with the next rank's pre-roll first token via ``all_to_all_single``
+    ring permutation; last CP rank zeros its tail.
     """
-    if shifts == 0 or tensor.shape[dim] == 0:
+    if tensor.shape[1] == 0:
         return tensor, tensor.sum()
 
     if cp_group is None or dist.get_world_size(cp_group) == 1:
-        rolled = torch.roll(tensor, shifts=shifts, dims=dim)
-        if shifts < 0:
-            rolled.select(dim, tensor.shape[dim] - 1).zero_()
-        else:
-            rolled.select(dim, 0).zero_()
+        rolled = torch.roll(tensor, shifts=-1, dims=1)
+        rolled[:, -1] = 0
         return rolled, rolled.sum()
 
-    assert shifts == -1, (
-        f"mtp_roll_tensor_cp currently supports shifts=-1 only, got shifts={shifts}"
-    )
     cp_rank = dist.get_rank(cp_group)
     cp_size = dist.get_world_size(cp_group)
 
-    rolled = torch.roll(tensor, shifts=shifts, dims=dim)
-    tail_view = rolled.select(dim, tensor.shape[dim] - 1)
+    rolled = torch.roll(tensor, shifts=-1, dims=1)
 
-    recv_from_next: torch.Tensor | None = None
-    ops: list[dist.P2POp] = []
-    if cp_rank > 0:
-        send_to_prev = tensor.select(dim, 0).contiguous()
-        ops.append(dist.P2POp(
-            dist.isend,
-            send_to_prev,
-            group_peer=cp_rank - 1,
-            group=cp_group,
-        ))
+    send_buf = tensor[:, :1, ...].contiguous()
+    recv_buf = _ring_all_to_all(
+        send_tensor=send_buf,
+        send_peer=(cp_rank - 1) % cp_size,
+        recv_peer=(cp_rank + 1) % cp_size,
+        group=cp_group,
+        seq_dim=1,
+    )
     if cp_rank < cp_size - 1:
-        recv_from_next = torch.empty_like(tail_view)
-        ops.append(
-            dist.P2POp(
-                dist.irecv,
-                recv_from_next,
-                group_peer=cp_rank + 1,
-                group=cp_group,
-            )
-        )
-    if ops:
-        for req in dist.batch_isend_irecv(ops):
-            req.wait()
-
-    if recv_from_next is None:
-        tail_view.zero_()
+        rolled[:, -1:] = recv_buf
     else:
-        tail_view.copy_(recv_from_next)
+        rolled[:, -1] = 0
     return rolled, rolled.sum()
+
+
+def _roll_tensor_thd(
+    tensor: torch.Tensor,
+    packed_seq_params,
+    cp_group=None,
+) -> torch.Tensor:
+    """Segment-aware left-shift by 1 along dim=1 for THD packed sequences.
+
+    Each segment (defined by ``cu_seqlens_q_padded``, GLOBAL offsets)
+    is rolled independently; the segment-final position is filled with
+    zero. Tokens never cross segment boundaries.
+
+    When ``cp_group`` has size > 1, ``tensor`` is the local CP chunk
+    ``[B, s_local]`` while ``cu_seqlens_q_padded`` stays global.
+    The local tail is exchanged with the next rank's first token
+    via ``all_to_all_single`` ring permutation (same pattern as
+    ``cp.py::_ring_all_to_all``); segment-final positions are then
+    zeroed regardless of what the exchange put there.
+    """
+
+    cu = packed_seq_params.cu_seqlens_q_padded
+    if cu.device != tensor.device:
+        cu = cu.to(tensor.device)
+
+    cp_size = 1 if cp_group is None else dist.get_world_size(cp_group)
+
+    if cp_size <= 1:
+        rolled = tensor.clone()
+        for seg_i in range(cu.shape[0] - 1):
+            seg_start = int(cu[seg_i].item())
+            seg_end = int(cu[seg_i + 1].item())
+            if seg_end <= seg_start:
+                continue
+            seg_rolled = torch.roll(tensor[:, seg_start:seg_end], shifts=-1, dims=1)
+            seg_rolled[:, -1] = 0
+            rolled[:, seg_start:seg_end] = seg_rolled
+        return rolled
+
+    cp_rank = dist.get_rank(cp_group)
+    s_local = tensor.shape[1]
+    global_start = cp_rank * s_local
+
+    # Step 1: local roll + ring exchange for CP boundary
+    rolled = torch.roll(tensor, shifts=-1, dims=1)
+
+    # Send first token to prev rank, recv from next rank into local tail.
+    # Uses all_to_all_single ring pattern (avoids P2P hang issues).
+    send_buf = tensor[:, :1, ...].contiguous()  # pre-roll first token
+    recv_buf = _ring_all_to_all(
+        send_tensor=send_buf,
+        send_peer=(cp_rank - 1) % cp_size,
+        recv_peer=(cp_rank + 1) % cp_size,
+        group=cp_group,
+        seq_dim=1,
+    )
+    if cp_rank < cp_size - 1:
+        rolled[:, -1:] = recv_buf
+    else:
+        rolled[:, -1] = 0
+
+    # Step 2: zero segment-final positions within local chunk.
+    for seg_i in range(cu.shape[0] - 1):
+        seg_end = int(cu[seg_i + 1].item())
+        local_pos = seg_end - 1 - global_start
+        if 0 <= local_pos < s_local:
+            rolled[:, local_pos] = 0
+
+    return rolled
 
 
 @dataclass
@@ -247,16 +308,16 @@ class DeepseekV4MTPModule(nn.Module):
         cp_group=None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        packed_seq_params=None,
         **kwargs,
     ) -> list[torch.Tensor]:
         per_depth_h: list[torch.Tensor] = []
         cur_input_ids = input_ids
         for block in self.layers:
-            cur_input_ids = roll_tensor(
+            cur_input_ids = mtp_roll_tensor(
                 cur_input_ids,
-                shifts=-1,
-                dim=-1,
                 cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
             )
             embed_input = embed_fn(cur_input_ids)
             hidden_states, prediction_hidden = block(

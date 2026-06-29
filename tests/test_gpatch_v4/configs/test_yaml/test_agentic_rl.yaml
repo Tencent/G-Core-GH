@@ -31,7 +31,6 @@ training:
     max_concurrency: 4
     adv_estimator: grpo
     mask_negative_samples: False
-    whiten_advantages: False
     reward_normalization:
       grouping: traj_group_id
       method: mean_std
@@ -129,6 +128,7 @@ ppo:
   grpo_advantage_epsilon: 1.0e-6
   ppo_ratio_eps: 0.2
   advantage_type: grpo
+  whiten_advantages: False
 
 debug:
   save_first_rollout_data: False

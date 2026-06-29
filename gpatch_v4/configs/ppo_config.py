@@ -14,13 +14,12 @@ class PpoConfig(MappingProtocol):
         ``"grpo"`` / ``"ppo"`` / ``"on_policy_distill"`` / ``"gdpo"`` /
         ``"gdpo_sample_bn"`` / ``"custom"``.
     loss_func : str
-        ``"grpo"`` / ``"gspo"`` / ``"fipo"``.
+        ``"grpo"`` / ``"gspo"`` / ``"fipo"`` / ``"sapo"`` / ``"cispo"``.
     ppo_value_truncate_head : bool
     ppo_initial_policy_kl_penalty : float
     ppo_discount_factor : float
         GAE gamma.
     ppo_gae_lambda : float
-    ppo_normalize_advantages : bool
     ppo_entropy_bonus : float
     ppo_ratio_eps : float
         PPO clipping epsilon for the probability ratio.
@@ -43,15 +42,20 @@ class PpoConfig(MappingProtocol):
         Symmetric advantage clipping bound ``[-x, +x]``.
     advantage_clip_lower_bound : float or None
     advantage_clip_upper_bound : float or None
+    whiten_advantages: bool
+        It takes effect in the reinforcement / identity stage.
     grpo_kl_loss_beta : float
     enable_off_policy_correction : bool
     off_policy_correction_level : str
         ``"token"`` / ``"sequence"`` / ``"geometric"``.
     off_policy_correction_mode : str
-        ``"truncate"`` (TIS) / ``"mask"`` (MIS) / ``"icepop"`` / ``"clip"`` (CIS).
+        ``"truncate"`` (TIS) / ``"mask"`` (MIS) / ``"icepop"`` / ``"kpop"`` / ``"clip"`` (CIS).
         ``"icepop"`` zeros out-of-range weights but keeps response_mask
         unchanged (denominator counts all valid tokens), matching verl's IcePop.
+        ``"kpop"`` masks tokens where bidirectional binary KL between proximal
+        and behavior policies exceeds ``off_policy_correction_upper_bound``.
     off_policy_correction_upper_bound : float
+        Also used as KPop binary KL threshold φ when mode="kpop".
     off_policy_correction_lower_bound : float or None
     off_policy_correction_veto_threshold : float or None
         If any token ratio < this value, zero the entire sequence weight.
@@ -85,10 +89,17 @@ class PpoConfig(MappingProtocol):
     ppo_entropy_global_cov : bool
         Compute the advantage-logprob covariance over the global train_gbs
         (across DP) rather than per-micro-batch. *False* keeps per-mb behavior.
+    sapo_tau_pos : float
+        SAPO soft-gate temperature for positive-advantage tokens.
+    sapo_tau_neg : float
+        SAPO soft-gate temperature for negative-advantage tokens (``> τ_pos``
+        recommended). See `arXiv:2511.20347 <https://arxiv.org/pdf/2511.20347>`_.
     """
     advantage_type: str = field(default="grpo", metadata={"help": "Whether to use advantage."})
     # use_grpo: bool = field(default=True, metadata={"help": "Whether to use grpo."})
-    loss_func: str = field(default="grpo", metadata={"help": "Loss function. [grpo, gspo]"})
+    loss_func: str = field(
+        default="grpo", metadata={"help": "Loss function. [grpo, gspo, fipo, sapo, cispo]"}
+    )
     loss_func_py_path: Optional[str] = field(
         default=None, metadata={"help": "Path to the loss function."}
     )
@@ -123,9 +134,6 @@ class PpoConfig(MappingProtocol):
         default=1.0, metadata={"help": "Ppo discount factor, ppo GAE gamma."}
     )
     ppo_gae_lambda: float = field(default=0.95, metadata={"help": "Ppo gae lambda."})
-    ppo_normalize_advantages: bool = field(
-        default=False, metadata={"help": "Whether to normalize advantages."}
-    )
     ppo_entropy_bonus: float = field(default=0.0, metadata={"help": "Ppo entropy bonus."})
     ppo_ratio_eps: float = field(default=0.2, metadata={"help": "Ppo ratio eps."})
     ppo_dual_clip_ratio_c: Optional[float] = field(
@@ -172,6 +180,10 @@ class PpoConfig(MappingProtocol):
         default=None,
         metadata={"help": "Explicit upper bound for advantage clipping."},
     )
+    whiten_advantages: bool = field(default=False, metadata={"help": "Whiten advantages"})
+    reinforce_gamma: float = field(
+        default=1.0, metadata={"help": "Gamma parameter for advantage calculation"}
+    )
 
     grpo_kl_loss_beta: float = field(default=1e-3, metadata={"help": "Grpo kl loss beta."})
     # Importance Sampling
@@ -185,10 +197,13 @@ class PpoConfig(MappingProtocol):
     # truncate: cap to upper bound, TIS
     # mask: zero outside [lower, upper] & modify mask denominator, MIS
     # icepop: zero outside [lower, upper] & keep mask unchanged (verl IcePop)
+    # kpop: mask tokens where bidirectional binary KL > upper_bound (KPop)
     # clip: clip to [lower, upper], CIS
     off_policy_correction_mode: str = "truncate"
     off_policy_correction_upper_bound: float = 2.0
     off_policy_correction_lower_bound: Optional[float] = None
+    # KPop binary KL clamping epsilon to avoid log(0) in Bernoulli KL computation.
+    off_policy_correction_kpop_eps: float = 1e-6
     # Per-token veto threshold. If any token ratio < this, zero the entire sequence weight, the sequences won't have gradient
     # Note: float number must be written with dot e.g. 1.0e-4, not 1e-4
     off_policy_correction_veto_threshold: Optional[float] = None
@@ -257,6 +272,20 @@ class PpoConfig(MappingProtocol):
                 "via a global threshold. Default True keeps the global behavior."
         }
     )
+    # SAPO (Soft Adaptive Policy Optimization) configuration
+    # ref: https://arxiv.org/pdf/2511.20347
+    sapo_tau_pos: float = field(
+        default=1.0,
+        metadata={"help": "SAPO soft-gate temperature for positive-advantage tokens (τ_pos)."},
+    )
+    sapo_tau_neg: float = field(
+        default=1.05,
+        metadata={
+            "help":
+                "SAPO soft-gate temperature for negative-advantage tokens (τ_neg). "
+                "Paper recommends τ_neg > τ_pos so negative-token gradients decay faster."
+        },
+    )
 
     gdpo_reward_weights: dict[str, Any] = field(default_factory=dict)
 
@@ -275,6 +304,7 @@ class PpoConfig(MappingProtocol):
     def __post_init__(self):
         builtin_types = {
             "grpo",
+            "reinforce",
             "ppo",
             "on_policy_distill",
             "g_opd",
@@ -283,6 +313,7 @@ class PpoConfig(MappingProtocol):
             "gdpo_sample_bn",
             "group_gdpo",
             "group_gdpo_sample_bn",
+            "identity",
         }
         if self.advantage_type not in builtin_types:
             assert self.custom_advantage_py_path is not None and self.custom_advantage_py_name is not None, (
