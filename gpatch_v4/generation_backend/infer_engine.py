@@ -521,7 +521,7 @@ class InferEngine:
             assert dist_init_addr is not None
             assert pipeline_parallel_size == 1
             assert expert_parallel_size <= tensor_parallel_size
-            extra_args = {}
+            extra_args = dict()
             extra_args["watchdog_timeout"] = 600
             extra_args["crash_dump_folder"] = sgl_crash_dump_folder
             if sgl_chunked_prefill_size is not None:
@@ -575,6 +575,16 @@ class InferEngine:
 
             extra_args.update(extra_infer_engine_config)
             log(f"init infer engine with extra_args: {extra_args=}", rank=0)
+
+            # SGLang 的 torch_memory_saver 与 expandable_segments 不兼容，
+            # 需要在 SGLang 子进程继承环境变量前清理掉。
+            cuda_alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+            if "expandable_segments" in cuda_alloc_conf:
+                parts = [p for p in cuda_alloc_conf.split(",") if "expandable_segments" not in p]
+                if parts:
+                    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(parts)
+                else:
+                    os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
             server_args = sgl.ServerArgs(
                 model_path=model_path,

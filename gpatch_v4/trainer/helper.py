@@ -73,7 +73,7 @@ def get_nnodes() -> int:
     for k in cluster_res.keys():
         if isinstance(k, str) and is_node_ipv4_format(k):
             nodes_key.append(k)
-    assert nnodes == len(nodes_key)
+    assert len(nodes_key) == nnodes
 
     return nnodes
 

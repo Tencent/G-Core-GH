@@ -4,9 +4,7 @@ import torch
 from typing_extensions import override
 
 from megatron.core import mpu, parallel_state
-from megatron.core.datasets.data_schedule_utils import (
-    get_thd_partitioned_indices,
-)
+from megatron.core.datasets.data_schedule_utils import get_thd_partitioned_indices
 from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
@@ -14,11 +12,13 @@ try:
 except ImportError:
     qwen3vl_parallel_split = None
 
+from gpatch_v4.configs.config import FinetuneConfig
 from gpatch_v4.core.constants import MODEL_ARCH
 from gpatch_v4.extended_model.base import PrepareDataForward
 from gpatch_v4.extended_model.mtp_mixin import OnlineMtpSftMixin
 from gpatch_v4.utils import (
     get_tensor_on_this_cp_rank,
+    pad_3d_seq_dim,
     pad_or_truncate_last_dim,
     qwen2vl_pad_and_split,
 )
@@ -187,6 +187,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         feature_attention_mask_l = []
         audio_feature_l = []
         non_blocking = True
+        has_ref_logprobs = "ref_logprobs" in batches[0]
+        has_rollout_logprobs = "rollout_log_probs" in batches[0]
         for batch in batches:
             assert batch["tokens"].shape[-1] <= seqlen
             tokens_l.append(pad_or_truncate_last_dim(batch["tokens"], seqlen, pad_token_id))
@@ -199,11 +201,15 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             advantages_l.append(pad_or_truncate_last_dim(batch["advantages"], seqlen - 1, 0))
             mask_l.append(pad_or_truncate_last_dim(batch["mask"], seqlen - 1, 0))
             logprobs_l.append(pad_or_truncate_last_dim(batch["logprobs"], seqlen - 1, 0))
-            ref_logprobs_l.append(pad_or_truncate_last_dim(batch["ref_logprobs"], seqlen - 1, 0))
+            if has_ref_logprobs:
+                ref_logprobs_l.append(
+                    pad_or_truncate_last_dim(batch["ref_logprobs"], seqlen - 1, 0)
+                )
 
-            rollout_logprobs_l.append(
-                pad_or_truncate_last_dim(batch["rollout_log_probs"], seqlen - 1, 0)
-            )
+            if has_rollout_logprobs:
+                rollout_logprobs_l.append(
+                    pad_or_truncate_last_dim(batch["rollout_log_probs"], seqlen - 1, 0)
+                )
 
             if "vision_data" in batch and batch["vision_data"] is not None:
                 vision_grid_thw_l.append(batch["vision_grid_thw"])
@@ -225,8 +231,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         advantages = torch.stack(advantages_l)
         mask = torch.stack(mask_l)
         logprobs = torch.stack(logprobs_l)
-        ref_logprobs = torch.stack(ref_logprobs_l)
-        rollout_log_probs = torch.stack(rollout_logprobs_l)
+        ref_logprobs = torch.stack(ref_logprobs_l) if has_ref_logprobs else None
+        rollout_log_probs = torch.stack(rollout_logprobs_l) if has_rollout_logprobs else None
 
         mtp_labels, mtp_loss_mask = self._build_online_mtp_labels(
             tokens, mask, do_cp_split=not ppo_pack_seq
@@ -293,9 +299,11 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             "audio_feature": audio_feature,
         }
         if mpu.is_pipeline_last_stage():
-            keys_to_cuda = [
-                "mask", "prev_log_probs", "ref_log_probs", "advantages", "rollout_log_probs"
-            ]
+            keys_to_cuda = ["mask", "prev_log_probs", "advantages"]
+            if batch["ref_log_probs"] is not None:
+                keys_to_cuda.append("ref_log_probs")
+            if batch["rollout_log_probs"] is not None:
+                keys_to_cuda.append("rollout_log_probs")
             if batch["sample_mask"] is not None:
                 keys_to_cuda.append("sample_mask")
             if batch["global_retention_ratio"] is not None:
@@ -440,6 +448,11 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         return batch, fwd_kwargs
 
+    def _get_default_vision_type(self, config):
+        if isinstance(config, FinetuneConfig):
+            return torch.float32
+        return torch.bfloat16
+
     @override
     def prepare_loss_weights(
         self,
@@ -573,9 +586,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         if len(loss_weights_list) > 0:
             assert len(loss_weights_list) == len(tokens_l)
-            loss_weights = torch.stack(loss_weights_list).view(
-                len(loss_weights_list), -1
-            ).cuda(non_blocking=non_blocking)
+            loss_weights = torch.stack(loss_weights_list).view(len(loss_weights_list),
+                                                               -1).cuda(non_blocking=non_blocking)
 
         image_input_mask = None
         cp_img_num, images_padded, vision_data, vision_grid_thw = None, None, None, None
@@ -592,9 +604,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             labels = get_tensor_on_this_cp_rank(labels, 1, key_name="labels")
             loss_mask = get_tensor_on_this_cp_rank(loss_mask, 1, key_name="loss_mask")
             if loss_weights is not None:
-                loss_weights = get_tensor_on_this_cp_rank(
-                    loss_weights, 1, key_name="loss_weights"
-                )
+                loss_weights = get_tensor_on_this_cp_rank(loss_weights, 1, key_name="loss_weights")
 
         input_features = None
         feature_attention_mask = None
@@ -685,6 +695,9 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         dist_config = self.config.policy.dist_config
         scheduler_type = dist_config.dynamic_cp_scheduler_type
+        scheduler_max_seqlen = kwargs.get(
+            "max_seqlen_per_dp_cp_rank", dist_config.max_seqlen_per_dp_cp_rank
+        )
         if scheduler_type == "smart_padding":
             dp_cp_pad = 2 * cp_size
         else:
@@ -694,14 +707,16 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         # 1. 将所有的张量都 reshape 成一维，方便后续的动态 cp 调度
         dtype_map = {
-            "vision_data": torch.float32,
             "vision_grid_thw": torch.int64,
+            "vision_data": self._get_default_vision_type(self.config),
         }
         vision_data_last_dim = None
         for i, batch in enumerate(gbs_batches):
             if batch.get("vision_data") is not None:
                 assert batch.get("vision_grid_thw") is not None
-                assert dtype_map["vision_data"] == batch["vision_data"].dtype
+                assert batch["vision_data"].dtype == dtype_map["vision_data"], (
+                    f"inconsistent vision_data dtype: {batch['vision_data'].dtype} vs {dtype_map['vision_data']}"
+                )
                 assert dtype_map["vision_grid_thw"] == batch["vision_grid_thw"].dtype
                 if batch["vision_data"].numel() > 0:
                     if vision_data_last_dim is None:
@@ -759,6 +774,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                     dev,
                     packed_keys,
                     cat_keys,
+                    max_seqlen_per_dp_cp_rank=scheduler_max_seqlen,
                 )
             )
         else:
@@ -774,7 +790,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 "vision_grid_thw",
                 "position_ids",
             ]
-            new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum = (
+            new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, _ = (
                 dyn_cp_schedule_default(
                     gbs_batches,
                     dp_group,
@@ -788,6 +804,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                     cat_keys,
                     global_id_seqlens_keys,
                     dtype_map,
+                    max_seqlen_per_dp_cp_rank=scheduler_max_seqlen,
+                    need_routing_info=False,
                 )
             )
 
@@ -920,13 +938,13 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         return batch, fwd_kwargs
 
     @override
-    def grpo_reroute_data_for_dynamic_cp(
+    def rl_reroute_data_for_dynamic_cp(
         self,
         gbs_batches: List[Dict[str, Any]],
         pad_token_id: int,
         pad_with_random_token: bool = False,
         **kwargs,
-    ) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float]:
+    ) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float, Dict[str, Any]]:
         dp_group = mpu.get_data_parallel_group()
         tp_group = mpu.get_tensor_model_parallel_group()
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -941,19 +959,53 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         cp_size = dp_cp_group.size() // dp_size
 
         dist_config = self.config.policy.dist_config
+        scheduler_max_seqlen = kwargs.get(
+            "max_seqlen_per_dp_cp_rank", dist_config.max_seqlen_per_dp_cp_rank
+        )
 
         first = gbs_batches[0]
-        has_rollout = first.get("rollout_log_probs") is not None
-        has_sample_mask = first.get("sample_mask") is not None
         global_retention_ratio = first.get("global_retention_ratio")
 
-        dtype_map = {"vision_data": torch.float32, "vision_grid_thw": torch.int64}
+        _optional_rl_keys = [
+            ("mask", "loss_mask"),
+            ("advantages", "advantages"),
+            ("logprobs", "prev_log_probs"),
+            ("ref_logprobs", "ref_log_probs"),
+            ("rollout_log_probs", "rollout_log_probs"),
+        ]
+        # OPD teacher logprobs: detect teacher_logprobs_* keys and unify to
+        # teacher_log_probs. For multi-teacher, select per-sample based on routing.
+        teacher_logprobs_keys = [k for k in first if k.startswith("teacher_logprobs_")]
+        if teacher_logprobs_keys:
+            _opd_teacher_names = [k[len("teacher_logprobs_"):] for k in teacher_logprobs_keys]
+            _opd_single_teacher = len(_opd_teacher_names) == 1
+            _opd_routing_field = "teacher_type"
+        else:
+            _opd_teacher_names = None
+
+        rl_key_map = [(src, dst) for src, dst in _optional_rl_keys if src in first]
+        has_sample_mask = first.get("sample_mask") is not None
+
+        dtype_map = {
+            "vision_grid_thw": torch.int64,
+            "vision_data": self._get_default_vision_type(self.config),
+        }
         vision_data_last_dim = None
         for i, batch in enumerate(gbs_batches):
-            if vision_data_last_dim is None and batch.get("vision_data") is not None:
-                vision_data_last_dim = batch["vision_data"].shape[-1]
-                assert dtype_map["vision_data"] == batch["vision_data"].dtype
+            if batch.get("vision_data") is not None:
+                assert batch.get("vision_grid_thw") is not None
+                assert batch["vision_data"].dtype == dtype_map["vision_data"], (
+                    f"inconsistent vision_data dtype: {batch['vision_data'].dtype} vs {dtype_map['vision_data']}"
+                )
                 assert dtype_map["vision_grid_thw"] == batch["vision_grid_thw"].dtype
+                if batch["vision_data"].numel() > 0:
+                    if vision_data_last_dim is None:
+                        vision_data_last_dim = batch["vision_data"].shape[-1]
+                    else:
+                        assert vision_data_last_dim == batch["vision_data"].shape[-1], (
+                            f"inconsistent vision_data last dim across samples: "
+                            f"{vision_data_last_dim=} != {batch['vision_data'].shape[-1]=}"
+                        )
 
             tokens = batch["tokens"]
             shifted_tokens = tokens[:-1]
@@ -966,17 +1018,10 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             sample = dict(
                 tokens=pad_or_truncate_last_dim(shifted_tokens, pad_len, pad_token_id),
                 labels=pad_or_truncate_last_dim(shifted_labels, pad_len, 0),
-                loss_mask=pad_or_truncate_last_dim(batch["mask"], pad_len, 0).to(torch.float32),
                 position_ids=pad_or_truncate_last_dim(batch["position_ids"], pad_len,
                                                       0).permute(1, 2, 0).reshape(-1).contiguous(),
                 image_input_mask=pad_or_truncate_last_dim(batch["image_input_mask"], pad_len,
                                                           0).reshape(-1),
-                advantages=pad_or_truncate_last_dim(batch["advantages"], pad_len,
-                                                    0).to(torch.float32),
-                prev_log_probs=pad_or_truncate_last_dim(batch["logprobs"], pad_len,
-                                                        0).to(torch.float32),
-                ref_log_probs=pad_or_truncate_last_dim(batch["ref_logprobs"], pad_len,
-                                                       0).to(torch.float32),
                 original_seq_len=torch.tensor([actual_len], dtype=torch.int32),
                 padded_seq_len=torch.tensor([pad_len], dtype=torch.int32),
                 vision_data=batch["vision_data"].reshape(-1)
@@ -984,10 +1029,19 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 vision_grid_thw=batch["vision_grid_thw"].reshape(-1)
                 if batch.get("vision_grid_thw") is not None else None,
             )
-            if has_rollout:
-                sample["rollout_log_probs"] = pad_or_truncate_last_dim(
-                    batch["rollout_log_probs"], pad_len, 0
+            for src_key, dst_key in rl_key_map:
+                sample[dst_key] = pad_or_truncate_last_dim(batch[src_key], pad_len,
+                                                           0).to(torch.float32)
+            if _opd_teacher_names is not None:
+                if _opd_single_teacher:
+                    tname = _opd_teacher_names[0]
+                else:
+                    tname = batch[_opd_routing_field]
+                sample["teacher_log_probs"] = pad_or_truncate_last_dim(
+                    batch[f"teacher_logprobs_{tname}"], pad_len, 0
                 ).to(torch.float32)
+                if "ref_log_probs" not in sample:
+                    sample["ref_log_probs"] = sample["teacher_log_probs"].clone()
             if has_sample_mask:
                 sm = batch["sample_mask"]
                 if sm.dim() == 0:
@@ -998,38 +1052,60 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         # Schedule and pack with default dynamic CP scheduler.
         dev = torch.cuda.current_device()
-        packed_keys = [
-            "tokens", "labels", "loss_mask", "image_input_mask", "position_ids",
-            "advantages", "prev_log_probs", "ref_log_probs",
-        ]
-        if has_rollout:
-            packed_keys.append("rollout_log_probs")
+        packed_keys = ["tokens", "labels", "image_input_mask", "position_ids"]
+        packed_keys.extend(dst for _, dst in rl_key_map)
+        if _opd_teacher_names is not None:
+            packed_keys.append("teacher_log_probs")
+            if "ref_log_probs" not in packed_keys:
+                packed_keys.append("ref_log_probs")
         if has_sample_mask:
             packed_keys.append("sample_mask")
 
         cat_keys = ["vision_data", "vision_grid_thw"]
-        global_id_seqlens_keys = (
-            packed_keys + cat_keys + ["original_seq_len", "padded_seq_len"]
-        )
-        new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum = dyn_cp_schedule_default(
-            gbs_batches, dp_group, tp_group, dp_cp_group,
-            cp_size, dp_size, dist_config, dev,
-            packed_keys=packed_keys,
-            cat_keys=cat_keys,
-            global_id_seqlens_keys=global_id_seqlens_keys,
-            dtype_map=dtype_map,
+        global_id_seqlens_keys = (packed_keys + cat_keys + ["original_seq_len", "padded_seq_len"])
+        new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, routing_info = (
+            dyn_cp_schedule_default(
+                gbs_batches,
+                dp_group,
+                tp_group,
+                dp_cp_group,
+                cp_size,
+                dp_size,
+                dist_config,
+                dev,
+                packed_keys=packed_keys,
+                cat_keys=cat_keys,
+                global_id_seqlens_keys=global_id_seqlens_keys,
+                dtype_map=dtype_map,
+                max_seqlen_per_dp_cp_rank=scheduler_max_seqlen,
+            )
         )
 
         # Restore vision tensors to their original shapes.
         for sample in new_samples:
-            if sample.get("vision_data") is not None:
-                sample["vision_data"] = sample["vision_data"].reshape(-1, vision_data_last_dim)
-            if sample.get("vision_grid_thw") is not None:
-                sample["vision_grid_thw"] = sample["vision_grid_thw"].reshape(-1, 3)
+            for k in sample.keys():
+                if sample[k] is None:
+                    continue
+                if k in ["vision_data"]:
+                    if sample[k].numel() == 0:
+                        continue
+                    # dynamic-cp 交换数据后，不是所有 rank 的 vision_data_last_dim 都有值
+                    if vision_data_last_dim is None:
+                        vision_grid_thw = sample["vision_grid_thw"].reshape(-1, 3)
+                        vision_rows = vision_grid_thw.prod(dim=1).sum().item()
+                        assert vision_rows > 0, f"{vision_grid_thw=}"
+                        assert sample[k].numel() % vision_rows == 0, (
+                            f"invalid vision_data/grid_thw shape: {sample[k].shape=}, "
+                            f"{vision_grid_thw=}"
+                        )
+                        vision_data_last_dim = sample[k].numel() // vision_rows
+                    sample[k] = sample[k].reshape(-1, vision_data_last_dim)
+                elif k in ["vision_grid_thw"]:
+                    sample[k] = sample[k].reshape(-1, 3)
             if global_retention_ratio is not None:
                 sample["global_retention_ratio"] = global_retention_ratio
 
-        return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum
+        return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, routing_info
 
     @override
     def grpo_train_with_dynamic_cp(
@@ -1057,8 +1133,10 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             cp_group = parallel_state.get_context_parallel_group()
 
         rl_token_keys = [
-            key for key in ("advantages", "prev_log_probs", "ref_log_probs", "rollout_log_probs",
-                            "sample_mask") if key in batch
+            key for key in (
+                "advantages", "prev_log_probs", "ref_log_probs", "rollout_log_probs",
+                "teacher_log_probs", "sample_mask"
+            ) if key in batch
         ]
 
         total_tokens = batch["tokens"].size(0)
@@ -1072,7 +1150,10 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             )
             # tokens / image_input_mask need the full sequence; only loss-side
             # fields are CP-split.
-            for key in ["labels", "loss_mask"] + rl_token_keys:
+            cp_split_keys = ["labels"] + rl_token_keys
+            if "loss_mask" in batch:
+                cp_split_keys.append("loss_mask")
+            for key in cp_split_keys:
                 batch[key] = batch[key].index_select(0, index)
             # position_ids is flattened mrope [3 * total_tokens]; reshape to the
             # token axis before slicing.
@@ -1088,9 +1169,10 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         batch["tokens"] = batch["tokens"].view(1, total_tokens).contiguous()
         batch["image_input_mask"] = batch["image_input_mask"].view(1, total_tokens).contiguous()
         batch["labels"] = batch["labels"].view(1, cp_tokens).contiguous()
-        batch["loss_mask"] = batch["loss_mask"].view(1, cp_tokens).contiguous()
-        batch["position_ids"] = batch["position_ids"].view(1, cp_tokens,
-                                                           3).permute(2, 0, 1).contiguous()
+        if "loss_mask" in batch:
+            batch["loss_mask"] = batch["loss_mask"].view(1, cp_tokens).contiguous()
+        batch["position_ids"] = batch["position_ids"].view(1, cp_tokens, 3).permute(2, 0,
+                                                                                    1).contiguous()
         for key in rl_token_keys:
             batch[key] = batch[key].view(1, cp_tokens).contiguous()
 
@@ -1109,7 +1191,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             cp_group=cp_group,
         )
 
-        batch["mask"] = batch.pop("loss_mask")
+        if "loss_mask" in batch:
+            batch["mask"] = batch.pop("loss_mask")
         batch["target"] = batch.pop("labels")
         if batch.get("global_retention_ratio") is not None:
             batch["global_retention_ratio"] = batch["global_retention_ratio"].cuda()
@@ -1127,6 +1210,23 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             packed_seq_params=packed_seq_params,
         )
         return batch, fwd_kwargs
+
+    @override
+    def opd_train_with_dynamic_cp(
+        self,
+        batches: List[Dict[str, Any]],
+        seqlen: int,
+        pad_token_id: int,
+        ppo_pack_seq: bool,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        assert "teacher_log_probs" in batches[0], (
+            "OPD dynamic CP requires teacher_log_probs in packed batch"
+        )
+        return self.grpo_train_with_dynamic_cp(
+            batches, seqlen, pad_token_id, ppo_pack_seq, pad_with_random_token, **kwargs
+        )
 
     @override
     def opd_train(
@@ -1149,7 +1249,10 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         ref_logprobs_l = []
         teacher_logprobs_l = []
         rollout_logprobs_l = []
+        prev_topk_logprobs_l = []
+        opd_topk_ids_l = []
         has_ref_logprobs = "ref_logprobs" in batches[0]
+        has_topk = "prev_topk_logprobs" in batches[0] and "opd_topk_ids" in batches[0]
 
         vision_grid_thw_l = []
         vision_data_l = []
@@ -1166,7 +1269,11 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 pad_or_truncate_last_dim(batch["image_input_mask"], seqlen, 0)
             )
 
-            advantages_l.append(pad_or_truncate_last_dim(batch["advantages"], seqlen - 1, 0))
+            adv = batch["advantages"]
+            if adv.dim() == 2:
+                advantages_l.append(pad_3d_seq_dim(adv, seqlen - 1, 0))
+            else:
+                advantages_l.append(pad_or_truncate_last_dim(adv, seqlen - 1, 0))
             mask_l.append(pad_or_truncate_last_dim(batch["mask"], seqlen - 1, 0))
             logprobs_l.append(pad_or_truncate_last_dim(batch["logprobs"], seqlen - 1, 0))
 
@@ -1192,6 +1299,11 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             rollout_logprobs_l.append(
                 pad_or_truncate_last_dim(batch["rollout_log_probs"], seqlen - 1, 0)
             )
+            if has_topk:
+                prev_topk_logprobs_l.append(
+                    pad_3d_seq_dim(batch['prev_topk_logprobs'], seqlen - 1, 0)
+                )
+                opd_topk_ids_l.append(pad_3d_seq_dim(batch['opd_topk_ids'], seqlen - 1, 0))
 
             if "vision_data" in batch and batch["vision_data"] is not None:
                 vision_grid_thw_l.append(batch["vision_grid_thw"])
@@ -1211,6 +1323,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         teacher_logprobs = torch.stack(teacher_logprobs_l)
         ref_logprobs = torch.stack(ref_logprobs_l) if has_ref_logprobs else teacher_logprobs
         rollout_log_probs = torch.stack(rollout_logprobs_l)
+        prev_topk_logprobs = torch.stack(prev_topk_logprobs_l) if has_topk else None
+        opd_topk_ids = torch.stack(opd_topk_ids_l) if has_topk else None
 
         mtp_labels, mtp_loss_mask = self._build_online_mtp_labels(
             tokens, mask, do_cp_split=not ppo_pack_seq
@@ -1250,11 +1364,17 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             "mtp_loss_mask": mtp_loss_mask,
             "audio_feature": audio_feature,
         }
+        if has_topk:
+            batch["prev_topk_logprobs"] = prev_topk_logprobs
+            batch["opd_topk_ids"] = opd_topk_ids
         if mpu.is_pipeline_last_stage():
-            for k in [
+            keys_to_cuda = [
                 "mask", "prev_log_probs", "ref_log_probs", "teacher_log_probs", "advantages",
-                "rollout_log_probs"
-            ]:
+                "rollout_log_probs",
+            ]
+            if has_topk:
+                keys_to_cuda.extend(["prev_topk_logprobs", "opd_topk_ids"])
+            for k in keys_to_cuda:
                 batch[k] = batch[k].cuda(non_blocking=non_blocking)
 
         fwd_kwargs = dict(

@@ -25,6 +25,7 @@ from gpatch_v4.configs.config import (
     InferenceConfig,
     OffPolicyDistillConfig,
     OnPolicyDistillConfig,
+    RewardConfig,
     RlConfig,
     T2iRlConfig,
 )
@@ -247,7 +248,7 @@ def allocation_from_config(config) -> ResourceAllocation:
         config,
         (
             EvaluateConfig, FinetuneConfig, RlConfig, T2iRlConfig, OnPolicyDistillConfig,
-            OffPolicyDistillConfig, DpoConfig
+            OffPolicyDistillConfig, DpoConfig, RewardConfig
         ),
     ), f"unknown config {type(config).__name__}"
 
@@ -279,8 +280,8 @@ def allocation_from_config(config) -> ResourceAllocation:
         alloc.role_gpus_per_node["kv"] = kv_dc.num_gpus_per_node
         alloc.role_min_gpus_per_replica["kv"] = 1
 
-    # sampler: absent in FinetuneConfig / T2iRlConfig / DpoConfig.
-    if not isinstance(config, (FinetuneConfig, T2iRlConfig, DpoConfig)):
+    # sampler: absent in FinetuneConfig / T2iRlConfig / DpoConfig / RewardConfig.
+    if not isinstance(config, (FinetuneConfig, T2iRlConfig, DpoConfig, RewardConfig)):
         sampler_dc = config.sampler.dist_config
         alloc.role_nnodes["sampler"] = sampler_dc.nnodes
         alloc.role_gpus_per_node["sampler"] = sampler_dc.num_gpus_per_node
@@ -301,7 +302,7 @@ def allocation_from_config(config) -> ResourceAllocation:
     # 没有 ``training`` 字段（旧 config）时按旧行为默认启用，避免破坏既有 yaml。
     if not isinstance(
         config,
-        (FinetuneConfig, OffPolicyDistillConfig, EvaluateConfig, DpoConfig),
+        (FinetuneConfig, OffPolicyDistillConfig, EvaluateConfig, DpoConfig, RewardConfig),
     ):
         training_cfg = getattr(config, "training", None)
         use_gen_rm = getattr(training_cfg, "use_gen_rm_reward", True)

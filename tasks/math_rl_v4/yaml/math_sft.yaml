@@ -15,8 +15,8 @@ training:
 
 policy:
   dist_config:
-    tensor_model_parallel_size: 1
-    pipeline_model_parallel_size: 1
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 2
   model_arch: "qwen2"
   without_ref: True
   hf_model_path: "hf-hub/Qwen/Qwen2.5-Math-1.5B"

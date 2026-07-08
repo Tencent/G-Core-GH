@@ -414,6 +414,117 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         )
         return batch, fwd_kwargs
 
+    def rm_train(
+        self,
+        batches: List[Dict[str, Any]],
+        seq_len: int,
+        pad_token_id: int,
+        comput_attn_mask: bool = True,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """Prepare a micro-batch for Bradley-Terry reward-model training.
+
+        The dataset yields each preference pair with **separate** keys
+        ``chosen_tokens`` / ``rejected_tokens`` (unpadded ``[T]``) plus their
+        ``chosen_sequence_length`` / ``rejected_sequence_length`` (valid-token
+        count). The micro-batch is fused here as a chosen block followed by a
+        rejected block, so ``rm_bt`` splits it in half. Unlike ``sft_train``
+        there is no label shift: the model reads the whole sequence and the
+        scalar reward is pooled at the last valid token (``sequence_lengths -
+        1``). Context parallel is not supported.
+
+        Parameters
+        ----------
+        batches : list of dict
+            Each item is one pair with ``chosen_tokens`` ``[T]``,
+            ``rejected_tokens`` ``[T]`` (unpadded) and their scalar
+            ``chosen_sequence_length`` / ``rejected_sequence_length``. The fused
+            micro-batch puts all chosen sequences first, then all rejected.
+
+        Returns
+        -------
+        Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
+            ``(batch, fwd_kwargs)``; ``batch["sequence_lengths"]`` shape ``[B]``.
+        """
+        assert dist.get_world_size(mpu.get_context_parallel_group()) == 1, \
+            "rm_train (output_scalar reward model) does not support context parallel yet"
+        non_blocking = True
+        vocab_size = kwargs.get("vocab_size", 0)
+
+        def _pad(toks):
+            return pad_or_truncate_last_dim(
+                toks,
+                seq_len,
+                pad_token_id,
+                pad_with_random_token=pad_with_random_token,
+                vocab_size=vocab_size,
+            )
+
+        chosen_tokens_l = []
+        rejected_tokens_l = []
+        chosen_seqlen_l = []
+        rejected_seqlen_l = []
+        for batch in batches:
+            required = (
+                "chosen_tokens", "rejected_tokens",
+                "chosen_sequence_length", "rejected_sequence_length",
+            )
+            assert all(k in batch for k in required), \
+                f"reward model dataset must provide {required}"
+            chosen_tokens_l.append(_pad(batch["chosen_tokens"]))
+            rejected_tokens_l.append(_pad(batch["rejected_tokens"]))
+            chosen_seqlen_l.append(int(batch["chosen_sequence_length"]))
+            rejected_seqlen_l.append(int(batch["rejected_sequence_length"]))
+
+        # chosen block first, then rejected block (rm_bt splits the micro-batch in half)
+        tokens_l = chosen_tokens_l + rejected_tokens_l
+        seqlen_l = chosen_seqlen_l + rejected_seqlen_l
+        tokens = torch.stack(tokens_l).view(len(tokens_l), -1)
+        sequence_lengths = torch.tensor(seqlen_l, dtype=torch.long).clamp(max=seq_len)
+        attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
+            data=tokens,
+            eod_token=pad_token_id,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+            compute_attention_mask=comput_attn_mask,
+        )
+
+        batch = {
+            "tokens": tokens,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "sequence_lengths": sequence_lengths,
+        }
+        required_keys = set()
+        if mpu.get_pipeline_model_parallel_world_size() == 1:
+            required_keys.update(batch.keys())
+        else:
+            required_keys.add("attention_mask")
+            required_keys.add("position_ids")
+            if mpu.is_pipeline_first_stage():
+                required_keys.add("tokens")
+            if mpu.is_pipeline_last_stage():
+                required_keys.update(("tokens", "sequence_lengths"))
+
+        batch = {
+            key:
+                (
+                    val.cuda(non_blocking=non_blocking)
+                    if key in required_keys and val is not None else None
+                )
+            for key, val in batch.items()
+        }
+
+        fwd_kwargs = dict(
+            input_ids=batch.pop("tokens"),
+            position_ids=batch.pop("position_ids"),
+            attention_mask=batch.pop("attention_mask"),
+            labels=None,
+        )
+        return batch, fwd_kwargs
+
     @override
     def prepare_loss_weights(
         self,
@@ -690,11 +801,11 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         teacher_logprobs_l = []
         rollout_logprobs_l = []
         sequence_lengths_l = []
-        stu_topk_logprobs_l = []
-        stu_topk_ids_l = []
+        prev_topk_logprobs_l = []
+        opd_topk_ids_l = []
         has_rollout_logprobs = "rollout_log_probs" in batches[0]
         has_ref_logprobs = "ref_logprobs" in batches[0]
-        has_topk = "stu_topk_logprobs" in batches[0] and "stu_topk_ids" in batches[0]
+        has_topk = "prev_topk_logprobs" in batches[0] and "opd_topk_ids" in batches[0]
 
         teacher_names = list(self.config.teachers.keys())
         is_single_teacher = len(teacher_names) == 1
@@ -742,10 +853,10 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                     pad_or_truncate_last_dim(batch['rollout_log_probs'], seqlen - 1, 0)
                 )
             if has_topk:
-                stu_topk_logprobs_l.append(
-                    pad_3d_seq_dim(batch['stu_topk_logprobs'], seqlen - 1, 0)
+                prev_topk_logprobs_l.append(
+                    pad_3d_seq_dim(batch['prev_topk_logprobs'], seqlen - 1, 0)
                 )
-                stu_topk_ids_l.append(pad_3d_seq_dim(batch['stu_topk_ids'], seqlen - 1, 0))
+                opd_topk_ids_l.append(pad_3d_seq_dim(batch['opd_topk_ids'], seqlen - 1, 0))
             sequence_lengths_l.append(batch['sequence_lengths'])
 
         tokens = torch.stack(tokens_l).cuda(non_blocking=non_blocking)
@@ -756,8 +867,8 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         ref_logprobs = torch.stack(ref_logprobs_l) if has_ref_logprobs else teacher_logprobs
         rollout_log_probs = torch.stack(rollout_logprobs_l) if has_rollout_logprobs else None
         sequence_lengths = torch.stack(sequence_lengths_l)
-        stu_topk_logprobs = torch.stack(stu_topk_logprobs_l) if has_topk else None
-        stu_topk_ids = torch.stack(stu_topk_ids_l) if has_topk else None
+        prev_topk_logprobs = torch.stack(prev_topk_logprobs_l) if has_topk else None
+        opd_topk_ids = torch.stack(opd_topk_ids_l) if has_topk else None
 
         attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
             data=tokens,
@@ -798,8 +909,8 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         if has_rollout_logprobs:
             batch["rollout_log_probs"] = rollout_log_probs
         if has_topk:
-            batch["prev_topk_logprobs"] = stu_topk_logprobs
-            batch["stu_topk_ids"] = stu_topk_ids
+            batch["prev_topk_logprobs"] = prev_topk_logprobs
+            batch["opd_topk_ids"] = opd_topk_ids
 
         required_keys = set()
         if mpu.get_pipeline_model_parallel_world_size() == 1:
@@ -822,7 +933,7 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                         "rollout_log_probs",
                         'target',
                         "prev_topk_logprobs",
-                        "stu_topk_ids",
+                        "opd_topk_ids",
                     )
                 )
                 # mtp requires positon_ids and labels
@@ -869,6 +980,9 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
 
         dist_config = self.config.policy.dist_config
         scheduler_type = dist_config.dynamic_cp_scheduler_type
+        scheduler_max_seqlen = kwargs.get(
+            "max_seqlen_per_dp_cp_rank", dist_config.max_seqlen_per_dp_cp_rank
+        )
         if scheduler_type == "smart_padding":
             dp_cp_pad = 2 * cp_size
         else:
@@ -920,6 +1034,7 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                     dev,
                     packed_keys,
                     cat_keys,
+                    max_seqlen_per_dp_cp_rank=scheduler_max_seqlen,
                 )
             )
         else:
@@ -929,7 +1044,7 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                 "padded_seq_len"
             ]
             dtype_map = {}
-            new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum = (
+            new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, _ = (
                 dyn_cp_schedule_default(
                     gbs_batches,
                     dp_group,
@@ -943,19 +1058,21 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                     cat_keys,
                     global_id_seqlens_keys,
                     dtype_map,
+                    max_seqlen_per_dp_cp_rank=scheduler_max_seqlen,
+                    need_routing_info=False,
                 )
             )
 
         return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum
 
     @override
-    def grpo_reroute_data_for_dynamic_cp(
+    def rl_reroute_data_for_dynamic_cp(
         self,
         gbs_batches: List[Dict[str, Any]],
         pad_token_id: int,
         pad_with_random_token: bool = False,
         **kwargs,
-    ) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float]:
+    ) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float, Dict[str, Any]]:
         dp_group = mpu.get_data_parallel_group()
         tp_group = mpu.get_tensor_model_parallel_group()
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -970,11 +1087,33 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         cp_size = dp_cp_group.size() // dp_size
 
         dist_config = self.config.policy.dist_config
+        scheduler_max_seqlen = kwargs.get(
+            "max_seqlen_per_dp_cp_rank", dist_config.max_seqlen_per_dp_cp_rank
+        )
 
         first = gbs_batches[0]
-        has_rollout = first.get("rollout_log_probs") is not None
-        has_sample_mask = first.get("sample_mask") is not None
         global_retention_ratio = first.get("global_retention_ratio")
+
+        # (src_key, dst_key) — keys present in the input batch that should be
+        # padded to (seq_len - 1) and included in the rerouted sample / packing.
+        _optional_rl_keys = [
+            ("mask", "loss_mask"),
+            ("advantages", "advantages"),
+            ("logprobs", "prev_log_probs"),
+            ("ref_logprobs", "ref_log_probs"),
+            ("rollout_log_probs", "rollout_log_probs"),
+        ]
+        # OPD teacher logprobs: detect teacher_logprobs_* keys and unify.
+        teacher_logprobs_keys = [k for k in first if k.startswith("teacher_logprobs_")]
+        if teacher_logprobs_keys:
+            _opd_teacher_names = [k[len("teacher_logprobs_"):] for k in teacher_logprobs_keys]
+            _opd_single_teacher = len(_opd_teacher_names) == 1
+            _opd_routing_field = "teacher_type"
+        else:
+            _opd_teacher_names = None
+
+        rl_key_map = [(src, dst) for src, dst in _optional_rl_keys if src in first]
+        has_sample_mask = first.get("sample_mask") is not None
 
         # Shift each sample before packing (input = tokens[:-1], target =
         # tokens[1:]); a post-pack roll(-1) would leak labels across sub-sequence
@@ -988,21 +1127,23 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
             sample = dict(
                 tokens=pad_or_truncate_last_dim(shifted_tokens, pad_len, pad_token_id),
                 labels=pad_or_truncate_last_dim(shifted_labels, pad_len, 0),
-                loss_mask=pad_or_truncate_last_dim(batch["mask"], pad_len, 0).to(torch.float32),
                 position_ids=torch.arange(pad_len, dtype=torch.int64, device=tokens.device),
-                advantages=pad_or_truncate_last_dim(batch["advantages"], pad_len,
-                                                    0).to(torch.float32),
-                prev_log_probs=pad_or_truncate_last_dim(batch["logprobs"], pad_len,
-                                                        0).to(torch.float32),
-                ref_log_probs=pad_or_truncate_last_dim(batch["ref_logprobs"], pad_len,
-                                                       0).to(torch.float32),
                 original_seq_len=torch.tensor([actual_len], dtype=torch.int32),
                 padded_seq_len=torch.tensor([pad_len], dtype=torch.int32),
             )
-            if has_rollout:
-                sample["rollout_log_probs"] = pad_or_truncate_last_dim(
-                    batch["rollout_log_probs"], pad_len, 0
+            for src_key, dst_key in rl_key_map:
+                sample[dst_key] = pad_or_truncate_last_dim(batch[src_key], pad_len,
+                                                           0).to(torch.float32)
+            if _opd_teacher_names is not None:
+                if _opd_single_teacher:
+                    tname = _opd_teacher_names[0]
+                else:
+                    tname = batch[_opd_routing_field]
+                sample["teacher_log_probs"] = pad_or_truncate_last_dim(
+                    batch[f"teacher_logprobs_{tname}"], pad_len, 0
                 ).to(torch.float32)
+                if "ref_log_probs" not in sample:
+                    sample["ref_log_probs"] = sample["teacher_log_probs"].clone()
             if has_sample_mask:
                 sm = batch["sample_mask"]
                 if sm.dim() == 0:
@@ -1013,41 +1154,39 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
 
         # Schedule and pack with default dynamic CP scheduler.
         dev = torch.cuda.current_device()
-        packed_keys = [
-            "tokens",
-            "labels",
-            "loss_mask",
-            "position_ids",
-            "advantages",
-            "prev_log_probs",
-            "ref_log_probs",
-        ]
-        if has_rollout:
-            packed_keys.append("rollout_log_probs")
+        packed_keys = ["tokens", "labels", "position_ids"]
+        packed_keys.extend(dst for _, dst in rl_key_map)
+        if _opd_teacher_names is not None:
+            packed_keys.append("teacher_log_probs")
+            if "ref_log_probs" not in packed_keys:
+                packed_keys.append("ref_log_probs")
         if has_sample_mask:
             packed_keys.append("sample_mask")
 
         global_id_seqlens_keys = packed_keys + ["original_seq_len", "padded_seq_len"]
-        new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum = dyn_cp_schedule_default(
-            gbs_batches,
-            dp_group,
-            tp_group,
-            dp_cp_group,
-            cp_size,
-            dp_size,
-            dist_config,
-            dev,
-            packed_keys=packed_keys,
-            cat_keys=[],
-            global_id_seqlens_keys=global_id_seqlens_keys,
-            dtype_map={},
+        new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, routing_info = (
+            dyn_cp_schedule_default(
+                gbs_batches,
+                dp_group,
+                tp_group,
+                dp_cp_group,
+                cp_size,
+                dp_size,
+                dist_config,
+                dev,
+                packed_keys=packed_keys,
+                cat_keys=[],
+                global_id_seqlens_keys=global_id_seqlens_keys,
+                dtype_map={},
+                max_seqlen_per_dp_cp_rank=scheduler_max_seqlen,
+            )
         )
 
         if global_retention_ratio is not None:
             for sample in new_samples:
                 sample["global_retention_ratio"] = global_retention_ratio
 
-        return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum
+        return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, routing_info
 
     @override
     def grpo_train_with_dynamic_cp(
@@ -1075,11 +1214,14 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
             cp_group = parallel_state.get_context_parallel_group()
 
         rl_token_keys = [
-            key for key in
-            ("advantages", "prev_log_probs", "ref_log_probs", "rollout_log_probs", "sample_mask")
-            if key in batch
+            key for key in (
+                "advantages", "prev_log_probs", "ref_log_probs", "rollout_log_probs",
+                "teacher_log_probs", "sample_mask"
+            ) if key in batch
         ]
-        cp_split_keys = ["tokens", "labels", "loss_mask", "position_ids"] + rl_token_keys
+        cp_split_keys = ["tokens", "labels", "position_ids"] + rl_token_keys
+        if "loss_mask" in batch:
+            cp_split_keys.append("loss_mask")
 
         cp_size = cp_group.size()
         total_tokens = batch["tokens"].size(0)
@@ -1117,7 +1259,8 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
             cp_group=cp_group,
         )
 
-        batch["mask"] = batch.pop("loss_mask")
+        if "loss_mask" in batch:
+            batch["mask"] = batch.pop("loss_mask")
         batch["target"] = batch.pop("labels")
         if batch.get("global_retention_ratio") is not None:
             batch["global_retention_ratio"] = batch["global_retention_ratio"].cuda()
@@ -1130,6 +1273,23 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
             packed_seq_params=packed_seq_params,
         )
         return batch, fwd_kwargs
+
+    @override
+    def opd_train_with_dynamic_cp(
+        self,
+        batches: List[Dict[str, Any]],
+        seqlen: int,
+        pad_token_id: int,
+        ppo_pack_seq: bool,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        assert "teacher_log_probs" in batches[0], (
+            "OPD dynamic CP requires teacher_log_probs in packed batch"
+        )
+        return self.grpo_train_with_dynamic_cp(
+            batches, seqlen, pad_token_id, ppo_pack_seq, pad_with_random_token, **kwargs
+        )
 
 
 class OffPoilicyDistillPrepareDataForwardLLM(PrepareDataForwardLLM):

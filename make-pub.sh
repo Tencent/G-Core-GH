@@ -18,7 +18,7 @@ git rm -rf tests/test_gpatch_v3
 git rm -rf `find -type d -name 'priv'`
 git rm `find -name '*-priv.*'`
 git rm `find -name '*_priv.*'`
-git rm -rf `find tasks -mindepth 1 -maxdepth 1 -type d | grep -v 'tasks/math_rl_v4'`
+git rm -rf `find tasks -mindepth 1 -maxdepth 1 -type d | grep -v -e 'tasks/math_rl_v4' -e 'tasks/math_dsv4'`
 git rm -rf mpatch
 git rm -rf gpatch
 git rm -rf debug

@@ -126,6 +126,7 @@ def apply_hp(
     deepep_num_sms: int = 24,
     *,
     amp_fp32: bool = True,
+    fp8_qat: bool = False,
 ) -> nn.Module:
     """Shard experts for EP, apply FSDP2, and bind ``clip_grad_norm_`` / ``load_checkpoint_hp`` / ``save_checkpoint_hp``.
 
@@ -178,6 +179,12 @@ def apply_hp(
         gets bf16-cast in forward (the modeling ``_Fp32ParamHolder``
         wrappers exist either way; without this flag they are simply
         absorbed into the outer layer/model ``fully_shard``).
+    fp8_qat : bool, keyword-only, default False
+        Enable FP8 activation fake-quantization (QAT). Inserts
+        block-wise E4M3 quantize→dequantize round-trips (STE backward)
+        on KV nope dims, compressor compressed KV nope dims, and
+        indexer query/key nope dims. Simulates inference-time FP8
+        quantization noise so the model learns to be robust.
 
     Returns
     -------
@@ -209,6 +216,7 @@ def apply_hp(
     model.config.ep_backend = ep_backend
     model.config.deepep_num_sms = deepep_num_sms
     model.config.amp_fp32 = amp_fp32
+    model.config.fp8_qat = fp8_qat
     # Sync backend knobs to every DeepseekV4Attention / DeepseekV4Experts
     # (including MTP blocks), because MTP blocks are constructed before
     # apply_hp runs, and their self.self_attn.config is a deepcopy that
@@ -221,6 +229,7 @@ def apply_hp(
             layer.config.ep_backend = ep_backend
             layer.config.deepep_num_sms = deepep_num_sms
             layer.config.amp_fp32 = amp_fp32
+            layer.config.fp8_qat = fp8_qat
             assert layer.self_attn.config.attn_backend == attn_backend
 
     if mp_policy is None:

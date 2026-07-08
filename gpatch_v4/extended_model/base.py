@@ -205,6 +205,17 @@ class PrepareDataForward(ABC):
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         raise NotImplementedError("opd_train is not implemented")
 
+    def opd_train_with_dynamic_cp(
+        self,
+        batches: List[Dict[str, Any]],
+        seqlen: int,
+        pad_token_id: int,
+        ppo_pack_seq: bool,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        raise NotImplementedError("opd_train_with_dynamic_cp is not implemented")
+
     def sft_reroute_data_for_dynamic_cp(
         self,
         gbs_batches: List[Dict[str, Any]],
@@ -214,11 +225,11 @@ class PrepareDataForward(ABC):
     ) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float]:
         raise NotImplementedError("sft_reroute_data_for_dynamic_cp is not implemented")
 
-    def grpo_reroute_data_for_dynamic_cp(
+    def rl_reroute_data_for_dynamic_cp(
         self,
         gbs_batches: List[Dict[str, Any]],
         pad_token_id: int,
         pad_with_random_token: bool = False,
         **kwargs,
-    ) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float]:
-        raise NotImplementedError("grpo_reroute_data_for_dynamic_cp is not implemented")
+    ) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float, Dict[str, Any]]:
+        raise NotImplementedError("rl_reroute_data_for_dynamic_cp is not implemented")

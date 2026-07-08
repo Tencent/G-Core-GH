@@ -40,6 +40,7 @@ class MODEL_ARCH:
     QWEN3_OMNI_MOE = 'qwen3_omni_moe'
     WELM_MOE = 'welm_moe'
     WELMV4_MOE = 'welmv4_moe'
+    WELM_OMNI_V4_5 = 'welm_omni_v4_5'
     QWEN2_MOE = 'qwen2_moe'
     QWEN2_VL = 'qwen2_vl'
     DEEPSEEK_V3 = 'deepseek_v3'

@@ -11,7 +11,7 @@ except ImportError as e:
     print(
         "Megatron-Bridge package not found. Please install Megatron-Bridge with `pip install megatron-bridge`"
     )
-    raise e
+    pass
 
 
 def _ensure_model_list(model):

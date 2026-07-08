@@ -4,9 +4,15 @@
 #   - Operates on [seqlen, batch, heads, dim] (SBHD) layout, batch handled externally
 #   - Uses causal mask via cu_seqlens instead of variable-length packed sequences
 #   - Supports compressed KV (seq_len_kv = seq_len_q / compress_ratio)
-import tilelang
+
 import torch
-from tilelang import language as T
+
+try:
+    import tilelang
+    from tilelang import language as T
+except ImportError:
+    from gfused.fake_tilelang_stub import language_stub as T
+    from gfused.fake_tilelang_stub import tilelang_stub as tilelang
 
 
 @tilelang.jit(pass_configs={

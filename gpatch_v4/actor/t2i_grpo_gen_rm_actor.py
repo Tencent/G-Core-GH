@@ -142,7 +142,7 @@ class T2iGrpoGenRmActor(BaseActor, T2iTokenizerMixin):
             rm_idx=rm_idx,
             use_fast=infer_engine_config.use_fast_tokenizer,
             max_running_requests=infer_engine_config.max_running_requests,
-            load_format='auto',
+            load_format=infer_engine_config.load_format,
             log_level='info',
             allow_auto_truncate=infer_engine_config.allow_auto_truncate,
             enable_custom_logit_processor=False,
@@ -157,6 +157,7 @@ class T2iGrpoGenRmActor(BaseActor, T2iTokenizerMixin):
             placement_type=config.placement_type,
             pg_bundle_indices=pg_bundle_indices,
             base_gpu_id=base_gpu_id,
+            **infer_engine_config.override_infer_engine_config,
         )
         self.setup_tokenizer(hf_model_path)
         self.setup_processor(hf_model_path)

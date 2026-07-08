@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Any, Dict, List
 
 import torch
@@ -69,7 +70,7 @@ class Fsdp2EngineLm(
         if load_latest_step is not None:
             ref_hf_model_path = load_latest_step
         log(f"creating ref model from {ref_hf_model_path}", rank=0)
-        self.ref_model = self.get_fsdp2_model(init_context, self.policy_config.hf_model_path)
+        self.ref_model = self.get_fsdp2_model(init_context, self.policy_config.ref_hf_model_path)
         with profile_memory_and_time(f"offload_ref_model", rank=0):
             self.offload_ref_model()
 
@@ -148,6 +149,7 @@ class Fsdp2EngineLm(
 
             data_iter = get_k_split_list(batch, num_microbatches)
 
+            use_r3 = self.config.training.moe_router_replay
             for batches in data_iter:
                 batch_data, fwd_kwargs = self.prepare_data.grpo_train(
                     batches,
@@ -156,36 +158,43 @@ class Fsdp2EngineLm(
                     ppo_pack_seq=False,
                 )
 
-                logits = self.model(**fwd_kwargs).logits.float()
-                target = batch_data["target"]
-
-                # CP-aware logprobs
-                curr_log_probs = self.gather_log_probs_packed(logits, target, allow_compile=True)
-                response_mask = batch_data["mask"]
-
-                # Entropy: compute on all positions per rank, then all-gather
-                probs = logits.softmax(dim=-1)
-                entropy = -(probs * logits.log_softmax(dim=-1)).sum(dim=-1)
-                entropy = self._all_gather_cp_aware(entropy)
-                entropy = entropy[:, :-1]
-                scaled_entropy = masked_mean(entropy, response_mask)
-
-                advantages = batch_data["advantages"]
-
-                loss_input = PolicyLossInput(
-                    advantages=advantages,
-                    prev_log_probs=batch_data["prev_log_probs"],
-                    ref_log_probs=batch_data["ref_log_probs"],
-                    curr_log_probs=curr_log_probs,
-                    response_mask=response_mask,
-                    scaled_entropy=scaled_entropy,
-                    rollout_log_probs=batch_data.get("rollout_log_probs", None),
-                    per_token_entropy=entropy,
-                    should_dump_metrics=False,
+                replay_ctx = (
+                    self._maybe_router_replay(self.model, batches, seq_length)
+                    if use_r3 else nullcontext()
                 )
+                with replay_ctx:
+                    logits = self.model(**fwd_kwargs).logits.float()
+                    target = batch_data["target"]
 
-                bwd_loss, step_metrics = loss_fn(self.config, loss_input)
-                (bwd_loss / num_microbatches).backward()
+                    # CP-aware logprobs
+                    curr_log_probs = self.gather_log_probs_packed(
+                        logits, target, allow_compile=True
+                    )
+                    response_mask = batch_data["mask"]
+
+                    # Entropy: compute on all positions per rank, then all-gather
+                    probs = logits.softmax(dim=-1)
+                    entropy = -(probs * logits.log_softmax(dim=-1)).sum(dim=-1)
+                    entropy = self._all_gather_cp_aware(entropy)
+                    entropy = entropy[:, :-1]
+                    scaled_entropy = masked_mean(entropy, response_mask)
+
+                    advantages = batch_data["advantages"]
+
+                    loss_input = PolicyLossInput(
+                        advantages=advantages,
+                        prev_log_probs=batch_data["prev_log_probs"],
+                        ref_log_probs=batch_data["ref_log_probs"],
+                        curr_log_probs=curr_log_probs,
+                        response_mask=response_mask,
+                        scaled_entropy=scaled_entropy,
+                        rollout_log_probs=batch_data.get("rollout_log_probs", None),
+                        per_token_entropy=entropy,
+                        should_dump_metrics=False,
+                    )
+
+                    bwd_loss, step_metrics = loss_fn(self.config, loss_input)
+                    (bwd_loss / num_microbatches).backward()
                 extend_value_to_dict(metrics, {f"policy/{k}": v for k, v in step_metrics.items()})
 
             grad_norm = self.clip_grad_norm_()
@@ -285,6 +294,7 @@ class Fsdp2EngineLm(
             )
             self.offload_ref_model()
 
+        use_r3 = self.config.training.moe_router_replay
         if compute_pre_logps:
             self.onload_model()
             self.set_model_eval(self.model)
@@ -292,6 +302,7 @@ class Fsdp2EngineLm(
                 self.model,
                 batches_list,
                 batch_log_str="get_policy_logprobs",
+                enable_r3=use_r3,
             )
 
         def restor_shape(logps):

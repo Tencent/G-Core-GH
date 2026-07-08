@@ -1,0 +1,137 @@
+# @package _global_
+_target_: gpatch_v4.configs.config.RlConfig
+
+placement_type: "disaggregated"
+
+training:
+  training_backend: fsdp2
+  use_gen_rm_reward: False
+  use_bt_rm_reward: False
+  use_external_reward: True
+  use_fast_tokenizer: True
+  rollout_gbs: 256
+  rollout_mbs: 1
+  sampling_repeat_n: 4
+  sampling_keep_n: 4
+  train_gbs: 256
+  train_mbs: 1
+  data_parallel_random_init: False
+  save_interval: 100
+  num_train_epoches: 1
+  ppo_max_epochs_2: 1
+  seq_length: 10240
+  moe_pad_with_random_tokens: True
+  moe_router_replay: True
+  auto_load_from_save_ckpt: True
+  early_swap_model: True
+  recompute: True
+  single_controller: True
+  async_rollout: True
+  rollout_max_staleness: 0
+  metrics_report:
+    - "acc_reward"
+    - "fmt_reward"
+
+checkpoint:
+  load_ckpt_path: ckpt_math_dsv4_grpo_vllm_colocate
+  save_ckpt_path: ckpt_math_dsv4_grpo_vllm_colocate
+  convert_mcore_to_hf_online: False
+  mbridge_distributed_filesystem: True
+  override_tokenizer_special_token:
+    eos_token: "<｜end▁of▁sentence｜>"
+
+optimizer:
+  lr: 1.0e-6
+  lr_warmup_steps: 2
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "hf-hub/zhuzilin/dapo-math-17k/"
+  py_path: "tasks/math_dsv4/dapo_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, overlong response will be penalized, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+policy:
+  dist_config:
+    nnodes: 16
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8
+    context_parallel_size: 2
+  model_arch: "deepseek_v4"
+  attn_implementation: "eager"
+  hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_bak"
+  hf_tokenizer_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_bak"
+  ref_hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_bak"
+  sampler_client:
+    rpc_type: ray
+    update_weight_max_size_mb: 256
+    update_weight_use_bucketed_ipc: True
+  bt_rm_client:
+    rpc_type: ray
+
+sampler:
+  backend: vllm
+  dist_config:
+    nnodes: 8
+  model_info:
+    - model_arch: "deepseek_v4"
+      hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_bak"
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 8
+        tensor_model_parallel_size: 8
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.50
+      max_running_requests: 16
+      temperature: 1.0
+      top_p: 0.9
+      generate_max_tokens: 8192
+      override_infer_engine_config:
+        tokenizer_mode: deepseek_v4
+        reasoning_parser: deepseek_v4
+        block_size: 256
+        kv_cache_dtype: fp8
+        async_scheduling: False
+
+bt_rm:
+  dist_config:
+    nnodes: 0
+  reward_type: "rule_only"
+  reward_model_info:
+    - model_arch: "deepseek_v4"
+      hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_bak"
+      reward_py_path: tasks/math_rl_v4/bt_reward_dapo.py
+      parse_reward_fn_name: dapo_math_rule_reward
+      reward_weight: 1.0
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 0
+
+external_reward:
+  reward_info:
+    - reward_py_path: tasks/math_rl_v4/math_external_reward.py
+      reward_cls_name: MathRuleExternalReward
+      reward_weight: 1.0
+
+ppo:
+  advantage_type: "grpo"
+  loss_func: "cispo"
+  grpo_advantage_epsilon: 1.0e-4
+  grpo_kl_loss_beta: 0.0
+  ppo_ratio_eps: 0.2
+  ppo_clip_ratio_low: 10
+  ppo_clip_ratio_high: 0.2
+  ppo_entropy_bonus: 0.0
+  ppo_logps_ratio_clamp: 20.0
+  ppo_dual_clip_ratio_c: 3.0
+
+debug:
+  debug_engine_update_weight: False

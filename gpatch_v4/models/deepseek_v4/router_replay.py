@@ -48,7 +48,6 @@ class RouterReplay:
     fully scoped to a model, so loading multiple models in the same process
     is safe.
     """
-
     def __init__(self) -> None:
         self.target_topk_idx: Optional[torch.Tensor] = None
 
@@ -75,6 +74,48 @@ class RouterReplay:
 
 
 # ======================================================================
+# layer-index helpers
+# ======================================================================
+
+
+def get_topk_layer_indices(config) -> list[int]:
+    """Return decoder-layer indices that use ``DeepseekV4TopKRouter``.
+
+    Hash-MoE layers (deterministic routing) are excluded — they don't
+    need replay.  The returned indices index into the ``num_layers``
+    dimension of the ``routed_experts`` tensor produced by the sampler.
+
+    Parameters
+    ----------
+    config
+        A ``DeepseekV4Config`` (or any object with ``mlp_layer_types``).
+    """
+    mlp_layer_types = config.mlp_layer_types
+    return [i for i, t in enumerate(mlp_layer_types) if t != "hash_moe"]
+
+
+def extract_topk_layers(
+    routed_experts: torch.Tensor,
+    topk_layer_indices: list[int],
+) -> list[torch.Tensor]:
+    """Slice ``routed_experts`` to only the TopKRouter layers.
+
+    Parameters
+    ----------
+    routed_experts : Tensor
+        Shape ``(seq_len, num_all_layers, topk)`` — from sampler.
+    topk_layer_indices : list[int]
+        Output of :func:`get_topk_layer_indices`.
+
+    Returns
+    -------
+    list[Tensor]
+        One ``(seq_len, topk)`` tensor per TopKRouter layer, in order.
+    """
+    return [routed_experts[:, i, :] for i in topk_layer_indices]
+
+
+# ======================================================================
 # enable / disable (our fork only)
 # ======================================================================
 
@@ -84,9 +125,7 @@ def _iter_routers(model: nn.Module):
 
     Skips ``DeepseekV4HashRouter`` — it's fully deterministic and doesn't need replay.
     """
-    from gpatch_v4.models.deepseek_v4.modeling_deepseek_v4 import (
-        DeepseekV4TopKRouter,
-    )
+    from gpatch_v4.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4TopKRouter
 
     for module in model.modules():
         if isinstance(module, DeepseekV4TopKRouter):
@@ -161,7 +200,7 @@ def router_replay_ctx(
 def capture_routing_decisions(
     model: nn.Module,
     *,
-    router_class_names: tuple[str, ...] = ("DeepseekV4TopKRouter",),
+    router_class_names: tuple[str, ...] = ("DeepseekV4TopKRouter", ),
 ) -> Generator[list[Optional[torch.Tensor]], None, None]:
     """Record per-layer routing indices via forward hooks.
 
@@ -194,6 +233,7 @@ def capture_routing_decisions(
                 def hook(mod, inp, out):
                     # out = (router_logits, router_scores, router_indices)
                     recorded[i] = out[2].detach().clone()
+
                 return hook
 
             handles.append(module.register_forward_hook(_make_hook(slot)))

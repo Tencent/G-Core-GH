@@ -53,6 +53,7 @@ from gpatch_v4.utils import (
     unbind_tensor_to_list,
 )
 from gpatch_v4.utils.test_utils import save_data
+from gpatch_v4.utils.training_utils import compute_topk_overlap_masks, pad_3d_seq_dim
 
 #TODO: 实际上是 on policy distill student actor, 后面找个时间 rename 一下
 # 1. 实际上可以直接设置 without_ref, 可以省去一轮 compute logps 的时间，目前还没设置
@@ -101,6 +102,171 @@ class DistillStudentActor(GrpoTrainActor):
             self.bt_rm_client,
             **extra_kwargs,
         )
+
+    @override
+    async def _compute_log_probs(
+        self,
+        rollout_batches: List[Dict[str, Any]],
+        training_config,
+        effective_keep_n: int,
+        timers: TimerSingleton,
+        curr_ppo_step: int,
+    ) -> List[Dict[str, Any]]:
+        samples_per_batch = training_config.rollout_mbs * effective_keep_n
+        restore_info = None
+        for data in rollout_batches:
+            ll = len(data["tokens"])
+            src_dp = [torch.tensor(mpu.get_data_parallel_rank())] * ll
+            data["src_dp"] = src_dp
+
+        if getattr(self.config.policy, 'balance_dp_seqlen', False):
+            rebalanced_batches, restore_info = DPBalanceHelper.rebalance_for_compute_log_probs(
+                rollout_batches,
+                samples_per_batch,
+                add_custom_keys=getattr(self.config.task, "add_custom_keys", None),
+            )
+            origin_rollout_batches = rollout_batches
+            rollout_batches = rebalanced_batches
+
+        log_prob_top_k = self.config.ppo.log_prob_top_k
+        strategy = self.config.ppo.opd_top_k_strategy
+        has_ref = not self.config.policy.without_ref
+        need_ref_topk_gather = (
+            log_prob_top_k > 0 and self.config.ppo.advantage_type == "g_opd" and has_ref
+        )
+
+        # --- Determine compute_log_probs arguments based on strategy ---
+        compute_logps_kwargs: Dict[str, Any] = {}
+        if log_prob_top_k > 0:
+            if strategy in ("only_stu", "intersection"):
+                compute_logps_kwargs["policy_compute_topk"] = True
+                if need_ref_topk_gather:
+                    compute_logps_kwargs["ref_gather_ids_key"] = "stu_topk_ids"
+            elif strategy == "only_tch":
+                # Set canonical per-sample key from teacher's result (generator already ran).
+                default_t_name = next(iter(self.train_rollout_generator.teacher_clients))
+                for rb in rollout_batches:
+                    rb["tch_topk_ids"] = rb[f"teacher_topk_ids_{default_t_name}"]
+                compute_logps_kwargs["policy_gather_ids_key"] = "tch_topk_ids"
+                if need_ref_topk_gather:
+                    compute_logps_kwargs["ref_gather_ids_key"] = "tch_topk_ids"
+
+        timers("compute_logps", log_level=0).start(barrier=True)
+        ref_logprobs, prev_logprobs = self.policy_engine.compute_log_probs(
+            rollout_batches, **compute_logps_kwargs
+        )
+        cpu_barrier()
+        timers("compute_logps").stop()
+
+        extra_restore_keys: List[str] = []
+
+        if log_prob_top_k > 0:
+            if strategy in ("only_stu", "intersection"):
+                # Student produced its own topk.
+                for rb, prev in zip(rollout_batches, prev_logprobs, strict=True):
+                    rb["logprobs"] = [d["logprobs"] for d in prev]
+                    rb["prev_topk_logprobs"] = [d["topk_logprobs"] for d in prev]
+                    rb["stu_topk_ids"] = [d["topk_ids"] for d in prev]
+                extra_restore_keys.extend(["prev_topk_logprobs", "stu_topk_ids"])
+
+                if need_ref_topk_gather:
+                    for rb, ref_list in zip(rollout_batches, ref_logprobs, strict=True):
+                        rb["ref_logprobs"] = [d["logprobs"] for d in ref_list]
+                        rb["base_on_topk_logprobs"] = [d["gather_logprobs"] for d in ref_list]
+                    extra_restore_keys.append("base_on_topk_logprobs")
+
+                # generator 跳过了 teacher 调用（需要先有 stu_topk_ids），在此补调。
+                # sample_idx_base 回退到 generator 递增前的值以保证 EP 路由正确。
+                self.policy_engine.offload_model()
+                clear_memory()
+                num_microbatches = len(rollout_batches)
+                sample_idx_base = self.train_rollout_generator.sample_idx - num_microbatches
+                timers("compute_teacher_logps", log_level=0).start(barrier=True)
+                rollout_batches = await self.train_rollout_generator.calc_all_teacher_logps(
+                    rollout_batches,
+                    num_microbatches,
+                    curr_ppo_step,
+                    sample_idx_base=sample_idx_base,
+                )
+                cpu_barrier()
+                timers("compute_teacher_logps").stop()
+                self.policy_engine.onload_model()
+                rollout_batches = BroadcastUtils.broadcast_rollout_batch(rollout_batches)
+                for t_name in self.train_rollout_generator.teacher_clients:
+                    extra_restore_keys.append(f"teacher_logprobs_{t_name}")
+                    if strategy == "only_stu":
+                        extra_restore_keys.append(f"teacher_on_stu_topk_logprobs_{t_name}")
+                    elif strategy == "intersection":
+                        extra_restore_keys.append(f"teacher_on_stu_topk_logprobs_{t_name}")
+                        extra_restore_keys.append(f"teacher_topk_ids_{t_name}")
+
+                # Compute overlap_mask for intersection.
+                if strategy == "intersection":
+                    for rb in rollout_batches:
+                        for t_name in self.train_rollout_generator.teacher_clients:
+                            tch_ids_key = f"teacher_topk_ids_{t_name}"
+                            if tch_ids_key not in rb:
+                                continue
+                            overlap_masks = []
+                            for s_ids, t_ids in zip(rb["stu_topk_ids"], rb[tch_ids_key]):
+                                # Pad teacher ids (truncated) to match student ids (full length).
+                                if t_ids.shape[0] < s_ids.shape[0]:
+                                    t_ids = pad_3d_seq_dim(t_ids, s_ids.shape[0], value=-1)
+                                stu_in_tch, _ = compute_topk_overlap_masks(s_ids, t_ids)
+                                overlap_masks.append(stu_in_tch)
+                            rb[f"overlap_mask_{t_name}"] = overlap_masks
+                    for t_name in self.train_rollout_generator.teacher_clients:
+                        extra_restore_keys.append(f"overlap_mask_{t_name}")
+
+                # Set the canonical topk_ids key for training forward.
+                for rb in rollout_batches:
+                    rb["opd_topk_ids"] = rb["stu_topk_ids"]
+                extra_restore_keys.append("opd_topk_ids")
+
+            elif strategy == "only_tch":
+                # Student gathered on teacher's topk_ids.
+                for rb, prev in zip(rollout_batches, prev_logprobs, strict=True):
+                    rb["logprobs"] = [d["logprobs"] for d in prev]
+                    rb["prev_topk_logprobs"] = [d["gather_logprobs"] for d in prev]
+                    rb["stu_on_tch_topk_logprobs"] = [d["gather_logprobs"] for d in prev]
+                extra_restore_keys.extend(["prev_topk_logprobs", "stu_on_tch_topk_logprobs"])
+
+                if need_ref_topk_gather:
+                    for rb, ref_list in zip(rollout_batches, ref_logprobs, strict=True):
+                        rb["ref_logprobs"] = [d["logprobs"] for d in ref_list]
+                        rb["base_on_topk_logprobs"] = [d["gather_logprobs"] for d in ref_list]
+                    extra_restore_keys.append("base_on_topk_logprobs")
+
+                # Teacher already ran in generator; unpack tch_topk_ids → opd_topk_ids.
+                for t_name in self.train_rollout_generator.teacher_clients:
+                    extra_restore_keys.append(f"teacher_logprobs_{t_name}")
+                    extra_restore_keys.append(f"teacher_topk_ids_{t_name}")
+                    extra_restore_keys.append(f"teacher_topk_logprobs_{t_name}")
+
+                # Set the canonical topk_ids key for training forward.
+                # Use the first (or default) teacher's topk_ids.
+                default_t_name = next(iter(self.train_rollout_generator.teacher_clients))
+                for rb in rollout_batches:
+                    rb["opd_topk_ids"] = rb[f"teacher_topk_ids_{default_t_name}"]
+                extra_restore_keys.append("opd_topk_ids")
+
+        else:
+            # -- non-topk --
+            for rb, prev_logps in zip(rollout_batches, prev_logprobs, strict=True):
+                rb["logprobs"] = prev_logps
+            if has_ref:
+                for rb, ref_logps in zip(rollout_batches, ref_logprobs):
+                    rb["ref_logprobs"] = ref_logps
+
+        if getattr(self.config.policy, 'balance_dp_seqlen', False):
+            rollout_batches = DPBalanceHelper.restore_log_probs_to_original_batches(
+                origin_rollout_batches,
+                rollout_batches,
+                restore_info,
+                without_ref=self.config.policy.without_ref,
+                extra_keys=extra_restore_keys or None,
+            )
+        return rollout_batches
 
     @override
     async def rollout(
@@ -166,87 +332,22 @@ class DistillStudentActor(GrpoTrainActor):
         )
 
         # compute logps
-        samples_per_batch = training_config.rollout_mbs * effective_keep_n
-        restore_info = None
-        for data in rollout_batches:
-            ll = len(data["tokens"])
-            src_dp = [torch.tensor(mpu.get_data_parallel_rank())] * ll
-            data["src_dp"] = src_dp
-
-        if getattr(self.config.policy, 'balance_dp_seqlen', False):
-            rebalanced_batches, restore_info = DPBalanceHelper.rebalance_for_compute_log_probs(
+        if self.config.policy.dist_config.dynamic_context_parallel:
+            timers("compute_logps", log_level=0).start(barrier=True)
+            rollout_batches = self._compute_log_probs_dynamic_cp(
                 rollout_batches,
-                samples_per_batch,
-                add_custom_keys=getattr(self.config.task, "add_custom_keys", None),
+                training_config,
+                effective_keep_n,
             )
-            origin_rollout_batches = rollout_batches
-            rollout_batches = rebalanced_batches
-
-        # G-OPD top-K: ref 在 student topk_ids 上 gather
-        need_ref_topk_gather = (
-            self.config.ppo.log_prob_top_k > 0 and self.config.ppo.advantage_type == "g_opd" and
-            not self.config.policy.without_ref
-        )
-
-        timers("compute_logps", log_level=0).start(barrier=True)
-        ref_logprobs, prev_logprobs = self.policy_engine.compute_log_probs(
-            rollout_batches,
-            ref_topk_gather_ids_key="stu_topk_ids" if need_ref_topk_gather else None,
-        )
-        cpu_barrier()
-        timers("compute_logps").stop()
-
-        extra_restore_keys: List[str] = []
-
-        if self.config.ppo.log_prob_top_k > 0:
-            # -- unpack prev (student) topk results --
-            for rb, prev in zip(rollout_batches, prev_logprobs, strict=True):
-                rb["logprobs"] = [d["logprobs"] for d in prev]
-                rb["stu_topk_logprobs"] = [d["topk_logprobs"] for d in prev]
-                rb["stu_topk_ids"] = [d["topk_ids"] for d in prev]
-            extra_restore_keys.extend(["stu_topk_logprobs", "stu_topk_ids"])
-
-            # -- unpack ref topk-gather results (if applicable) --
-            if need_ref_topk_gather:
-                for rb, ref_list in zip(rollout_batches, ref_logprobs, strict=True):
-                    rb["ref_logprobs"] = [d["logprobs"] for d in ref_list]
-                    rb["base_on_stu_topk_logprobs"] = [d["gather_logprobs"] for d in ref_list]
-                extra_restore_keys.append("base_on_stu_topk_logprobs")
-
-            # generator 跳过了 teacher 调用（需要先有 stu_topk_ids），在此补调。
-            # sample_idx_base 回退到 generator 递增前的值以保证 EP 路由正确。
-            num_microbatches = len(rollout_batches)
-            sample_idx_base = self.train_rollout_generator.sample_idx - num_microbatches
-            timers("compute_teacher_logps", log_level=0).start(barrier=True)
-            rollout_batches = await self.train_rollout_generator.calc_all_teacher_logps(
-                rollout_batches,
-                num_microbatches,
-                curr_ppo_step,
-                sample_idx_base=sample_idx_base,
-            )
-            cpu_barrier()
-            timers("compute_teacher_logps").stop()
-            rollout_batches = BroadcastUtils.broadcast_rollout_batch(rollout_batches)
-            for t_name in self.train_rollout_generator.teacher_clients:
-                extra_restore_keys.append(f"teacher_logprobs_{t_name}")
-                extra_restore_keys.append(f"teacher_on_stu_topk_logprobs_{t_name}")
+            timers("compute_logps").stop()
         else:
-            # -- non-topk --
-            for rb, prev_logps in zip(rollout_batches, prev_logprobs, strict=True):
-                rb["logprobs"] = prev_logps
-            if not self.config.policy.without_ref:
-                for rb, ref_logps in zip(rollout_batches, ref_logprobs):
-                    rb["ref_logprobs"] = ref_logps
-
-        if getattr(self.config.policy, 'balance_dp_seqlen', False):
-            rollout_batches = DPBalanceHelper.restore_log_probs_to_original_batches(
-                origin_rollout_batches,
+            rollout_batches = await self._compute_log_probs(
                 rollout_batches,
-                restore_info,
-                without_ref=self.config.policy.without_ref,
-                extra_keys=extra_restore_keys or None,
+                training_config,
+                effective_keep_n,
+                timers,
+                curr_ppo_step,
             )
-
         clear_memory()
         logging_memory_usage_details("memory tracking after compute_log_probs", rank=0)
         logging_meminfo_str("CPU Memory: after get_rollout_batches: ")

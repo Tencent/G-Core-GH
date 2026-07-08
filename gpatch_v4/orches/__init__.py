@@ -1,8 +1,11 @@
+import inspect
+import logging
 import os
 
 import ray
 from ray.util.queue import Queue
 
+from gpatch_v4.core.device import get_propagate_env_keys
 from gpatch_v4.utils.logging_utils import (
     CAPTURE_INFER_ENGINE_LOG_ENV,
     DEBUG_LOG_TO_FILE_ENV,
@@ -13,6 +16,19 @@ from gpatch_v4.utils.logging_utils import (
 )
 
 PROPAGATE_ENV_KEYS = [
+    "RAY_OVERRIDE_JOB_RUNTIME_ENV",
+    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+    "RAY_DEDUP_LOGS",
+    "TOKENIZERS_PARALLELISM",
+    "VLLM_ALLOW_RUNTIME_LORA_UPDATING",
+    "NCCL_CUMEM_ENABLE",
+    "NCCL_SOCKET_IFNAME",
+    "NCCL_IB_HCA",
+    "NCCL_IB_GID_INDEX",
+    "CUDA_VISIBLE_DEVICES",
+    "HYDRA_FULL_ERROR",
+    "VLLM_LOGGING_LEVEL",
+    "VERL_LOGGING_LEVEL",
     "PYTHONPATH",
     "CUDA_DEVICE_MAX_CONNECTIONS",
     "PYTORCH_CUDA_ALLOC_CONF",
@@ -28,6 +44,7 @@ PROPAGATE_ENV_KEYS = [
     "GPATCH_ENGINE_LOG_DIR",
     "GPATCH_ENGINE_ROLE",
     "VLLM_CUDART_SO_PATH",
+    *get_propagate_env_keys(),
 ]
 
 
@@ -59,7 +76,7 @@ def init(config=None):
         val = os.environ.get(key)
         if val is not None:
             runtime_env_vars[key] = val
-
+    print(f"init ray with env_vars: {runtime_env_vars}")
     # Ensure critical defaults even if not set on head node
     ray.init(
         log_to_driver=log_to_driver, namespace='train', runtime_env={"env_vars": runtime_env_vars}

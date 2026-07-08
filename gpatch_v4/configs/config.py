@@ -33,6 +33,7 @@ from gpatch_v4.configs.training_config import (
     DpoTrainingConfig,
     FinetuneTrainingConfig,
     OffPolicyDistillTrainingConfig,
+    RewardTrainingConfig,
     RLTrainingConfig,
     T2iRlTrainingConfig,
     T2iSftTrainingConfig,
@@ -55,7 +56,7 @@ def _assert_deterministic_mode_constraints(training, checkpoint) -> None:
         )
 
 
-def _assert_dynamic_cp_requires_flash_attention(training, *policies) -> None:
+def _assert_dynamic_cp_requires(training, *policies) -> None:
     attention_backend = training.attention_backend
     for policy in policies:
         if policy is None:
@@ -66,6 +67,11 @@ def _assert_dynamic_cp_requires_flash_attention(training, *policies) -> None:
                 "dynamic_context_parallel requires training.attention_backend='flash', "
                 f"otherwise the grad_norm nan, got {attention_backend!r}"
             )
+            if dist_config.dynamic_cp_scheduler_type == "default":
+                assert dist_config.context_parallel_size == 1, (
+                    "default scheduler 需要 dist_config.context_parallel_size=1, "
+                    f"不然在重新分配数据时会有性能问题 {dist_config.context_parallel_size}"
+                )
 
 
 @dataclass
@@ -100,7 +106,11 @@ class FinetuneConfig(MappingProtocol):
 
     def __post_init__(self):
         _assert_deterministic_mode_constraints(self.training, self.checkpoint)
-        _assert_dynamic_cp_requires_flash_attention(self.training, self.policy)
+        _assert_dynamic_cp_requires(self.training, self.policy)
+        if self.policy.dist_config.dynamic_context_parallel:
+            assert self.policy.override_transformer_config.get(
+                "calculate_per_token_loss", False
+            ), ("dynamic_context_parallel requires calculate_per_token_loss=True ")
 
 
 # rl config
@@ -146,7 +156,21 @@ class RlConfig(MappingProtocol):
 
     def __post_init__(self):
         _assert_deterministic_mode_constraints(self.training, self.checkpoint)
-        _assert_dynamic_cp_requires_flash_attention(self.training, self.policy, self.critic)
+        _assert_dynamic_cp_requires(self.training, self.policy, self.critic)
+        if self.training.use_linear_ce:
+            assert getattr(
+                self.ppo, 'log_prob_top_k', 0
+            ) == 0, ("use_linear_ce 与 log_prob_top_k > 0 不兼容，"
+                     "linear_ce 不生成完整 logits，无法计算 top-K")
+            assert not self.policy.ppo_pack_seq, ("use_linear_ce 与 ppo_pack_seq 不兼容")
+            assert self.training.dump_metrics_logprobs_topk == 0, (
+                "use_linear_ce 与 dump_metrics_logprobs_topk > 0 不兼容，"
+                "linear_ce 不生成完整 logits，无法 dump top-K"
+            )
+            assert not self.training.im_end_metrics_enable, (
+                "use_linear_ce 与 im_end_metrics_enable 不兼容，"
+                "linear_ce 不生成完整 logits，无法计算 im_end 指标"
+            )
         # Global covariance centers on the global (cross-DP) mean, so it does not
         # degenerate at train_mbs == 1; only the per-micro-batch path needs mbs > 1.
         if (
@@ -268,9 +292,21 @@ class OnPolicyDistillConfig(MappingProtocol):
     def __post_init__(self):
         _assert_deterministic_mode_constraints(self.training, self.checkpoint)
         teachers = tuple(self.teachers.values()) if self.teachers else ()
-        _assert_dynamic_cp_requires_flash_attention(
-            self.training, self.policy, self.teacher, *teachers
-        )
+        _assert_dynamic_cp_requires(self.training, self.policy, self.teacher, *teachers)
+        if self.training.use_linear_ce:
+            assert getattr(
+                self.ppo, 'log_prob_top_k', 0
+            ) == 0, ("use_linear_ce 与 log_prob_top_k > 0 不兼容，"
+                     "linear_ce 不生成完整 logits，无法计算 top-K")
+            assert not self.policy.ppo_pack_seq, ("use_linear_ce 与 ppo_pack_seq 不兼容")
+            assert self.training.dump_metrics_logprobs_topk == 0, (
+                "use_linear_ce 与 dump_metrics_logprobs_topk > 0 不兼容，"
+                "linear_ce 不生成完整 logits，无法 dump top-K"
+            )
+            assert not self.training.im_end_metrics_enable, (
+                "use_linear_ce 与 im_end_metrics_enable 不兼容，"
+                "linear_ce 不生成完整 logits，无法计算 im_end 指标"
+            )
         if not self.teachers and self.teacher is not None:
             self.teachers = {"default": self.teacher}
         self.teacher = None
@@ -308,7 +344,46 @@ class DpoConfig(MappingProtocol):
     def __post_init__(self):
         assert self.placement_type in ["colocate", "disaggregated"]
         _assert_deterministic_mode_constraints(self.training, self.checkpoint)
-        _assert_dynamic_cp_requires_flash_attention(self.training, self.policy)
+        _assert_dynamic_cp_requires(self.training, self.policy)
+
+
+@dataclass
+class RewardConfig(MappingProtocol):
+    """Configuration for Bradley-Terry reward-model training (output_scalar).
+
+    Mirrors :class:`DpoConfig`: pairwise (chosen|rejected) preference data,
+    no reference model, colocate placement. The policy model is built with a
+    scalar reward head via ``training.build_reward_head``.
+
+    Attributes
+    ----------
+    placement_type : str or None
+        ``"colocate"`` or ``"disaggregated"``.
+    data : DataConfig
+    training : RewardTrainingConfig
+    policy : BasePolicyConfig
+    checkpoint : CheckpointConfig
+    optimizer : OptimizerConfig
+    report : ReportConfig
+    monitor : MonitorConfig
+    debug : DebugConfig
+    task : Any
+    """
+    placement_type: Optional[str] = field(default="colocate", metadata={"help": "Placement type"})
+    data: DataConfig = field(default_factory=DataConfig)
+    training: RewardTrainingConfig = field(default_factory=RewardTrainingConfig)
+    policy: BasePolicyConfig = field(default_factory=BasePolicyConfig)
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    report: ReportConfig = field(default_factory=ReportConfig)
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
+    task: Any = field(default=None, metadata={'help': 'any task related config'})
+
+    def __post_init__(self):
+        assert self.placement_type in ["colocate", "disaggregated"]
+        _assert_deterministic_mode_constraints(self.training, self.checkpoint)
+        _assert_dynamic_cp_requires(self.training, self.policy)
 
 
 @dataclass
@@ -349,7 +424,7 @@ class OffPolicyDistillConfig(MappingProtocol):
     def __post_init__(self):
         assert self.placement_type in ["colocate", "disaggregated"]
         _assert_deterministic_mode_constraints(self.training, self.checkpoint)
-        _assert_dynamic_cp_requires_flash_attention(self.training, self.policy, self.teacher)
+        _assert_dynamic_cp_requires(self.training, self.policy, self.teacher)
 
         if not self.training.setup_teacher_in_independent_topo:
             # When CP > 1, teacher smart_pad_infer and student smart_pad_train must match

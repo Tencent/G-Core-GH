@@ -8,9 +8,9 @@
 2. 字段没有限制，比较灵活。
 '''
 
-from dataclasses import dataclass
 import argparse
 import glob
+import gzip
 import json
 import os
 import pickle
@@ -18,16 +18,16 @@ import shutil
 import struct
 import subprocess
 import sys
-import gzip
+from dataclasses import dataclass
 
 try:
     from mpi4py import MPI
 except ImportError:
     MPI = None
 
-from tqdm import tqdm
 import numpy as np
 import torch
+from tqdm import tqdm
 
 EACH_INDEX_SIZE = 12
 EACH_INDEX_WITH_SCORE_SIZE = 16
@@ -170,16 +170,34 @@ def make_dataset_builder(args):
 
 def main():
     args = get_args()
+
+    # --- 定义 DummyComm（用于无 MPI 场景） ---
+    class DummyComm:
+        def Get_rank(self):
+            return 0
+
+        def Get_size(self):
+            return 1
+
+        def Barrier(self):
+            pass
+
+    # --- 初始化 comm / rank / size ---
     try:
-        comm = MPI.COMM_WORLD  # 假定使用 mpi，其实用 torchrun 也可以，但是 mpi 更加方便。
-        rank = comm.Get_rank()
-        size = comm.Get_size()
-    except:
-        rank = 0
-        size = 1
+        if MPI is not None:
+            comm = MPI.COMM_WORLD
+        else:
+            comm = DummyComm()
+    except Exception:
+        comm = DummyComm()
+
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
     print(f"begin preprocess {rank} {size}", flush=True)
     print(f"inspect args  {args}", flush=True)
 
+    # --- 解压 ---
     decompress_fnames = [
         fname
         for fname in glob.glob(os.path.join(args.data_folder, '*.' + args.decompress_postfix))
@@ -188,11 +206,14 @@ def main():
         for fname in decompress_fnames[rank:len(decompress_fnames):size]:
             decompress_each_file(args, fname, args.decompress_postfix)
 
+    # --- 删除旧 metadata ---
     try:
         os.remove(os.path.join(args.data_folder, 'metadata.json'))
     except OSError:
         pass
+
     comm.Barrier()
+
     data_fnames = [
         fname for fname in glob.glob(os.path.join(args.data_folder, '*.' + args.data_file_postfix))
     ]

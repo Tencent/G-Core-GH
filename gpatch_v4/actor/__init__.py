@@ -11,6 +11,7 @@ from gpatch_v4.actor.grpo_train_actor import GrpoTrainActor
 from gpatch_v4.actor.kv_store_actor import KvStoreActor
 from gpatch_v4.actor.off_policy_distill_sampler_actor import OffPolicyDistillSamplerActor
 from gpatch_v4.actor.off_policy_distill_student_actor import OffPolicyDistillStudentActor
+from gpatch_v4.actor.reward_actor import RewardActor
 from gpatch_v4.actor.t2i_edit_sft_actor import T2iEditSftActor
 from gpatch_v4.actor.t2i_grpo_bt_rm_actor import T2iGrpoBtRmActor
 from gpatch_v4.actor.t2i_grpo_gen_rm_actor import T2iGrpoGenRmActor

@@ -1,0 +1,73 @@
+# @package _global_
+#
+# DeepSeek-V4 SFT with THD pack-seq on NuminaMath-CoT, EP + CP + FSDP2.
+#
+# Compared to math_sft_fsdp2.yaml (BSHD pad-to-max):
+#   * pack_seq: true — each micro-batch packs multiple variable-length samples
+#     into a single [1, T] THD sequence via pack_sequences + PackedSeqParams.
+#   * max_token_len_per_gpu: 8192 — token budget per micro-batch; dynamic
+#     micro-batch splitting groups samples so total packed tokens ≤ this value.
+#   * train_gbs: 256, train_mbs: 8 — more samples per step to fill packs.
+#   * experimental_pad_to_max_length removed — THD per-segment padding replaces
+#     global pad-to-max.
+#   * enable_mtp: false — MTP not yet supported with THD (guarded by assert).
+
+training:
+  training_backend: fsdp2
+  use_fast_tokenizer: True
+  train_gbs: 256
+  train_mbs: 1
+  seq_length: 32768                # upper bound per sample (not a pad target)
+  data_parallel_random_init: False
+  save_interval: 999999
+  num_train_epoches: 1
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+  exit_step: 5                     # smoke
+  recompute: True
+  enable_mtp: False
+
+policy:
+  dist_config:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 4
+    context_parallel_size: 4
+  model_arch: "deepseek_v4"
+  ppo_pack_seq: True
+  attn_implementation: "fused"
+  indexer_backend: "fused"
+  without_ref: True
+  hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
+  hf_tokenizer_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
+
+checkpoint:
+  load_ckpt_path: load_dsv4_sft_ckpt
+  save_ckpt_path: save_dsv4_sft_ckpt
+  convert_mcore_to_hf_online: False
+  mbridge_distributed_filesystem: True
+  override_tokenizer_special_token:
+    eos_token: "<｜end▁of▁sentence｜>"
+
+optimizer:
+  lr: 1.0e-5
+  lr_warmup_steps: 100
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "hf-hub/AI-MO/NuminaMath-CoT-jsonl/train/"
+  py_path: "tasks/math_dsv4/finetune_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+debug:
+  save_first_rollout_data: True
+  debug_truncate_num_hidden_layers: 4

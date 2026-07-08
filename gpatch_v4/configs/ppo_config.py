@@ -432,6 +432,21 @@ class DistillConfig(PpoConfig):
                 "(https://arxiv.org/abs/2604.13016)."
         }
     )
+    opd_top_k_strategy: str = field(
+        default="only_stu",
+        metadata={
+            "help":
+                "Strategy for selecting top-K token ids in OPD distillation. "
+                "Effective only when log_prob_top_k > 0. Options: "
+                "'only_stu' — use student's top-K ids; "
+                "'only_tch' — use teacher's top-K ids; " # 当teacher与student在topk上的权重分布差异太大，可能训崩。
+                "'intersection' — intersection of student and teacher top-K (MOPD)."
+                # (rionawang)TODO union: "'union' — union of student and teacher top-K (shape [S-1, 2K])."
+        }
+    )
+
+    # (rionawang)TODO union: add "union" back once implemented
+    _VALID_OPD_TOP_K_STRATEGIES = ("only_stu", "only_tch", "intersection")
 
     def __post_init__(self):
         super().__post_init__()
@@ -440,3 +455,16 @@ class DistillConfig(PpoConfig):
             "Entropy regularization operates on 2D (B, S) log-probs, but "
             f"log_prob_top_k={self.log_prob_top_k} produces 3D (B, S, K) tensors."
         )
+        assert self.opd_top_k_strategy in self._VALID_OPD_TOP_K_STRATEGIES, (
+            f"opd_top_k_strategy must be one of {self._VALID_OPD_TOP_K_STRATEGIES}, "
+            f"got '{self.opd_top_k_strategy}'."
+        )
+        if self.opd_top_k_strategy != "only_stu":
+            assert self.log_prob_top_k > 0, (
+                f"opd_top_k_strategy='{self.opd_top_k_strategy}' requires log_prob_top_k > 0."
+            )
+        if self.log_prob_top_k > 0:
+            assert self.loss_func == "opd", (
+                f"log_prob_top_k={self.log_prob_top_k} produces 3D advantages that only "
+                f"loss_func='opd' can handle, got loss_func='{self.loss_func}'."
+            )

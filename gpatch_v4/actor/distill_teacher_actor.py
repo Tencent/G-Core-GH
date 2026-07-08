@@ -169,11 +169,26 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
                 try:
                     fwd_kwargs = {}
                     if log_prob_top_k > 0:
-                        # teacher 在 student 提供的 stu_topk_ids 上 gather log-probs。
-                        fwd_kwargs["topk_gather_ids_key"] = "stu_topk_ids"
-                    _, teacher_logps = self.teacher_engine.compute_log_probs(
-                        real_data, **fwd_kwargs
-                    )
+                        strategy = self.config.ppo.opd_top_k_strategy
+                        if strategy == "only_stu":
+                            fwd_kwargs["policy_gather_ids_key"] = "stu_topk_ids"
+                        elif strategy == "only_tch":
+                            fwd_kwargs["policy_compute_topk"] = True
+                        elif strategy in ("intersection", "union"):
+                            fwd_kwargs["policy_compute_topk"] = True
+                            fwd_kwargs["policy_gather_ids_key"] = "stu_topk_ids"
+                    if self.config.teacher.dist_config.dynamic_context_parallel:
+                        assert log_prob_top_k == 0, (
+                            "Dynamic CP does not yet support top-k in teacher"
+                        )
+                        _, teacher_logps = self.teacher_engine.compute_log_probs_dynamic_cp(
+                            real_data,
+                            compute_pre_logps=True,
+                        )
+                    else:
+                        _, teacher_logps = self.teacher_engine.compute_log_probs(
+                            real_data, **fwd_kwargs
+                        )
 
                     # prevent seq_len across student batches between dp group
                     assert len(real_data) == len(
@@ -188,11 +203,22 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
                             target_len = int(sequence_lengths[tj].item()) - 1
                             entry = teacher_logps[ri][tj]
                             if log_prob_top_k > 0:
-                                assert isinstance(entry, dict), f"unexpected entry type {type(entry)}"
+                                assert isinstance(
+                                    entry, dict
+                                ), f"unexpected entry type {type(entry)}"
                                 entry["logprobs"] = entry["logprobs"][:target_len].detach().clone()
-                                entry["gather_logprobs"] = (
-                                    entry["gather_logprobs"][:target_len].detach().clone()
-                                )
+                                if "gather_logprobs" in entry:
+                                    entry["gather_logprobs"] = (
+                                        entry["gather_logprobs"][:target_len].detach().clone()
+                                    )
+                                if "topk_logprobs" in entry:
+                                    entry["topk_logprobs"] = (
+                                        entry["topk_logprobs"][:target_len].detach().clone()
+                                    )
+                                if "topk_ids" in entry:
+                                    entry["topk_ids"] = (
+                                        entry["topk_ids"][:target_len].detach().clone()
+                                    )
                             else:
                                 assert entry.ndim == 1, f"teacher_logps[i][j].ndim {entry.shape}"
                                 teacher_logps[ri][tj] = entry[:target_len].detach().clone()
@@ -207,11 +233,22 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
                         tmpd = self.compute_logps_results.setdefault(b_actor_dp_rank, {})
                         tmpdd = tmpd.setdefault(b_ppo_step, {})
                         if log_prob_top_k > 0:
-                            tmpdd[b_sample_idx] = {
+                            result = {
                                 "teacher_logprobs": [d["logprobs"] for d in b_teacher_logps],
-                                "teacher_on_stu_topk_logprobs":
-                                    [d["gather_logprobs"] for d in b_teacher_logps],
                             }
+                            if "gather_logprobs" in b_teacher_logps[0]:
+                                result["teacher_on_stu_topk_logprobs"] = [
+                                    d["gather_logprobs"] for d in b_teacher_logps
+                                ]
+                            if "topk_ids" in b_teacher_logps[0]:
+                                result["teacher_topk_ids"] = [
+                                    d["topk_ids"] for d in b_teacher_logps
+                                ]
+                            if "topk_logprobs" in b_teacher_logps[0]:
+                                result["teacher_topk_logprobs"] = [
+                                    d["topk_logprobs"] for d in b_teacher_logps
+                                ]
+                            tmpdd[b_sample_idx] = result
                         else:
                             tmpdd[b_sample_idx] = {"teacher_logprobs": b_teacher_logps}
 

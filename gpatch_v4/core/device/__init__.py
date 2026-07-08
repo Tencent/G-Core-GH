@@ -57,5 +57,9 @@ def get_visible_devices_env_var() -> str:
     return _DEVICE_BACKEND.visible_devices_env_var
 
 
+def get_propagate_env_keys() -> list[str]:
+    return _DEVICE_BACKEND.propagate_env_keys
+
+
 def get_flash_attn_varlen_func(max_segment_len=4096):
     return _DEVICE_BACKEND.get_flash_attn_varlen_func(max_segment_len=max_segment_len)

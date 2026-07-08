@@ -12,7 +12,7 @@ source tests/test_gpatch_v4/mpirun-stop-ray.sh
 source tests/test_gpatch_v4/mpirun-init-ray.sh
 
 # pytest -v -s --timeout=1800 tests/test_gpatch_v4/test_cp_mappings.py
-pytest -v -s --timeout=1800 tests/test_gpatch_v4/test_custom_module_registry.py
+pytest -v -s --timeout=1800 tests/test_gfused/test_router_replay.py
 
 echo "=== 清理 Ray 集群 ==="
 source tests/test_gpatch_v4/mpirun-stop-ray.sh

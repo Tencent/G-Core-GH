@@ -2,21 +2,20 @@ import asyncio
 import os
 import traceback
 from abc import ABC
-import ray
 
+import ray
 import torch
 import torch.distributed as dist
 
 from gpatch_v4.orches.flashinfer_cudart_fix import patch_ctypes_for_cudart_stub
 
 # sglang-native serialization (used only when backend == sglang)
-
 try:
     with patch_ctypes_for_cudart_stub():
-        from sglang.srt.model_executor.model_runner import (
+        from sglang.srt.utils import MultiprocessingSerializer as SglSerializer
+        from sglang.srt.weight_sync.tensor_bucket import (
             FlattenedTensorBucket as SglFlatTensorBucket,
         )
-        from sglang.srt.utils import MultiprocessingSerializer as SglSerializer
     _has_sglang_ipc = True
 except Exception as e:
     _has_sglang_ipc = False
@@ -26,9 +25,16 @@ from gpatch_v4.utils import clear_memory, log, logging_rank0, perf_time
 
 # Backend-agnostic serialization (used for vllm; no sglang dependency)
 from gpatch_v4.utils.tensor_ipc import FlattenedTensorBucket as GpatchFlatTensorBucket
+from gpatch_v4.utils.tensor_ipc import disable_expandable_segments
 from gpatch_v4.utils.tensor_ipc import (
     serialize_pickle_base64 as _gpatch_serialize_pickle_base64,
 )
+
+# try:
+#     from torch_xmlir.symbrewrite.plugins.torch.mock_torch import mock_init_reductions
+#     mock_init_reductions()
+# except ImportError:
+#     pass
 
 
 class UpdateWeightIpcMixin:
@@ -196,14 +202,12 @@ class UpdateWeightIpcMixin:
 
         async def async_update_weights():
             count_packed_bucket_num = 0
-            with perf_time(f"update weight total", rank=0):
+            with disable_expandable_segments(), perf_time(f"update weight total", rank=0):
                 try:
                     converted_named_tensors_by_dtypes = {}
                     converted_buffer_size_by_dtypes = {}
                     for name, param in weight_generator:
-                        is_gathered_tensor = bool(
-                            getattr(param, "is_gathered_tensor", False)
-                        )
+                        is_gathered_tensor = bool(getattr(param, "is_gathered_tensor", False))
                         if replace_zeros:
                             weight_tensor = torch.zeros_like(param)
                         elif is_gathered_tensor:
@@ -283,6 +287,7 @@ class UpdateWeightIpcMixin:
 
         count_packed_bucket_num = await async_update_weights()
         log(f"total packed bucket num: {count_packed_bucket_num}")
+        clear_memory()
         return True
 
     async def _update_weights_by_ipc_handle_vllm(

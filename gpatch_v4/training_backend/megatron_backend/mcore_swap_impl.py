@@ -14,14 +14,14 @@ from gpatch_v4.utils.common_utils import (
 class McoreSwapImpl:
     @classmethod
     @torch.no_grad()
-    def offload_model(cls, models):
+    def offload_model(cls, models, tag=""):
         """Offload model params/grads to CPU.
 
         Megatron layout: bf16 param + fp32 grad chunked in MP group;
         fp32 main_param + optimizer state chunked in MP+DP groups.
         """
         clear_memory()
-        logging_memory_usage_details("memory tracking before model offload", rank=0)
+        logging_memory_usage_details(f"memory tracking before {tag}model offload", rank=0)
         if models is None:
             return
 
@@ -50,7 +50,7 @@ class McoreSwapImpl:
             rank=0,
         )
         clear_memory()
-        logging_memory_usage_details("memory tracking after model offload", rank=0)
+        logging_memory_usage_details(f"memory tracking after {tag}model offload", rank=0)
 
     @classmethod
     @torch.no_grad()
@@ -71,14 +71,14 @@ class McoreSwapImpl:
 
     @classmethod
     @torch.no_grad()
-    def onload_model(cls, models, onload_grad=True):
+    def onload_model(cls, models, onload_grad=True, tag=""):
         """Onload model params/grads back to GPU.
 
         Megatron layout: bf16 param + fp32 grad chunked in MP group;
         fp32 main_param + optimizer state chunked in MP+DP groups.
         """
         clear_memory()
-        logging_memory_usage_details("memory tracking before model onload", rank=0)
+        logging_memory_usage_details(f"memory tracking before {tag}model onload", rank=0)
         if models is None:
             return
         for model_chunk in models:
@@ -103,7 +103,7 @@ class McoreSwapImpl:
                 for _, buf in model_chunk.named_buffers():
                     onload_tensor_to_gpu(buf)
         clear_memory()
-        logging_memory_usage_details("memory tracking after model onload", rank=0)
+        logging_memory_usage_details(f"memory tracking after {tag}model onload", rank=0)
 
     @classmethod
     @torch.no_grad()

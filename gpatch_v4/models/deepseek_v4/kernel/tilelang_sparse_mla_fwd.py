@@ -5,9 +5,14 @@
 #   - Single-head KV: kv shape [B, S_kv, D] (no kv_group, no D/D_tail split)
 #   - Index shape: [B, S, topk] (no kv_group dim)
 #   - Output: [B, S, H, D] + LSE [B, S, H]
-import tilelang
 import torch
-from tilelang import language as T
+
+try:
+    import tilelang
+    from tilelang import language as T
+except ImportError:
+    from gfused.fake_tilelang_stub import language_stub as T
+    from gfused.fake_tilelang_stub import tilelang_stub as tilelang
 
 
 @tilelang.jit(

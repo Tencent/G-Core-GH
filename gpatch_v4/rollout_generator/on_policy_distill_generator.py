@@ -73,14 +73,32 @@ class OnPolicyDistillRolloutGenerator(BaseRolloutGenerator):
         )
 
         # Phase 2: issue calc_logps requests for all teachers concurrently
+        # Only send keys that teacher actually needs to reduce RPC transfer size.
         if self.is_mp_and_cp_head:
             s_idx = self.sample_idx if sample_idx_base is None else sample_idx_base
+            teacher_keys = {
+                "tokens", "sequence_lengths", "stu_topk_ids",
+                "position_ids", "image_input_mask",
+                "vision_data", "vision_grid_thw",
+                "input_features", "feature_attention_mask",
+                "audio_feature",
+            }
             all_issue_cos = []
             for _, t_client in teacher_items:
                 for rbi, rollout_batch in enumerate(rbs):
+                    lightweight_batch = {
+                        k: rollout_batch[k] for k in teacher_keys if k in rollout_batch
+                    }
+                    # Truncate stu_topk_ids to response length for transfer efficiency.
+                    if "stu_topk_ids" in lightweight_batch:
+                        seq_lens = lightweight_batch["sequence_lengths"]
+                        lightweight_batch["stu_topk_ids"] = [
+                            ids[:int(sl.item()) - 1]
+                            for ids, sl in zip(lightweight_batch["stu_topk_ids"], seq_lens)
+                        ]
                     all_issue_cos.append(
                         t_client.issue_calc_logps(
-                            rollout_batch,
+                            lightweight_batch,
                             curr_ppo_step,
                             s_idx + rbi,
                         )
@@ -102,13 +120,19 @@ class OnPolicyDistillRolloutGenerator(BaseRolloutGenerator):
 
             idx = 0
             for t_name, _ in teacher_items:
-                logps_key = f"teacher_logprobs_{t_name}"
-                topk_logps_key = f"teacher_on_stu_topk_logprobs_{t_name}"
                 for rbi, rollout_batch in enumerate(rbs):
                     resp = all_results[idx]
-                    rollout_batch[logps_key] = resp["teacher_logprobs"]
+                    rollout_batch[f"teacher_logprobs_{t_name}"] = resp["teacher_logprobs"]
                     if "teacher_on_stu_topk_logprobs" in resp:
-                        rollout_batch[topk_logps_key] = resp["teacher_on_stu_topk_logprobs"]
+                        rollout_batch[f"teacher_on_stu_topk_logprobs_{t_name}"] = (
+                            resp["teacher_on_stu_topk_logprobs"]
+                        )
+                    if "teacher_topk_ids" in resp:
+                        rollout_batch[f"teacher_topk_ids_{t_name}"] = resp["teacher_topk_ids"]
+                    if "teacher_topk_logprobs" in resp:
+                        rollout_batch[f"teacher_topk_logprobs_{t_name}"] = (
+                            resp["teacher_topk_logprobs"]
+                        )
                     idx += 1
                 assert check_rollout_batches(rbs), \
                     f"rbs format error after teacher {t_name}"
@@ -159,8 +183,10 @@ class OnPolicyDistillRolloutGenerator(BaseRolloutGenerator):
         if self.is_mp_and_cp_head:
             rbs = self._post_process_rm_rollout_batch(rbs)
 
-        # Top-K: teacher 调用推迟到 actor（需等 student forward 产出 stu_topk_ids）。
-        if self.config.ppo.log_prob_top_k == 0:
+        # Teacher runs here when it does NOT depend on student's topk_ids.
+        # only_tch: teacher produces its own topk (no dependency on student).
+        # only_stu/intersection/union: teacher needs stu_topk_ids → deferred to actor.
+        if self.config.ppo.log_prob_top_k == 0 or self.config.ppo.opd_top_k_strategy == "only_tch":
             timers("compute_teacher_logps", log_level=0).start(barrier=True)
             rbs = await self.calc_all_teacher_logps(rbs, num_microbatches, curr_ppo_step)
             cpu_barrier()

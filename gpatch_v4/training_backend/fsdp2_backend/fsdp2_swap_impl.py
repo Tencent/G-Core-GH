@@ -26,13 +26,13 @@ class Fsdp2SwapImpl:
 
     @classmethod
     @torch.no_grad()
-    def offload_model(cls, models):
-        offload_model(models)
+    def offload_model(cls, models, tag=""):
+        offload_model(models, tag=tag)
 
     @classmethod
     @torch.no_grad()
-    def onload_model(cls, models, onload_grad=True):
-        onload_model(models)
+    def onload_model(cls, models, onload_grad=True, tag=""):
+        onload_model(models, tag=tag)
 
     @classmethod
     @torch.no_grad()

@@ -53,7 +53,7 @@ class EngineSwapMixin:
             return
         if not self.get_swap_state().ref_model:
             return
-        self.swap_impl.offload_model(self.ref_model)
+        self.swap_impl.offload_model(self.ref_model, tag="ref_")
         self.get_swap_state().ref_model = False
 
     def onload_ref_model(self):
@@ -62,5 +62,5 @@ class EngineSwapMixin:
             return
         if self.get_swap_state().ref_model:
             return
-        self.swap_impl.onload_model(self.ref_model, onload_grad=False)
+        self.swap_impl.onload_model(self.ref_model, onload_grad=False, tag="ref_")
         self.get_swap_state().ref_model = True

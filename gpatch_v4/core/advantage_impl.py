@@ -2,7 +2,7 @@
 # copyright (c) 2026 tencent inc. all rights reserved.
 # xiaotaoliu@tencent.com, nrwu@tencent.com
 
-from typing import Dict, List, cast
+from typing import Dict, List, Optional, cast
 
 import numpy as np
 import torch
@@ -452,7 +452,7 @@ def discounted_future_sum_vectorized(x: np.ndarray, gamma: float) -> np.ndarray:
 
 
 def calculate_reverse_kl_advantages(
-    rewards: List[torch.Tensor],
+    rewards: Optional[List[torch.Tensor]],
     mask_lst: List[torch.Tensor],
     logprobs: List[torch.Tensor],
     teacher_logprobs: List[torch.Tensor],
@@ -494,14 +494,15 @@ def calculate_reverse_kl_advantages(
         advantages = [torch.zeros_like(logprobs[i]) for i in range(len(logprobs))]
         returns = [torch.zeros_like(logprobs[i]) for i in range(len(logprobs))]
 
-    # pad teacher_logprobs to match student_logprobs
-    student_len = logprobs[0].shape[-1]
+    # pad teacher_logprobs to match student_logprobs (per-sample for variable-length dyn_cp)
     for i in range(len(teacher_logprobs)):
-        assert teacher_logprobs[i].shape[
-            -1] <= student_len, f"{teacher_logprobs[i].shape[-1]=} > {student_len=}"
+        student_len_i = logprobs[i].shape[-1]
+        assert teacher_logprobs[i].shape[-1] <= student_len_i, (
+            f"{teacher_logprobs[i].shape[-1]=} > student_len={student_len_i} (sample {i})"
+        )
         teacher_logprobs[i] = torch.nn.functional.pad(
             teacher_logprobs[i],
-            (0, student_len - teacher_logprobs[i].shape[-1]),
+            (0, student_len_i - teacher_logprobs[i].shape[-1]),
             value=0,
         )
 
@@ -724,6 +725,7 @@ def calculate_topk_advantages(
     multi_teacher_topk_logprobs: Dict[str, List[torch.Tensor]] = None,
     teacher_types: List[str] = None,
     default_teacher_name: str = "default",
+    topk_valid_mask: List[torch.Tensor] = None,
 ):
     """Compute per-sample 3D top-K advantages for the OPD / G-OPD top-K logits path.
 
@@ -780,6 +782,8 @@ def calculate_topk_advantages(
     reverse_kl_token_sum = 0.0
     reverse_kl_per_sample_sum = 0.0
     mask_token_sum = 0.0
+    overlap_ratio_sum = 0.0
+    overlap_token_count = 0.0
     per_teacher_count: Dict[str, int] = {}
 
     for i in range(batch_size):
@@ -798,9 +802,21 @@ def calculate_topk_advantages(
         else:
             rkl = stu_lp - teacher_lp
 
-        # softmax_K renormalizes the student's mass over the K candidates so that
-        # tokens dominating the student's prediction contribute more weight.
-        w = torch.softmax(stu_lp, dim=-1)
+        # Renormalize student mass over valid K candidates.
+        # When topk_valid_mask is provided (intersection), only valid positions
+        # contribute; empty intersection → advantage=0.
+        if topk_valid_mask is not None:
+            v_mask = topk_valid_mask[i].to(stu_lp.device)
+            w = torch.softmax(stu_lp.masked_fill(~v_mask, float('-inf')), dim=-1)
+            w = torch.nan_to_num(w, nan=0.0)
+            rkl = rkl.masked_fill(~v_mask, 0.0)
+            # Accumulate overlap ratio: mean fraction of valid ids per token.
+            valid_positions = mask_1d.bool()
+            if valid_positions.any():
+                overlap_ratio_sum += v_mask[valid_positions].float().mean(dim=-1).sum().item()
+                overlap_token_count += valid_positions.sum().item()
+        else:
+            w = torch.softmax(stu_lp, dim=-1)
         adv = (-rkl) * w * mask_2d
 
         advantages_3d.append(adv)
@@ -833,6 +849,8 @@ def calculate_topk_advantages(
         "topk_teacher_kl": (reverse_kl_token_sum / (mask_token_sum + 1e-12)).item(),
         "g_opd_lambda": g_opd_lambda,
     }
+    if overlap_token_count > 0:
+        metrics["topk_overlap_ratio"] = overlap_ratio_sum / overlap_token_count
     if is_multi_teacher:
         for t_name, count in per_teacher_count.items():
             metrics[f"topk_teacher_count/{t_name}"] = count

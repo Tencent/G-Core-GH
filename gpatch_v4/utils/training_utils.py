@@ -29,8 +29,11 @@ try:
     from megatron.core.gcore_utils import (
         get_gathered_routing_info,  # only branch wxdev support
     )
-except ImportError:
+    from gpatch_v4.kernel import linear_cross_entropy, set_linear_ce_backend
+except (ImportError, Exception) as e:
     get_gathered_routing_info = None
+    linear_cross_entropy = None
+    set_linear_ce_backend = None
 
 
 def move_to_device_if_tensor(device, item):
@@ -1009,6 +1012,114 @@ def from_parallel_logits_to_logprobs(
     return curr_log_probs[:, :-1].contiguous()
 
 
+def logprobs_from_linear_ce(
+    linear_ce_backend,
+    linear_ce_output: Dict[str, Any],
+    target: torch.Tensor,
+    ignore_cp=False,
+    pre_shifted=False,
+    mask: Optional[torch.Tensor] = None,
+    return_entropy: bool = False,
+) -> torch.Tensor:
+    """Compute per-token logprobs from linear_ce model output.
+
+    Parameters
+    ----------
+    linear_ce_output : dict
+        Model output dict with keys ``hidden_states``, ``weight``,
+        ``output_layer``.
+    target : torch.Tensor
+        Token ids ``[B, S]`` (unshifted).
+
+    Returns
+    -------
+    torch.Tensor
+        Log-probs ``[B, S-1]`` (float32), semantics consistent with
+        ``from_parallel_logits_to_logprobs``.
+    """
+    set_linear_ce_backend(linear_ce_backend)
+
+    cp_rank = mpu.get_context_parallel_rank() if not ignore_cp else 0
+    cp_size = mpu.get_context_parallel_world_size() if not ignore_cp else 1
+
+    s = target.shape[1]
+    assert s % cp_size == 0, f'{s=} {cp_size=}'
+    local_s = s // cp_size
+    if not pre_shifted:
+        target = target.roll(shifts=-1, dims=-1)
+    # NOTE(guanyouhe): Ulysess CP应该并不能这样分割
+    if not ignore_cp:
+        target = reorder_target_for_cp(target)
+    local_target = target[:, cp_rank * local_s:(cp_rank + 1) * local_s]
+
+    hidden_states = linear_ce_output["hidden_states"]
+    # [B, local_S] -> [local_S, B] to match hidden_states layout [local_S, B, H]
+    local_target = local_target.transpose(0, 1).contiguous().to(hidden_states.device)
+
+    output_layer = linear_ce_output["output_layer"]
+    tp_group = output_layer.tp_group
+    if output_layer.sequence_parallel:
+        hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+            hidden_states,
+            tensor_parallel_output_grad=True,
+        )
+    elif tp_group is not None and dist.get_world_size(tp_group) > 1:
+        assert not hidden_states.requires_grad, (
+            "linear_cross_entropy backward does not all-reduce d_hidden across TP ranks. "
+            "With TP > 1, sequence_parallel=False, and hidden requiring grad, "
+            "d_hidden would be incorrect. Enable sequence_parallel or use vocab_parallel_cross_entropy."
+        )
+
+    weight = linear_ce_output["weight"]
+    if weight is None:
+        weight = output_layer.weight
+
+    linear_ce_output = linear_cross_entropy(
+        hidden_states,
+        weight,
+        local_target,
+        1.0,
+        "none",
+        tp_group,
+        return_entropy=return_entropy,
+    )
+
+    if return_entropy:
+        curr_log_probs, curr_entropy = linear_ce_output
+    else:
+        curr_log_probs = linear_ce_output
+        curr_entropy = None
+
+    curr_log_probs = -1 * curr_log_probs
+    # [local_S, B] -> [B, local_S]
+    curr_log_probs = curr_log_probs.transpose(0, 1).contiguous()
+    if return_entropy:
+        curr_entropy = curr_entropy.transpose(0, 1).contiguous()
+
+    if cp_size > 1:
+        curr_log_probs = all_gather_from_context_parallel_region(curr_log_probs)
+        if return_entropy:
+            curr_entropy = all_gather_from_context_parallel_region(curr_entropy)
+
+    if pre_shifted:
+        curr_log_probs = curr_log_probs.contiguous()
+        if return_entropy:
+            curr_entropy = curr_entropy.contiguous()
+    else:
+        curr_log_probs = curr_log_probs[:, :-1].contiguous()
+        if return_entropy:
+            curr_entropy = curr_entropy[:, :-1].contiguous()
+
+    if return_entropy:
+        if mask is not None:
+            scaled_entropy = masked_mean(curr_entropy, mask)
+        else:
+            scaled_entropy = curr_entropy.mean()
+        return curr_log_probs, scaled_entropy, curr_entropy
+
+    return curr_log_probs
+
+
 @torch.no_grad()
 def from_parallel_logits_to_topk_logprobs(
     vocab_parallel_logits: torch.Tensor,
@@ -1348,6 +1459,27 @@ def pad_topk_logprobs_to_target_len(
             f"topk logprobs seq dim exceeds target: {logprobs_lst[i].shape[-2]=} > {tgt_s=}"
         )
         logprobs_lst[i] = pad_3d_seq_dim(logprobs_lst[i], tgt_s, value=0)
+
+
+def compute_topk_overlap_masks(
+    stu_topk_ids: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute bidirectional membership masks between student and teacher top-K ids.
+
+    Args:
+        stu_topk_ids: [S-1, K] student top-K token ids.
+        teacher_topk_ids: [S-1, K] teacher top-K token ids.
+
+    Returns:
+        stu_in_teacher_mask: [S-1, K] bool — True = in intersection, False = not.
+        teacher_in_stu_mask: [S-1, K] bool — True = in intersection, False = not.
+    """
+    matches = (stu_topk_ids.unsqueeze(-1) == teacher_topk_ids.unsqueeze(-2))  # [S-1, K_s, K_t]
+    stu_in_teacher_mask = matches.any(dim=-1)  # [S-1, K_s]
+    # (rionawang)TODO union: teacher_in_stu_mask needed for union strategy
+    # teacher_in_stu_mask = matches.any(dim=-2)   # [S-1, K_t]
+    return stu_in_teacher_mask, None
 
 
 def get_im_end_metrics_token_id(tokenizer) -> int:

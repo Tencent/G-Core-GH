@@ -459,10 +459,18 @@ def _compute_topk_advantages(
     ``[S-1, K]`` and added to the KL-based 3D advantages.
     """
     rollout_batch = ctx.rollout_batch
-    stu_topk_lp = rollout_batch.get("stu_topk_logprobs", None)
-    assert stu_topk_lp is not None, "stu_topk_logprobs required for top-K advantage"
+    strategy = ctx.config.ppo.opd_top_k_strategy
 
-    primary_teacher_topk_key = f"teacher_on_stu_topk_logprobs_{default_teacher_name}"
+    # Resolve student and teacher topk logprobs based on strategy.
+    if strategy == "only_tch":
+        stu_topk_lp = rollout_batch.get("stu_on_tch_topk_logprobs", None)
+        assert stu_topk_lp is not None, "stu_on_tch_topk_logprobs required for only_tch"
+        primary_teacher_topk_key = f"teacher_topk_logprobs_{default_teacher_name}"
+    else:
+        stu_topk_lp = rollout_batch.get("prev_topk_logprobs", None)
+        assert stu_topk_lp is not None, "prev_topk_logprobs required for top-K advantage"
+        primary_teacher_topk_key = f"teacher_on_stu_topk_logprobs_{default_teacher_name}"
+
     primary_teacher_topk_lp = rollout_batch.get(primary_teacher_topk_key, None)
     assert primary_teacher_topk_lp is not None, (
         f"{primary_teacher_topk_key} not found in rollout_batch; "
@@ -470,13 +478,17 @@ def _compute_topk_advantages(
     )
 
     multi_teacher_topk_lp: Dict[str, List[torch.Tensor]] = {}
+    prefix = (
+        "teacher_topk_logprobs_" if strategy == "only_tch"
+        else "teacher_on_stu_topk_logprobs_"
+    )
     for key, val in rollout_batch.items():
-        if key.startswith("teacher_on_stu_topk_logprobs_"):
-            t_name = key[len("teacher_on_stu_topk_logprobs_"):]
+        if key.startswith(prefix):
+            t_name = key[len(prefix):]
             if t_name != default_teacher_name:
                 multi_teacher_topk_lp[t_name] = val
 
-    base_topk_lp = (rollout_batch.get("base_on_stu_topk_logprobs", None) if has_base else None)
+    base_topk_lp = (rollout_batch.get("base_on_topk_logprobs", None) if has_base else None)
 
     routing_field = getattr(ctx.config.ppo, "g_opd_teacher_routing_field", "teacher_type")
     teacher_types = rollout_batch.get(routing_field, None) if multi_teacher_topk_lp else None
@@ -484,6 +496,11 @@ def _compute_topk_advantages(
         teacher_types = list(teacher_types)
 
     g_opd_lambda = getattr(ctx.config.ppo, "g_opd_lambda", 1.0)
+
+    # Intersection: pass overlap_mask to restrict softmax to overlapping tokens.
+    valid_mask = None
+    if strategy == "intersection":
+        valid_mask = rollout_batch.get(f"overlap_mask_{default_teacher_name}", None)
 
     topk_advantages, topk_metrics = calculate_topk_advantages(
         mask_lst=ctx.mask,
@@ -497,6 +514,7 @@ def _compute_topk_advantages(
         multi_teacher_topk_logprobs=multi_teacher_topk_lp or None,
         teacher_types=teacher_types,
         default_teacher_name=default_teacher_name,
+        topk_valid_mask=valid_mask,
     )
     return topk_advantages, topk_metrics
 

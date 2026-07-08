@@ -1,5 +1,6 @@
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -24,9 +25,17 @@ from gpatch_v4.extended_model import DeepseekV4PrepareDataForwardLLM
 
 try:
     from gpatch_v4.models.deepseek_v4 import DeepseekV4ForCausalLM, apply_hp
+    from gpatch_v4.models.deepseek_v4.router_replay import (
+        extract_topk_layers,
+        get_topk_layer_indices,
+        router_replay_ctx,
+    )
 except ImportError:
     DeepseekV4ForCausalLM = None
     apply_hp = None
+    get_topk_layer_indices = None
+    extract_topk_layers = None
+    router_replay_ctx = None
 from gpatch_v4.core.seqlen_balancing import convert_mbs_for_pack_seq
 from gpatch_v4.models.hp_module import HpModule
 from gpatch_v4.training_backend.fsdp2_backend.checkpoint import (
@@ -36,6 +45,10 @@ from gpatch_v4.training_backend.fsdp2_backend.checkpoint import (
 from gpatch_v4.training_backend.fsdp2_backend.mtp_loss import (
     calculate_mtp_loss,
     mtp_per_depth_valid_count,
+)
+from gpatch_v4.training_backend.loss_factory import (
+    compute_dpo_loss_core,
+    load_balancing_loss_func,
 )
 from gpatch_v4.utils import (
     clear_memory,
@@ -303,6 +316,7 @@ class Fsdp2EngineMixin:
                 indexer_backend=self.policy_config.indexer_backend,
                 ep_backend=self.policy_config.ep_backend,
                 deepep_num_sms=self.policy_config.deepep_num_sms,
+                fp8_qat=self.policy_config.fp8_qat,
             )
             model.load_checkpoint_hp(hf_model_path)
             if not model_only_inference:
@@ -340,10 +354,100 @@ class CheckpointMixin:
             save_hf_checkpoint(self.config, self.model, self.tokenizer, global_step=global_step)
 
 
-class ForwardStepMixin:
+class RouterReplayMixin:
+    """Router Replay (R3) support for FSDP2 backend.
+
+    Replays sampler routing decisions during the actor's forward pass so
+    that TopKRouter selects the same experts as the inference engine —
+    eliminating routing drift caused by FP8/FP4 weight quantization.
+    """
+
+    _topk_layer_indices: Optional[list[int]] = None
+
+    def _get_topk_layer_indices(self) -> list[int]:
+        if self._topk_layer_indices is None:
+            self._topk_layer_indices = get_topk_layer_indices(self.hf_config)
+        return self._topk_layer_indices
+
+    def _prepare_replay_indices(
+        self,
+        batches: List[Dict[str, Any]],
+        seq_length: int,
+    ) -> Optional[list[torch.Tensor]]:
+        """Build per-TopKRouter-layer replay indices from a micro-batch.
+
+        Parameters
+        ----------
+        batches : list[dict]
+            Micro-batch dicts; each must contain ``"routed_experts"``
+            of shape ``(sample_seq_len, num_all_layers, topk)``.
+        seq_length : int
+            Padded sequence length for this step.
+
+        Returns
+        -------
+        list[Tensor] or None
+            One ``(B * seq_length, topk)`` int64 tensor per TopKRouter
+            layer, ready for :func:`router_replay_ctx`. ``None`` if the
+            batch has no ``routed_experts``.
+        """
+        if batches[0].get("routed_experts") is None:
+            return None
+
+        topk_indices = self._get_topk_layer_indices()
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
+        dp_rank = mpu.get_data_parallel_rank()
+
+        per_layer_accum: list[list[torch.Tensor]] = [[] for _ in topk_indices]
+
+        for batch in batches:
+            re = batch["routed_experts"]
+            seq_batch = re.shape[0] - 1
+
+            full_index = torch.arange(seq_length, device=re.device)
+            index = (full_index + (full_index // seq_batch) * 6 * dp_rank) % seq_batch
+
+            if cp_size > 1:
+                s_local = seq_length // cp_size
+                start = cp_rank * s_local
+                index = index[start:start + s_local]
+
+            padded = re[index]
+
+            for out_i, layer_i in enumerate(topk_indices):
+                per_layer_accum[out_i].append(padded[:, layer_i, :])
+
+        return [torch.cat(chunks, dim=0).contiguous().long() for chunks in per_layer_accum]
+
+    @contextmanager
+    def _maybe_router_replay(
+        self,
+        model,
+        batches: List[Dict[str, Any]],
+        seq_length: int,
+    ):
+        if not self.config.training.moe_router_replay:
+            yield
+            return
+
+        indices = self._prepare_replay_indices(batches, seq_length)
+        if indices is None:
+            yield
+            return
+
+        with router_replay_ctx(model, indices):
+            yield
+
+
+class ForwardStepMixin(RouterReplayMixin):
     @torch.no_grad()
     def compute_logprobs(
-        self, model, batches_list: List[Dict[str, Any]], batch_log_str: str
+        self,
+        model,
+        batches_list: List[Dict[str, Any]],
+        batch_log_str: str,
+        enable_r3: bool = False,
     ) -> torch.Tensor:
         total_samples = len(batches_list)
         seq_length = get_batches_max_seqlen(batches_list, self.training_config.pad_to_mulitiple_of)
@@ -362,7 +466,12 @@ class ForwardStepMixin:
                 vocab_size=self._get_vocab_size(),
             )
             target = model_fwd_args.pop("target")
-            logits = model(**model_fwd_args).logits.float()
+            replay_ctx = (
+                self._maybe_router_replay(model, batches, seq_length)
+                if enable_r3 else nullcontext()
+            )
+            with replay_ctx:
+                logits = model(**model_fwd_args).logits.float()
 
             logprobs, _ = self.get_logprob_and_entropy(
                 logits=logits,
@@ -479,12 +588,20 @@ class ForwardStepMixin:
     ):
         training_config = self.config.training
         dp_size = mpu.get_data_parallel_world_size()
-        assert training_config.train_gbs == len(
+
+        is_dpo = training_config.loss_func == "dpo"
+        gbs_factor = 2 if is_dpo else 1
+        assert training_config.train_gbs * gbs_factor == len(
             batch
-        ) * dp_size, f"{training_config.train_gbs=} {len(batch)=} {dp_size=}"
+        ) * dp_size, f"{training_config.train_gbs=} {gbs_factor=} {len(batch)=} {dp_size=}"
+
+        if is_dpo:
+            assert not training_config.enable_mtp, "DPO + MTP not yet supported on FSDP2"
+            assert not training_config.use_dynamic_mbs, "DPO + dynamic_mbs not yet supported"
 
         pack_seq = self.policy_config.ppo_pack_seq
         if pack_seq:
+            assert not is_dpo, "DPO + pack_seq not supported"
             assert not training_config.use_dynamic_mbs, (
                 "use_dynamic_mbs is incompatible with ppo_pack_seq "
                 "(pack-seq does its own token-budget micro-batch splitting)"
@@ -517,7 +634,22 @@ class ForwardStepMixin:
                 num_microbatches = len(batch) // dynamic_mbs
 
             data_iter = get_k_split_list(batch, num_microbatches)
+        if is_dpo:
+            dpo_mbs = len(batch) // num_microbatches
+            assert dpo_mbs == training_config.train_mbs * 2, (
+                f"DPO microbatch must have 2*train_mbs samples, got {dpo_mbs} "
+                f"(train_mbs={training_config.train_mbs})"
+            )
         loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+
+        # Switch-style MoE load-balancing loss (FSDP2). Computed for the metric
+        # in both train and eval; only added to backward when training. Reads
+        # router_logits captured via forward hooks; these keep their grad_fn
+        # only under non-reentrant gradient checkpointing (the transformers
+        # default), so recompute is supported. Under use_reentrant=True the hook
+        # captures the no-grad first-pass tensor and the balance gradient is
+        # silently dropped, so recompute must stay non-reentrant.
+        enable_balance_loss = training_config.moe_balance_loss_coef > 0
 
         # 在 dp rank 与 micro batch 之间统计 valid token 数量，用于后面 loss 的归一化。
         # MTP（仅 DSV4）额外统计逐 depth 的全局 valid token 数，作为无偏 den 替换
@@ -554,10 +686,18 @@ class ForwardStepMixin:
             dist.all_reduce(global_n_for_mtp)
             global_n_for_mtp = global_n_for_mtp.clamp_min(1.0)
 
+        if is_dpo:
+            dpo_beta = training_config.dpo_beta
+            dpo_label_smoothing = training_config.dpo_label_smoothing
+            dpo_ftx_gamma = training_config.dpo_ftx_gamma
+            total_dpo_pairs = training_config.train_gbs
+            dpo_metric_sums = {}
+
         report_loss = 0.
         report_main_loss = 0.
         report_mtp_loss = 0.
         report_mtp_depth_loss = None
+        report_balance_loss = 0.
         for batches in tqdm(data_iter, disable=True):
             batch, fwd_kwargs = self.prepare_data.sft_train(
                 batches,
@@ -571,6 +711,8 @@ class ForwardStepMixin:
 
             loss_mask = batch["loss_mask"]
             labels = batch["labels"]
+            if enable_balance_loss:
+                fwd_kwargs["output_router_logits"] = True
             # Cast to fp32 for numerically stable cross entropy (log-sum-exp in
             # bf16/fp16 is lossy); consistent with logprob path above.
             outputs = self.model(**fwd_kwargs)
@@ -578,66 +720,136 @@ class ForwardStepMixin:
             labels_2d = labels
             loss_mask_2d = loss_mask
 
-            # tokens 和 logits 都在 sft_train 时候 shift 过了
-            logits = logits.view(-1, self._get_vocab_size())
-            labels = labels_2d.view(-1)
-            loss_mask = loss_mask_2d.view(-1)
+            if is_dpo:
+                ref_logprobs = batch["ref_logprobs"]
+                safe_labels = labels_2d.clamp(min=0)
+                policy_logps = selective_log_softmax_raw(logits, safe_labels)
+                ref_len = ref_logprobs.shape[1]
+                policy_logps = policy_logps[:, :ref_len]
+                dpo_loss_mask = loss_mask_2d[:, :ref_len].float()
 
-            # Enable model parallelism
-            labels = labels.to(logits.device)
-            loss = loss_fct(logits, labels)
-            loss = loss * loss_mask.to(loss.device)
+                policy_seq_logps = (policy_logps * dpo_loss_mask).sum(-1)
+                ref_seq_logps = (ref_logprobs.to(policy_logps.device) * dpo_loss_mask).sum(-1)
 
-            # TODO: 将 loss func 独立出去
-            # Q: 为什么 `* dp_size`？
-            # A: 因为在 dp rank 之间 reduce 缩小了尺度。
-            # Q: 为什么不需要 `/ num_microbatches`？
-            # A: 因为在 micro batch 之间 reduce 已经缩小了尺度。
-            main_loss = torch.sum(loss) / global_n
-            main_loss = main_loss * self.dp_size
+                B = policy_seq_logps.shape[0]
+                assert B % 2 == 0, f"DPO microbatch must have even size, got {B}"
+                rbs = B // 2
+                policy_chosen_logps, policy_rejected_logps = policy_seq_logps.split(rbs)
+                ref_chosen_logps, ref_rejected_logps = ref_seq_logps.split(rbs)
 
-            mtp_loss = None
-            mtp_depth_losses = None
-            if training_config.enable_mtp:
-                mtp_per_depth_h = getattr(outputs, "mtp_per_depth_h", None)
-                assert mtp_per_depth_h is not None, (
-                    "enable_mtp=True but model forward returned no mtp_per_depth_h"
+                losses, chosen_rewards, rejected_rewards = compute_dpo_loss_core(
+                    policy_chosen_logps,
+                    policy_rejected_logps,
+                    ref_chosen_logps,
+                    ref_rejected_logps,
+                    beta=dpo_beta,
+                    label_smoothing=dpo_label_smoothing,
+                    loss_type=training_config.dpo_loss_type,
                 )
-                model_cp_group = self.model._cp_group if self.cp_size > 1 else None
-                mtp_scale = float(
-                    getattr(
-                        outputs,
-                        "mtp_loss_scaling_factor",
-                        getattr(training_config, "mtp_loss_scaling_factor", 0.1),
-                    )
-                )
-                mtp_depth_nums = calculate_mtp_loss(
-                    mtp_per_depth_h=mtp_per_depth_h,
-                    labels=labels_2d.to(logits.device),
-                    lm_head=self.model.lm_head,
-                    loss_fct=loss_fct,
-                    loss_mask=loss_mask_2d.to(logits.device),
-                    cp_group=model_cp_group,
-                    packed_seq_params=fwd_kwargs.get("packed_seq_params"),
-                )
-                assert len(mtp_depth_nums) == global_n_for_mtp.numel(
-                ), (f"{len(mtp_depth_nums)=} != {global_n_for_mtp.numel()=}")
-                mtp_depth_losses = []
-                mtp_depth_loss_metrics = []
-                for depth, d_loss_local in enumerate(mtp_depth_nums):
-                    # Per-depth unbiased global den from labels_full (replaces
-                    # calculate_mtp_loss's biased per-micro-batch den).
-                    den = global_n_for_mtp[depth]
-                    mtp_depth_losses.append(d_loss_local / den * self.dp_size)
-                    n_global_metric = d_loss_local.detach().clone()
-                    # Reporting metric: global numerator / global token count.
-                    dist.all_reduce(n_global_metric)
-                    mtp_depth_loss_metrics.append(n_global_metric / den * self.dp_size)
-                mtp_loss = torch.stack(mtp_depth_losses
-                                      ).sum() * (mtp_scale / max(len(mtp_depth_losses), 1))
-                loss = main_loss + mtp_loss
-            else:
+                log(f"DEBUG dpo loss {losses} {chosen_rewards=} {rejected_rewards=}")
+
+                if dpo_ftx_gamma > 1e-6:
+                    chosen_mask_sum = dpo_loss_mask[:rbs].sum(-1).clamp_min(1.0)
+                    losses = losses - dpo_ftx_gamma * policy_chosen_logps / chosen_mask_sum
+
+                main_loss = losses.sum() / total_dpo_pairs * dp_size
                 loss = main_loss
+
+                with torch.no_grad():
+                    reward_acc = (chosen_rewards > rejected_rewards).float().mean()
+                    _m = {
+                        "rewards-accuracies": reward_acc,
+                        "rewards-chosen": chosen_rewards.mean(),
+                        "rewards-rejected": rejected_rewards.mean(),
+                        "rewards-margins": (chosen_rewards - rejected_rewards).mean(),
+                        "logps-chosen": policy_chosen_logps.mean(),
+                        "logps-rejected": policy_rejected_logps.mean(),
+                        "ref-logps-chosen": ref_chosen_logps.mean(),
+                        "ref-logps-rejected": ref_rejected_logps.mean(),
+                    }
+                    for k, v in _m.items():
+                        dpo_metric_sums[k] = dpo_metric_sums.get(k, 0.0) + v.item()
+            else:
+                # tokens 和 logits 都在 sft_train 时候 shift 过了
+                logits = logits.view(-1, self._get_vocab_size())
+                labels = labels_2d.view(-1)
+                loss_mask = loss_mask_2d.view(-1)
+
+                # Enable model parallelism
+                labels = labels.to(logits.device)
+                loss = loss_fct(logits, labels)
+                loss = loss * loss_mask.to(loss.device)
+
+                # Q: 为什么 `* dp_size`？
+                # A: 因为在 dp rank 之间 reduce 缩小了尺度。
+                # Q: 为什么不需要 `/ num_microbatches`？
+                # A: 因为在 micro batch 之间 reduce 已经缩小了尺度。
+                main_loss = torch.sum(loss) / global_n
+                main_loss = main_loss * self.dp_size
+
+                mtp_loss = None
+                mtp_depth_losses = None
+                if training_config.enable_mtp:
+                    mtp_per_depth_h = getattr(outputs, "mtp_per_depth_h", None)
+                    assert mtp_per_depth_h is not None, (
+                        "enable_mtp=True but model forward returned no mtp_per_depth_h"
+                    )
+                    model_cp_group = self.model._cp_group if self.cp_size > 1 else None
+                    mtp_scale = float(
+                        getattr(
+                            outputs,
+                            "mtp_loss_scaling_factor",
+                            getattr(training_config, "mtp_loss_scaling_factor", 0.1),
+                        )
+                    )
+                    mtp_depth_nums = calculate_mtp_loss(
+                        mtp_per_depth_h=mtp_per_depth_h,
+                        labels=labels_2d.to(logits.device),
+                        lm_head=self.model.lm_head,
+                        loss_fct=loss_fct,
+                        loss_mask=loss_mask_2d.to(logits.device),
+                        cp_group=model_cp_group,
+                        packed_seq_params=fwd_kwargs.get("packed_seq_params"),
+                    )
+                    assert len(mtp_depth_nums) == global_n_for_mtp.numel(
+                    ), (f"{len(mtp_depth_nums)=} != {global_n_for_mtp.numel()=}")
+                    mtp_depth_losses = []
+                    mtp_depth_loss_metrics = []
+                    for depth, d_loss_local in enumerate(mtp_depth_nums):
+                        den = global_n_for_mtp[depth]
+                        mtp_depth_losses.append(d_loss_local / den * self.dp_size)
+                        n_global_metric = d_loss_local.detach().clone()
+                        dist.all_reduce(n_global_metric)
+                        mtp_depth_loss_metrics.append(n_global_metric / den * self.dp_size)
+                    mtp_loss = torch.stack(mtp_depth_losses
+                                          ).sum() * (mtp_scale / max(len(mtp_depth_losses), 1))
+                    loss = main_loss + mtp_loss
+                else:
+                    loss = main_loss
+
+            balance_loss = None
+            if enable_balance_loss:
+                balance_loss = load_balancing_loss_func(
+                    gate_logits=outputs.router_logits,
+                    num_experts=self.model.num_experts,
+                    top_k=self.model.num_experts_per_tok,
+                    cp_group=self.model._cp_group if self.cp_size > 1 else None,
+                )
+
+                # The current computation method follows HF.transformers, which introduces a bias due to varying sequence lengths.
+                # For example:
+                # ```
+                # s1 = [
+                #   [1, 2, ..., 10000],
+                #   [1],
+                # ]
+                # ```
+                # will produce a different result compared to
+                # ```
+                # s2 = [[1, 2, ...., 10000, 1]]
+                # ```
+                loss = loss + training_config.moe_balance_loss_coef * balance_loss / num_microbatches
+
             if not forward_only:
                 loss.backward()
 
@@ -648,7 +860,11 @@ class ForwardStepMixin:
                 dist.all_reduce(tmp_main, group=self.model._cp_group)
             report_loss += tmp.item()
             report_main_loss += tmp_main.item()
-            if mtp_loss is not None:
+            if balance_loss is not None:
+                # Already CP-global (identical on every CP rank); accumulate the
+                # per-step mean contribution.
+                report_balance_loss += balance_loss.detach().item() / num_microbatches
+            if not is_dpo and mtp_loss is not None:
                 tmp_mtp = mtp_loss.detach().clone()
                 if self.cp_size > 1:
                     dist.all_reduce(tmp_mtp, group=self.model._cp_group)
@@ -674,6 +890,19 @@ class ForwardStepMixin:
             f"{metric_prefix}/total_loss": report_loss.item(),
             f"{metric_prefix}/seq_length": max_seq_length,
         }
+        if is_dpo:
+            n_mb = max(num_microbatches, 1)
+            for k, v in dpo_metric_sums.items():
+                t = torch.tensor(v / n_mb).to(torch.cuda.current_device())
+                dist.all_reduce(t, op=dist.ReduceOp.AVG)
+                metrics[f"{metric_prefix}/dpo-metrics/{k}"] = t.item()
+            metrics[f"{metric_prefix}/dpo-metrics/loss"] = report_loss.item()
+        if enable_balance_loss:
+            report_balance_loss_t = torch.tensor(report_balance_loss).to(
+                torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(report_balance_loss_t, op=torch.distributed.ReduceOp.AVG)
+            metrics[f"{metric_prefix}/balance_loss"] = report_balance_loss_t.item()
         if training_config.enable_mtp:
             metrics[f"{metric_prefix}/mtp_loss"] = report_mtp_loss_t.item()
             if report_mtp_depth_loss is not None:

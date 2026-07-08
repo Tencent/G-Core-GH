@@ -6,12 +6,29 @@ import os
 import types
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 import vllm
 from typing_extensions import override
 
 from gpatch_v4.generation_backend.infer_engine import InferEngine
 from gpatch_v4.utils import gcore_save_vllm_checkpoint, log
+
+
+def merge_vllm_routed_experts(gen_output, completion_output):
+    """Merge vLLM v0.21+ split routing back to a full-sequence array.
+
+    vLLM puts prompt routing on ``RequestOutput.prompt_routed_experts`` and
+    generation routing on ``CompletionOutput.routed_experts``.  gcore's
+    ``process_routed_experts`` expects the concatenated full sequence.
+    """
+    prompt_re = getattr(gen_output, "prompt_routed_experts", None)
+    gen_re = completion_output.routed_experts
+    if prompt_re is None and gen_re is None:
+        return None
+    if prompt_re is not None and gen_re is not None:
+        return np.concatenate([prompt_re, gen_re], axis=0)
+    return gen_re if gen_re is not None else prompt_re
 
 
 class VllmEngine(InferEngine):
@@ -194,7 +211,7 @@ class VllmEngine(InferEngine):
                     types.SimpleNamespace(
                         token_ids=completion_output.token_ids,
                         prompt_len=len(gen_output.prompt_token_ids),
-                        routed_experts=completion_output.routed_experts,
+                        routed_experts=merge_vllm_routed_experts(gen_output, completion_output),
                         output_logprobs=output_logprobs,
                         text=completion_output.text,
                         # vllm 特有，sglang 后面如果有最好加上，对多模态验证比较有用
@@ -244,6 +261,17 @@ class VllmEngine(InferEngine):
         should_sleep = [t for t in want_tags if self.wake_up_tag[t]]
         if not should_sleep:
             return
+
+        # vllm 这里如果有一些 tag 在睡，一些 tag 在醒，vllm 就默认睡了，不会再将醒的 tag 也睡下去
+        # 所以在这种情况下，让所有 tag 都醒，再睡下去，这样才能释放全部的显存
+        awake_tags = [t for t in self.all_supported_tags if self.wake_up_tag[t]]
+        sleeping_tags = [t for t in self.all_supported_tags if not self.wake_up_tag[t]]
+
+        if awake_tags and sleeping_tags:
+            await self.infer_engine.wake_up(tags=sleeping_tags)
+            for t in sleeping_tags:
+                self.wake_up_tag[t] = True
+            should_sleep = [t for t in want_tags if self.wake_up_tag[t]]
 
         await self.infer_engine.collective_rpc("gcore_save_moe_for_sleep")
         await self.infer_engine.sleep(level=1)

@@ -54,6 +54,10 @@ try:
         LoRALinear,
         LoRATopKRouter,
     )
+    from megatron.bridge.training.checkpointing import (
+        apply_peft_adapter_filter_to_state_dict,
+    )
+    
 except ImportError:
     lora_merged = None
     gather_lora_state_dict = None
@@ -65,10 +69,8 @@ except ImportError:
     LoRATopKRouter = None
     LoRALinearSplitFC1UpGate = None
     LoRALinearSplitQKV = None
+    apply_peft_adapter_filter_to_state_dict = None
 
-from megatron.bridge.training.checkpointing import (
-    apply_peft_adapter_filter_to_state_dict,
-)
 
 from gpatch_v4.configs.checkpoint_config import CheckpointConfig
 from gpatch_v4.core.parallel_state import cpu_barrier

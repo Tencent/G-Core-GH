@@ -32,6 +32,8 @@ from .router_replay import (
     capture_routing_decisions,
     disable_router_replay,
     enable_router_replay,
+    extract_topk_layers,
+    get_topk_layer_indices,
     router_replay_ctx,
 )
 
@@ -43,5 +45,7 @@ __all__ = [
     "capture_routing_decisions",
     "disable_router_replay",
     "enable_router_replay",
+    "extract_topk_layers",
+    "get_topk_layer_indices",
     "router_replay_ctx",
 ]

@@ -124,9 +124,10 @@ def linear_cross_entropy(
     temperature: typing.Optional[float] = 1.0,
     reduction: typing.Optional[str] = "none",
     dist_process_group: typing.Optional[dist.ProcessGroup] = None,
+    return_entropy: bool = False,
 ):
     # _entropy 暂时不返回
-    loss, _entropy = LinearCrossEntropy.apply(
+    loss, entropy = LinearCrossEntropy.apply(
         hidden,
         weight,
         labels,
@@ -138,4 +139,8 @@ def linear_cross_entropy(
     # 与 vocab_parallel_cross_entropy 返回值语义一致
     loss = (-loss).view(labels.shape)
 
-    return loss
+    if return_entropy:
+        entropy = entropy.view(labels.shape)
+        return loss, entropy
+    else:
+        return loss

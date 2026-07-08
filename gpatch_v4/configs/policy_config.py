@@ -47,6 +47,14 @@ class BasePolicyConfig(MappingProtocol):
         Whether to delay DDP wrapping until after mbridge weight loading.
     override_transformer_config : dict
         Overrides applied to the transformer model config.
+    freeze_patterns : list of str
+        Wildcard patterns (``*`` matches any substring, see
+        ``mbridge.peft.utils.wildcard_match``) matched against parameter
+        names; matching parameters have ``requires_grad`` set to ``False``.
+    unfreeze_patterns : list of str
+        Same wildcard syntax as ``freeze_patterns``, but for keeping/forcing
+        parameters trainable. Takes priority over ``freeze_patterns``: a
+        parameter matching both stays trainable.
     """
     dist_config: DistConfig = field(default_factory=DistConfig)
 
@@ -69,6 +77,9 @@ class BasePolicyConfig(MappingProtocol):
     ep_backend: str = field(default="eager", metadata={"help": "DSV4 EP backend: eager, deepep"})
     deepep_num_sms: int = field(
         default=24, metadata={"help": "Number of SMs used by DeepEP kernels"}
+    )
+    fp8_qat: bool = field(
+        default=False, metadata={"help": "Enable FP8 activation/weight fake-quant (QAT)"}
     )
 
     rollout_gen_type: Optional[str] = field(
@@ -122,6 +133,22 @@ class BasePolicyConfig(MappingProtocol):
         metadata={"help": "Delay DDP wrapping until after mbridge load_weights."},
     )
     override_transformer_config: dict[str, Any] = field(default_factory=dict)
+    freeze_patterns: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help":
+                "Wildcard patterns ('*' = any substring) matched against parameter "
+                "names to freeze (requires_grad=False)."
+        },
+    )
+    unfreeze_patterns: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help":
+                "Wildcard patterns ('*' = any substring) matched against parameter "
+                "names to keep/force trainable. Takes priority over freeze_patterns."
+        },
+    )
     lora: LoRAConfig = field(
         default_factory=LoRAConfig,
         metadata={"help": "LoRA/PEFT config (rank=0 disables)"},
@@ -158,10 +185,29 @@ class BasePolicyConfig(MappingProtocol):
             self.dist_config = DistConfig(**self.dist_config)
         if isinstance(self.lora, dict):
             self.lora = LoRAConfig(**self.lora)
+
         if self.dist_config.dynamic_context_parallel:
-            assert self.override_transformer_config.get(
-                "calculate_per_token_loss", False
-            ), ("dynamic_context_parallel requires calculate_per_token_loss=True ")
+            _dcp_incompatible = {
+                "balance_dp_seqlen":
+                    self.balance_dp_seqlen,
+                "smart_pad_infer":
+                    self.smart_pad_infer,
+                "smart_pad_train":
+                    self.smart_pad_train,
+                "dynamic_mbs_target_seqlen":
+                    self.dynamic_mbs_target_seqlen is not None,
+                "dynamic_mbs_limit":
+                    self.dynamic_mbs_limit is not None,
+                "dynamic_mbs_target_seqlen_fwd_only":
+                    self.dynamic_mbs_target_seqlen_fwd_only is not None,
+                "dynamic_mbs_limit_fwd_only":
+                    self.dynamic_mbs_limit_fwd_only is not None,
+            }
+            _violations = [k for k, v in _dcp_incompatible.items() if v]
+            assert not _violations, (
+                f"dynamic_context_parallel is incompatible with: {', '.join(_violations)}. "
+                "Dynamic CP handles sequence packing and load balancing internally."
+            )
 
 
 @dataclass

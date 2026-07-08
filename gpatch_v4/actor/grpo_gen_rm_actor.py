@@ -145,7 +145,7 @@ class GrpoGenRmActor(BaseActor, TokenizerMixin):
             rm_idx=rm_idx,
             use_fast=infer_engine_config.use_fast_tokenizer,
             max_running_requests=infer_engine_config.max_running_requests,
-            load_format='auto',
+            load_format=infer_engine_config.load_format,
             log_level='info',
             allow_auto_truncate=infer_engine_config.allow_auto_truncate,
             enable_custom_logit_processor=False,

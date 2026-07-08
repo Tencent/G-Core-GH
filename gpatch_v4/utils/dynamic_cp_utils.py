@@ -8,15 +8,208 @@ ranks and build packed THD microbatches.
 Note: the abbreviation "DCP" in this codebase elsewhere refers to PyTorch
 ``torch.distributed.checkpoint``; this module always uses ``dyn_cp``.
 """
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 import torch.distributed as dist
-from typing import Any, Dict, List, Optional, Tuple
 
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule import DefaultDynamicCPScheduler
 from megatron.core.datasets.data_schedule_utils import _get_global_seqlens_and_ids
 
-from gpatch_v4.utils import logging_rank0
+from gpatch_v4.utils import logging_rank0, logging_with_rank_and_datetime
+
+# 2026.07.02 by guanyouhe
+# Env var switch to enable the cross-rank ``all_to_all_single`` legality
+# check below. Off by default since it costs one extra ``all_gather_object``
+# per call; turn on when debugging a dyn_cp hang.
+A2A_CHECK_ENV_VAR = "GPATCH_DYN_CP_CHECK_A2A"
+
+
+def _a2a_check_enabled() -> bool:
+    return os.environ.get(A2A_CHECK_ENV_VAR, "0") == "1"
+
+
+def check_all_to_all_single_legal(
+    name: str,
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+    input_split_sizes: List[int],
+    output_split_sizes: List[int],
+    group: dist.ProcessGroup,
+) -> None:
+    """Validate that an upcoming ``all_to_all_single`` call is globally legal.
+
+    No-op unless ``GPATCH_DYN_CP_CHECK_A2A=1``, since it performs an extra
+    ``all_gather_object`` across ``group`` to cross-check what every rank
+    believes it is about to send/receive. This is meant to turn a silent
+    NCCL hang into an immediate, actionable ``AssertionError``.
+
+    Catches (at least) two known dyn_cp hang root causes:
+      - Different ranks using a different dtype for the *same* collective
+        (e.g. one rank packs real data with its true dtype while another
+        rank, having nothing to send this round, packs an empty tensor
+        with a merely-guessed dtype).
+      - Ranks disagreeing on send/recv split sizes for a given (src, dst)
+        pair -- e.g. two ranks both believe they are the "compute rank"
+        for the same sample and both send, while the destination only
+        budgeted to receive one sender's worth of data (or nobody sends
+        what the receiver expects).
+
+    Parameters
+    ----------
+    name
+        Human-readable label for the call site, used in error messages.
+    input_tensor, output_tensor
+        The tensors this rank is about to pass as ``input``/``output`` to
+        ``torch.distributed.all_to_all_single``.
+    input_split_sizes, output_split_sizes
+        This rank's per-destination send sizes / per-source recv sizes.
+    group
+        The process group the collective will run on.
+    """
+    if not _a2a_check_enabled():
+        return
+
+    world_size = group.size()
+    my_rank = group.rank()
+
+    local_info: Dict[str, Any] = {
+        "rank": my_rank,
+        "dtype": str(input_tensor.dtype),
+        "input_numel": int(input_tensor.numel()),
+        "output_numel": int(output_tensor.numel()),
+        "input_split_sizes": [int(x) for x in input_split_sizes],
+        "output_split_sizes": [int(x) for x in output_split_sizes],
+    }
+
+    gathered: List[Optional[Dict[str, Any]]] = [None] * world_size
+    dist.all_gather_object(gathered, local_info, group=group)
+
+    errors: List[str] = []
+    for info in gathered:
+        r = info["rank"]
+        if len(info["input_split_sizes"]) != world_size:
+            errors.append(
+                f"rank {r}: len(input_split_sizes)={len(info['input_split_sizes'])} "
+                f"!= world_size={world_size}"
+            )
+        if len(info["output_split_sizes"]) != world_size:
+            errors.append(
+                f"rank {r}: len(output_split_sizes)={len(info['output_split_sizes'])} "
+                f"!= world_size={world_size}"
+            )
+        if sum(info["input_split_sizes"]) != info["input_numel"]:
+            errors.append(
+                f"rank {r}: sum(input_split_sizes)={sum(info['input_split_sizes'])} "
+                f"!= input_numel={info['input_numel']}"
+            )
+        if sum(info["output_split_sizes"]) != info["output_numel"]:
+            errors.append(
+                f"rank {r}: sum(output_split_sizes)={sum(info['output_split_sizes'])} "
+                f"!= output_numel={info['output_numel']}"
+            )
+
+    dtypes = {info["dtype"] for info in gathered}
+    if len(dtypes) > 1:
+        errors.append(
+            "dtype mismatch across ranks: "
+            f"{ {info['rank']: info['dtype'] for info in gathered} }"
+        )
+
+    for src in range(world_size):
+        src_info = gathered[src]
+        if len(src_info["input_split_sizes"]) != world_size:
+            continue  # already reported above
+        for dst in range(world_size):
+            dst_info = gathered[dst]
+            if len(dst_info["output_split_sizes"]) != world_size:
+                continue  # already reported above
+            declared_send = src_info["input_split_sizes"][dst]
+            declared_recv = dst_info["output_split_sizes"][src]
+            if declared_send != declared_recv:
+                errors.append(
+                    f"send/recv split-size mismatch: rank {src} declares sending "
+                    f"{declared_send} elem(s) to rank {dst}, but rank {dst} expects "
+                    f"{declared_recv} elem(s) from rank {src}"
+                )
+
+    if errors:
+        report = "\n  ".join(errors)
+        logging_with_rank_and_datetime(
+            f"[dyn_cp][all_to_all_single check FAILED] name={name!r}\n  {report}",
+            rank=0,
+        )
+        raise AssertionError(
+            f"[dyn_cp] all_to_all_single(name={name!r}) is not legal: "
+            f"found {len(errors)} inconsistency(ies) across ranks "
+            f"(full report logged on rank0). First few: {errors[:5]}"
+        )
+
+
+def check_gid_to_compute_rank_consistent(
+    gid_to_compute_rank: Dict[int, int],
+    cp_group: dist.ProcessGroup,
+) -> None:
+    """Cross-check that ``gid_to_compute_rank`` agrees across CP siblings.
+
+    Every CP sibling of a DP index independently recomputes the *same*
+    dyn_cp schedule from replicated rollout data (see ``docs/source/dynamic_cp.md``);
+    ``reverse_reroute_logprobs`` relies on this to fan a single all-to-all
+    out to every CP sibling correctly. If a future change ever breaks the
+    "rollout data is replicated across CP siblings" invariant, the two
+    siblings' independently-computed ``gid_to_compute_rank`` dicts would
+    silently diverge -- this turns that into an immediate ``AssertionError``
+    instead of a reverse-reroute hang. No-op unless ``GPATCH_DYN_CP_CHECK_A2A=1``.
+    """
+    if not _a2a_check_enabled():
+        return
+    if cp_group.size() <= 1:
+        return
+
+    gathered: List[Optional[Dict[int, int]]] = [None] * cp_group.size()
+    dist.all_gather_object(gathered, gid_to_compute_rank, group=cp_group)
+
+    my_rank = cp_group.rank()
+    mine = gathered[my_rank]
+    mismatched_ranks = [r for r, other in enumerate(gathered) if other != mine]
+    if mismatched_ranks:
+        logging_with_rank_and_datetime(
+            f"[dyn_cp][gid_to_compute_rank check FAILED] this CP group's ranks "
+            f"{mismatched_ranks} disagree with rank {my_rank} on gid_to_compute_rank "
+            f"-- the 'rollout data replicated across CP siblings' invariant that "
+            f"reverse_reroute_logprobs depends on has been broken.",
+            rank=0,
+        )
+        raise AssertionError(
+            f"[dyn_cp] gid_to_compute_rank is not identical across CP siblings: "
+            f"rank {my_rank} disagrees with CP-group rank(s) {mismatched_ranks}."
+        )
+
+
+def _gather_int_metadata_by_key(
+    batch: list[dict[str, torch.Tensor]],
+    key: str,
+    dp_group: torch.distributed.ProcessGroup,
+    dev,
+) -> List[Tuple[int, int]]:
+    """Gather per-sample scalar metadata values across DP ranks.
+
+    Unlike ``get_global_id_1d_len_by_keys``, this reads the stored *value*
+    (e.g. ``original_seq_len``) rather than the 1-D tensor width used for
+    all-to-all byte counts during reroute.
+    """
+    local_vals = torch.tensor(
+        [int(s[key].reshape(-1)[0].item()) for s in batch],
+        dtype=torch.int32,
+        device=dev,
+    )
+    gathered = [torch.empty_like(local_vals) for _ in range(dp_group.size())]
+    torch.distributed.all_gather(gathered, local_vals, group=dp_group)
+
+    all_vals = torch.cat(gathered, dim=0).tolist()
+    return [(i, int(v)) for i, v in enumerate(all_vals)]
 
 
 def _round_up(n: int, divisor: int) -> int:
@@ -143,7 +336,7 @@ def reroute_samples_to_dcp_ranks_by_keys(
     dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
     dp_ranks = [(r // tp_group.size()) % dp_cp_group.size() for r in dp_ranks]
 
-    data_keys = batch[0].keys()
+    data_keys = sorted(batch[0].keys())  # sort to ensure consistent order across ranks
 
     # Create the send plan
     combined_sample_id_groups: List[List[int]] = [[] for _ in range(total_dcp_gpus)]
@@ -229,6 +422,14 @@ def reroute_samples_to_dcp_ranks_by_keys(
         recv_tensor_size = sum(output_split_sizes)
         recv_tensor = torch.empty(
             recv_tensor_size, device=torch.cuda.current_device(), dtype=send_tensor.dtype
+        )
+        check_all_to_all_single_legal(
+            name=f"reroute_samples_to_dcp_ranks_by_keys[key={key}]",
+            input_tensor=send_tensor,
+            output_tensor=recv_tensor,
+            input_split_sizes=input_split_sizes,
+            output_split_sizes=output_split_sizes,
+            group=dp_cp_group,
         )
         torch.distributed.all_to_all_single(
             output=recv_tensor,
@@ -384,12 +585,37 @@ def dyn_cp_schedule_default(
     cat_keys: list[str],
     global_id_seqlens_keys: list[str],
     dtype_map: Dict[str, torch.dtype],
-) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float]:
-    """Default dynamic CP: global sorting + all-to-all redistribution."""
-    total_dyn_cp_gpus = dp_cp_group.size()
+    max_seqlen_per_dp_cp_rank: Optional[int] = None,
+    need_routing_info: bool = True,
+) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float, Optional[Dict[str, Any]]]:
+    """Default dynamic CP: global sorting + all-to-all redistribution.
 
+    Parameters
+    ----------
+    need_routing_info : bool
+        If False, skip building the reverse-routing metadata and return
+        ``None`` for ``routing_info``.  This saves one collective
+        (``_gather_int_metadata_by_key``) and some CPU work when the caller
+        only needs the packed microbatches (e.g. training forward-backward).
+
+    Returns
+    -------
+    new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, routing_info
+
+    ``routing_info`` (when requested) contains scheduling metadata for reverse
+    communication:
+      - ``global_ids_this_rank``: Tensor of global IDs originally on this rank
+      - ``offsets``: cumulative sample counts per rank
+      - ``global_id_logprob_lens``: list[(gid, logprob_len)] for all samples
+      - ``gid_to_compute_rank``: dict mapping gid → dcp_rank that computes it
+      - ``gid_to_orig_dcp_rank``: dict mapping gid → list of dcp_ranks (all
+        CP siblings of the originating DP index) that need the restored
+        result
+    """
+    total_dyn_cp_gpus = dp_cp_group.size()
+    assert max_seqlen_per_dp_cp_rank is not None
     scheduler = DefaultDynamicCPScheduler(
-        max_seqlen_per_dp_cp_rank=dist_config.max_seqlen_per_dp_cp_rank,
+        max_seqlen_per_dp_cp_rank=max_seqlen_per_dp_cp_rank,
         cp_size=cp_size,
         dp_size=dp_size,
         microbatch_group_size_per_vp_stage=None,
@@ -440,6 +666,12 @@ def dyn_cp_schedule_default(
         cat_keys=cat_keys,
     )
 
+    # Embed global sample IDs in each packed microbatch for reverse mapping.
+    for i, sample in enumerate(new_samples):
+        sample["_dyn_cp_sample_ids"] = torch.tensor(
+            sample_id_groups[i][dyn_cp_rank], dtype=torch.int64, device=dev
+        )
+
     # Move packed microbatches to CPU to reduce peak GPU memory when GBS is
     # large.  Each microbatch will be moved back to GPU lazily during forward.
     for sample in new_samples:
@@ -451,7 +683,64 @@ def dyn_cp_schedule_default(
     seqlen_sum = float(sum(seqlens_gathered))
     seqlen_sq_sum = float(sum(s**2 for s in seqlens_gathered))
 
-    return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum
+    if not need_routing_info:
+        return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, None
+
+    # Build gid → compute_rank mapping from scheduling.
+    gid_to_compute_rank: Dict[int, int] = {}
+    for group in sample_id_groups:
+        for rank_idx, gids in enumerate(group):
+            for gid in gids:
+                gid_to_compute_rank[gid] = rank_idx
+
+    # Defensive (debug-only): confirm every CP sibling computed the exact
+    # same schedule from the replicated rollout data. See docstring on
+    # ``check_gid_to_compute_rank_consistent``.
+    check_gid_to_compute_rank_consistent(
+        gid_to_compute_rank, parallel_state.get_context_parallel_group()
+    )
+
+    # Map each global ID back to *every* dcp rank that needs the restored
+    # result, i.e. all CP siblings of its originating DP index -- not just
+    # the single rank this call's own (CP-slice-scoped) ``dp_group`` happens
+    # to resolve.
+    #
+    # Rollout data is broadcast identically to every CP sibling of a DP
+    # index (see ``is_mp_and_cp_head`` + ``broadcast_object_within_mp_and_cp``),
+    # so every one of those ``cp_size`` physical ranks independently computes
+    # this same routing with an *identical* ``gid -> compute_rank`` mapping
+    # (a pure function of the replicated seqlen content) but a *different*,
+    # self-referential ``dp_group`` (its own CP slice) when resolving "who is
+    # the original owner". Resolving to a single rank here would silently
+    # drop the reverse-reroute send/recv for every other CP sibling that
+    # also needs the result -- exactly the all-to-all deadlock this function
+    # was hardened against. Instead, expand to the full CP-sibling group so
+    # every rank sends/receives a copy directly via the same all-to-all
+    # (ranks are laid out CP-fastest-within-DP: dcp_rank = dp_idx*cp_size + cp_idx).
+    dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
+    orig_dcp_rank_by_dp = [(r // tp_group.size()) % total_dyn_cp_gpus for r in dp_ranks]
+    total_samples = len(seqlens_gathered)
+    gid_to_orig_dcp_rank: Dict[int, List[int]] = {}
+    for gid in range(total_samples):
+        dp_src_rank = int(torch.bucketize(torch.tensor(gid), offsets[1:] - 1))
+        representative = orig_dcp_rank_by_dp[dp_src_rank]
+        dp_idx = representative // cp_size
+        gid_to_orig_dcp_rank[gid] = [dp_idx * cp_size + c for c in range(cp_size)]
+
+    # Logprob length = shifted token count (stored value, not tensor width).
+    global_id_logprob_lens = _gather_int_metadata_by_key(
+        gbs_batches, "original_seq_len", dp_group, dev
+    )
+
+    routing_info = {
+        "global_ids_this_rank": global_ids_this_rank.cpu(),
+        "offsets": offsets.cpu(),
+        "global_id_logprob_lens": global_id_logprob_lens,
+        "gid_to_compute_rank": gid_to_compute_rank,
+        "gid_to_orig_dcp_rank": gid_to_orig_dcp_rank,
+    }
+
+    return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, routing_info
 
 
 def _compute_smart_padding_dyn_cp_params(
@@ -492,6 +781,7 @@ def dyn_cp_schedule_smart_padding(
     dev,
     packed_keys: list[str],
     cat_keys: list[str],
+    max_seqlen_per_dp_cp_rank: Optional[int] = None,
 ) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float]:
     """Smart-padding-aware dynamic CP: local scheduling, no all-to-all.
 
@@ -500,7 +790,7 @@ def dyn_cp_schedule_smart_padding(
     and selects its own sample subset.  The only communication is a single
     scalar all-reduce(MAX) across the DP group.
     """
-    max_seqlen_per_dp_cp_rank = dist_config.max_seqlen_per_dp_cp_rank
+    assert max_seqlen_per_dp_cp_rank is not None
 
     local_seqlens = [s["tokens"].shape[-1] for s in gbs_batches]
     local_stats = torch.tensor(
@@ -577,3 +867,129 @@ def dyn_cp_schedule_smart_padding(
     )
 
     return new_samples, num_microbatches, seqlen_sum, seqlen_sq_sum
+
+
+def reverse_reroute_logprobs(
+    per_sample_logprobs: Dict[int, torch.Tensor],
+    global_ids_this_rank: torch.Tensor,
+    global_id_logprob_lens: List[Tuple[int, int]],
+    gid_to_compute_rank: Dict[int, int],
+    gid_to_orig_dcp_rank: Dict[int, List[int]],
+    dp_cp_group: dist.ProcessGroup,
+) -> Dict[int, torch.Tensor]:
+    """Reverse the dynamic CP all-to-all with a single data exchange.
+
+    All send/recv split sizes and per-sample lengths are pre-computed from
+    globally-known scheduling info, so only ONE ``all_to_all_single`` call
+    (for the actual log-prob data) is needed.
+
+    Parameters
+    ----------
+    per_sample_logprobs : dict[int, Tensor]
+        Global-ID → log-prob tensor (1D) computed on this rank.
+    global_ids_this_rank : Tensor
+        Global IDs that ORIGINALLY belonged to this rank (before reroute).
+    global_id_logprob_lens : list[tuple[int, int]]
+        ``(global_id, logprob_length)`` for ALL samples globally.
+    gid_to_compute_rank : dict[int, int]
+        Global-ID → the DCP rank that computed its log-probs (derived from
+        ``sample_id_groups`` during scheduling).
+    gid_to_orig_dcp_rank : dict[int, list[int]]
+        Global-ID → *every* DCP rank that needs the restored result, i.e.
+        all CP siblings of the sample's originating DP index. Rollout data
+        is replicated identically across CP siblings (see
+        ``is_mp_and_cp_head`` broadcast), so every one of them independently
+        expects its own copy back -- not just a single "canonical" owner.
+    dp_cp_group : ProcessGroup
+        The DP×CP process group used for all-to-all.
+
+    Returns
+    -------
+    dict[int, Tensor]
+        Global-ID → log-prob tensor for all samples originally on this rank.
+    """
+    total_dcp_gpus = dp_cp_group.size()
+    my_dcp_rank = dp_cp_group.rank()
+    dev = torch.cuda.current_device()
+
+    gid_to_len = {gid: length for gid, length in global_id_logprob_lens}
+
+    # --- Sender: group computed logprobs by destination (original owner). ---
+    # When local_cp_size > 1, every CP collaborator runs forward and holds the
+    # same gids in per_sample_logprobs after CP all_reduce, but only the
+    # designated compute rank (gid_to_compute_rank) may send each gid.
+    # Each gid is duplicated to *every* CP sibling in gid_to_orig_dcp_rank[gid]
+    # since all of them independently expect their own copy back. A gid whose
+    # compute rank IS one of its own CP siblings (dest == my_dcp_rank) is kept
+    # locally instead of being routed through the all-to-all -- it would only
+    # ever be looped back to ourselves.
+    local_results: Dict[int, torch.Tensor] = {}
+    send_by_dest: List[List[Tuple[int, torch.Tensor]]] = [[] for _ in range(total_dcp_gpus)]
+    for gid, lp in per_sample_logprobs.items():
+        if gid_to_compute_rank[gid] != my_dcp_rank:
+            continue
+        assert lp.numel() == gid_to_len[gid], (
+            f"logprob length mismatch for gid={gid}: got {lp.numel()}, "
+            f"expected {gid_to_len[gid]}"
+        )
+        for dest in gid_to_orig_dcp_rank[gid]:
+            if dest == my_dcp_rank:
+                local_results[gid] = lp.to(device=dev, dtype=torch.float32)
+            else:
+                send_by_dest[dest].append((gid, lp))
+    for dest_list in send_by_dest:
+        dest_list.sort(key=lambda x: x[0])
+
+    send_split_sizes = [sum(lp.numel() for _, lp in dest_list) for dest_list in send_by_dest]
+
+    # --- Receiver: pre-compute recv sizes from global knowledge. ---
+    # For each source rank S, the samples it sends to me are: my original gids
+    # that were computed on rank S, sorted by gid (excluding gids resolved
+    # locally above).
+    my_gids = [int(g) for g in global_ids_this_rank.tolist()]
+    recv_by_src: List[List[int]] = [[] for _ in range(total_dcp_gpus)]
+    for gid in my_gids:
+        if gid in local_results:
+            continue
+        src = gid_to_compute_rank[gid]
+        recv_by_src[src].append(gid)
+    for src_list in recv_by_src:
+        src_list.sort()
+
+    recv_split_sizes = [sum(gid_to_len[gid] for gid in src_list) for src_list in recv_by_src]
+
+    # --- Single all-to-all for log-prob data. ---
+    send_data = torch.cat(
+        [
+            lp.to(device=dev, dtype=torch.float32).reshape(-1) for dest_list in send_by_dest
+            for _, lp in dest_list
+        ]
+    ) if sum(send_split_sizes) > 0 else torch.empty(0, device=dev, dtype=torch.float32)
+
+    recv_data = torch.empty(sum(recv_split_sizes), device=dev, dtype=torch.float32)
+    check_all_to_all_single_legal(
+        name="reverse_reroute_logprobs",
+        input_tensor=send_data,
+        output_tensor=recv_data,
+        input_split_sizes=send_split_sizes,
+        output_split_sizes=recv_split_sizes,
+        group=dp_cp_group,
+    )
+    dist.all_to_all_single(
+        recv_data,
+        send_data,
+        output_split_sizes=recv_split_sizes,
+        input_split_sizes=send_split_sizes,
+        group=dp_cp_group,
+    )
+
+    # --- Unpack recv_data using known per-sample lengths and ordering. ---
+    result: Dict[int, torch.Tensor] = dict(local_results)
+    data_cursor = 0
+    for src_rank in range(total_dcp_gpus):
+        for gid in recv_by_src[src_rank]:
+            length = gid_to_len[gid]
+            result[gid] = recv_data[data_cursor:data_cursor + length]
+            data_cursor += length
+
+    return result

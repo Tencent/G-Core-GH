@@ -42,7 +42,7 @@ class TestDLFinetuneActor(BaseActor, TokenizerMixin):
 
         cond1 = all(
             [
-                len(fn_kwargs) == 4,
+                len(fn_kwargs) >= 4,
                 'config' in fn_kwargs,
                 'tokenizer' in fn_kwargs,
                 'dp_rank' in fn_kwargs,

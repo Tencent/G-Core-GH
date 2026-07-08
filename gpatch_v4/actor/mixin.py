@@ -354,6 +354,13 @@ class OffloadManager:
         self.model_engine.release_grad()
         if self.early_swap:
             self.model_engine.offload_model()
+            logging_memory_usage_details(
+                f"memory tracking before clear memory (early_swap enter)", rank=0
+            )
+            n_times_clear_memory(3)
+            logging_memory_usage_details(
+                f"memory tracking after clear memory (early_swap enter)", rank=0
+            )
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):

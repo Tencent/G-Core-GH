@@ -75,6 +75,10 @@ class FinetuneActor(
     FlopsCounterMixin, ProfileMixin
 ):
     """Ray actor for supervised fine-tuning (SFT)."""
+
+    # Log tag for train/eval prefixes; subclasses override to distinguish runs.
+    train_log_tag = "SFT"
+
     async def init(self, config):
         """Initialize the actor: parallel state, tokenizer, dataset, and model.
 
@@ -327,7 +331,7 @@ class FinetuneActor(
         time_log_keys = ["eval_loop"]
         report_metric = record_time_to_metrics(timers, time_log_keys, report_metric, reset=True)
         if is_last_rank():
-            log_prefix = f"[SFT]eval "
+            log_prefix = f"[{self.train_log_tag}]eval "
             TrainReporterSingleton.log_and_report(report_metric, train_step, log_prefix=log_prefix)
         cpu_barrier()
         self._training_plt_report(TrainingPltMixin.TrainState.EVAL_END, {})
@@ -380,7 +384,7 @@ class FinetuneActor(
                 ):
                     save_data(
                         expanded_rbs, "debug-tmp",
-                        f"sft_batches_{train_step}_{torch.distributed.get_rank()}.pt"
+                        f"{self.train_log_tag.lower()}_batches_{train_step}_{torch.distributed.get_rank()}.pt"
                     )
 
                 should_dump = training_config.ppo_dump_metrics_interval > 0 and (
@@ -423,7 +427,7 @@ class FinetuneActor(
                     metric['finetune/avg_mfu'] = avg_mfu
 
                 if is_last_rank():
-                    log_prefix = f"[SFT] training train_step {train_step}/{training_config.total_training_step} epoch {epoch}"
+                    log_prefix = f"[{self.train_log_tag}] training train_step {train_step}/{training_config.total_training_step} epoch {epoch}"
                     TrainReporterSingleton.log_and_report(metric, train_step, log_prefix=log_prefix)
                 if self.config.debug.trainer_return_ppo_step_metrics:
                     collected_metrics.append(metric)

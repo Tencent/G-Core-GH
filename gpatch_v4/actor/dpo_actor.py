@@ -14,7 +14,9 @@ from gpatch_v4.actor.finetune_actor import FinetuneActor
 from gpatch_v4.core.parallel_state import cpu_barrier, is_last_rank
 from gpatch_v4.training_backend.loss_factory import get_policy_loss_fn
 from gpatch_v4.training_backend.megatron_backend.megatron_utils import unwrap_model
-from gpatch_v4.training_backend.megatron_backend.model_forward import gptmodel_pack_foward
+from gpatch_v4.training_backend.megatron_backend.model_forward import (
+    gptmodel_pack_foward,
+)
 from gpatch_v4.utils import (
     TimerSingleton,
     TrainReporterSingleton,
@@ -22,6 +24,10 @@ from gpatch_v4.utils import (
     record_time_to_metrics,
     save_data,
 )
+
+# TODO：整条链路没有任何显式标记（比如一个 is_chosen: bool 字段）来标识每个 sample 的身份。完全靠
+#  "前半 chosen 后半 rejected" 的隐式约定。如果中间任何环节插了 shuffle、排序、或者 reorder，配
+# 对就会悄悄错乱，模型在垃圾信号上训练，而且 loss 不会有明显异常（只是不再收敛到正确的偏好）。
 
 
 class OffloadEngineManager:

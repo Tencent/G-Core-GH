@@ -4,13 +4,18 @@ from gpatch_v4.configs.config import (
     FinetuneConfig,
     OffPolicyDistillConfig,
     OnPolicyDistillConfig,
+    RewardConfig,
     RlConfig,
 )
 from gpatch_v4.core.constants import MODEL_ARCH
 
 try:
-    from gpatch_v4.extended_model.deepseek_v4 import DeepseekV4PrepareDataForwardLLM
+    from gpatch_v4.extended_model.deepseek_v4 import (
+        DeepseekV4DpoPrepareDataForwardLLM,
+        DeepseekV4PrepareDataForwardLLM,
+    )
 except ImportError:
+    DeepseekV4DpoPrepareDataForwardLLM = None
     DeepseekV4PrepareDataForwardLLM = None
 from gpatch_v4.extended_model.gemma4 import Gemma4PrepareDataForward
 from gpatch_v4.extended_model.llm import (
@@ -34,9 +39,18 @@ from gpatch_v4.extended_model.rollout_attr_hook import ApplySamplingRolloutAttrL
 from gpatch_v4.extended_model.wemm3_embedding import Wemm3EmbeddingPrepareDataForward
 
 try:
-    from gpatch_v4.extended_model.welm_v4 import WelmV4PrepareDataForwardLLM
+    from gpatch_v4.extended_model.welm_v4 import (
+        WelmV4DpoPrepareDataForwardLLM,
+        WelmV4PrepareDataForwardLLM,
+    )
 except ImportError:
     WelmV4PrepareDataForwardLLM = None
+    WelmV4DpoPrepareDataForwardLLM = None
+
+try:
+    from gpatch_v4.extended_model.welm_omni_v4_5 import WelmOmniV45PrepareDataForward
+except ImportError:
+    WelmOmniV45PrepareDataForward = None
 
 DEFAULT = "default"
 
@@ -127,6 +141,8 @@ REGISTER_SFT_PREPARE_DATA_FORWARD = {
         Gemma4PrepareDataForward,
     MODEL_ARCH.WEMM3_EMBEDDING:
         Wemm3EmbeddingPrepareDataForward,
+    MODEL_ARCH.WELM_OMNI_V4_5:
+        WelmOmniV45PrepareDataForward,
 }
 
 REGISTER_OFF_POLICY_DISTILL_PREPARE_DATA_FORWARD = {
@@ -148,9 +164,16 @@ REGISTER_OFF_POLICY_DISTILL_PREPARE_DATA_FORWARD = {
 REGISTER_DPO_PREPARE_DATA_FORWARD = {
     DEFAULT:
         DpoPrepareDataForwardLLM,
-    **({
-        MODEL_ARCH.WELMV4_MOE: WelmV4PrepareDataForwardLLM
-    } if WelmV4PrepareDataForwardLLM else {}),
+    **(
+        {
+            MODEL_ARCH.WELMV4_MOE: WelmV4DpoPrepareDataForwardLLM
+        } if WelmV4DpoPrepareDataForwardLLM else {}
+    ),
+    **(
+        {
+            MODEL_ARCH.DEEPSEEK_V4: DeepseekV4DpoPrepareDataForwardLLM
+        } if DeepseekV4DpoPrepareDataForwardLLM else {}
+    ),
     MODEL_ARCH.QWEN3_VL:
         Qwen3VLDpoPrepareDataForward,
     MODEL_ARCH.QWEN3_VL_MOE:
@@ -227,6 +250,9 @@ class PrepareDataForwardFactory:
         elif isinstance(config, OffPolicyDistillConfig):
             register_clss = REGISTER_OFF_POLICY_DISTILL_PREPARE_DATA_FORWARD
         elif isinstance(config, FinetuneConfig):
+            register_clss = REGISTER_SFT_PREPARE_DATA_FORWARD
+        elif isinstance(config, RewardConfig):
+            # reward model reuses the SFT prepare-data classes (they carry rm_train)
             register_clss = REGISTER_SFT_PREPARE_DATA_FORWARD
         elif isinstance(config, DpoConfig):
             register_clss = REGISTER_DPO_PREPARE_DATA_FORWARD

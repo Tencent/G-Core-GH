@@ -1,5 +1,8 @@
-cp /etc/mpi/hostfile /root/hostfile
-# head -n 1 /etc/mpi/hostfile > /root/hostfile
+if [ -z "${GCORE_GPU}" ]; then
+    cp /etc/mpi/hostfile /root/hostfile
+else
+    head -n $GCORE_GPU /etc/mpi/hostfile > /root/hostfile
+fi
 sed -i 's/slots=8/slots=1/g' /root/hostfile
 
 ray stop --force
@@ -15,6 +18,7 @@ mpirun -v --allow-run-as-root \
   --mca btl_tcp_if_include bond1 --mca oob_tcp_if_include bond1 --mca routed direct \
   -x PATH -x LIBRARY_PATH -x LD_LIBRARY_PATH -x PYTHONPATH \
   hostname
+
 
 mpirun -v --allow-run-as-root \
   --bind-to none --map-by slot --hostfile /root/hostfile \

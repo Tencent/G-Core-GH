@@ -1,8 +1,13 @@
 import math
 
-import tilelang as tl
-import tilelang.language as T
 import torch
+
+try:
+    import tilelang as tl
+    import tilelang.language as T
+except ImportError:
+    from gfused.fake_tilelang_stub import language_stub as T
+    from gfused.fake_tilelang_stub import tilelang_stub as tl
 
 
 @tl.jit(

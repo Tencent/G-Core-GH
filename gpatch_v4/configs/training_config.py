@@ -75,6 +75,8 @@ class TrainingConfig(MappingProtocol):
         ``"allgather"`` / ``"alltoall"`` / ``"flex"``.
     moe_router_load_balancing_type : str
         ``"none"`` disables load balancing.
+    moe_balance_loss_coef : float
+        FSDP2 switch-style MoE load-balancing loss coefficient; ``0`` disables.
     offload_process_group : bool
     use_dynamic_mbs : bool
         Requires ``train_mbs == 1``.
@@ -237,6 +239,10 @@ class TrainingConfig(MappingProtocol):
     moe_router_load_balancing_type: str = field(
         default="none", metadata={"help": "Router load balancing type"}
     )
+    moe_balance_loss_coef: float = field(
+        default=0.0,
+        metadata={"help": "FSDP2 switch-style MoE load-balancing loss coefficient; 0 disables."},
+    )
 
     offload_process_group: bool = field(
         default=False, metadata={"help": "Whether to offload process group"}
@@ -337,6 +343,16 @@ class TrainingConfig(MappingProtocol):
             f"Unknown linear_ce_backend: '{self.linear_ce_backend}'. "
             f"Choose from: ['fuse_mn', 'separate', 'split_n']"
         )
+        # use_linear_ce has no [s, V] logits, so the two logits-only dumps fail fast (mirrors SFT).
+        if self.use_linear_ce:
+            assert self.dump_metrics_logprobs_topk == 0, (
+                "use_linear_ce is incompatible with dump_metrics_logprobs_topk: fused-CE does not "
+                "materialize logits (set dump_metrics_logprobs_topk=0 or disable use_linear_ce)"
+            )
+            assert not self.im_end_metrics_enable, (
+                "use_linear_ce is incompatible with im_end_metrics_enable: no logits to compute "
+                "the EOS token-rank (disable one)"
+            )
         if self.ppo_dump_metrics_interval > 0:
             assert self.ppo_dump_metrics_dir
         if self.eval_before_train:
@@ -439,7 +455,8 @@ class FinetuneTrainingConfig(TrainingConfig):
     def __post_init__(self):
         super().__post_init__()
         assert self.loss_func in [
-            "cross_entropy", "ce_with_kl", "custom", "dpo", "square_averaging_cross_entropy"
+            "cross_entropy", "ce_with_kl", "custom", "dpo", "rm_bt",
+            "square_averaging_cross_entropy"
         ], f"Invalid loss function: {self.loss_func}"
         if self.loss_func == "custom":
             assert self.loss_func_py_path is not None and self.loss_func_py_name is not None, "Custom loss function must be provided"
@@ -935,3 +952,26 @@ class DpoTrainingConfig(FinetuneTrainingConfig):
         assert self.dpo_loss_type in [
             "sigmoid"
         ], f"not support this loss type: {self.dpo_loss_type}"
+
+
+@dataclass
+class RewardTrainingConfig(FinetuneTrainingConfig):
+    """Training configuration for Bradley-Terry reward-model training.
+
+    Attributes
+    ----------
+    build_reward_head : bool
+        Replace the LM output layer with a scalar value head
+        (``LinearForLastLayer`` -> 1) so the model emits a per-token scalar.
+        Sequence-level reward is then pooled at the last valid token.
+    """
+    build_reward_head: bool = field(
+        default=True, metadata={"help": "Build a scalar reward head instead of the LM head."}
+    )
+    loss_func: str = field(default="rm_bt", metadata={"help": "Loss function."})
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert self.loss_func == "rm_bt", \
+            f"reward model training requires loss_func='rm_bt', got {self.loss_func}"
+        assert self.build_reward_head, "reward model training requires build_reward_head=True"

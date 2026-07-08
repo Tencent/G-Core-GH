@@ -9,7 +9,7 @@ from typing_extensions import override
 
 from megatron.core import mpu
 
-from gpatch_v4.extended_model.llm import PrepareDataForwardLLM
+from gpatch_v4.extended_model.llm import DpoPrepareDataForwardLLM, PrepareDataForwardLLM
 from gpatch_v4.models.deepseek_v4.cp import cp_chunk_data
 from gpatch_v4.models.deepseek_v4.thd import pack_sequences
 
@@ -200,3 +200,16 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
 
         local_data = cp_chunk_data(cp_rank, cp_size, tokens=data)[0]
         return local_data
+
+
+class DeepseekV4DpoPrepareDataForwardLLM(DpoPrepareDataForwardLLM, DeepseekV4PrepareDataForwardLLM):
+    """DSV4 DPO data preparation: ref_logprobs injection + contiguous CP slicing.
+
+    MRO resolves ``sft_train`` to ``DpoPrepareDataForwardLLM`` (injects
+    ``ref_logprobs``), which calls ``super().sft_train`` →
+    ``DeepseekV4PrepareDataForwardLLM`` (BSHD/THD dispatch + contiguous CP).
+    CP chunk overrides come from ``DeepseekV4PrepareDataForwardLLM``.
+    """
+    def __init__(self, config):
+        super().__init__(config)
+        assert not config.policy.ppo_pack_seq, ("DPO + THD pack_seq not supported for DSV4")

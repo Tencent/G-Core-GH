@@ -15,6 +15,7 @@ from megatron.core.optimizer.optimizer import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 
+from gpatch_v4.configs.config import RewardConfig
 from gpatch_v4.core import parallel_state
 from gpatch_v4.core.mappings import all_gather_from_context_parallel_region
 from gpatch_v4.core.parallel_state import is_tp_and_cp_head
@@ -34,12 +35,12 @@ from gpatch_v4.training_backend.megatron_backend.mixin import (
     CheckpointMixin,
     ForwardStepMixin,
 )
-from gpatch_v4.training_backend.megatron_backend.welm_v45_myfa import (
-    install_welm_v45_myfa_hooks,
-)
 from gpatch_v4.training_backend.megatron_backend.optimizer import (
     get_megatron_last_lr,
     get_optimizer_and_scheduler,
+)
+from gpatch_v4.training_backend.megatron_backend.welm_v45_myfa import (
+    install_welm_v45_myfa_hooks,
 )
 from gpatch_v4.utils import (
     cpu_dict,
@@ -59,7 +60,12 @@ from gpatch_v4.utils.common_utils import (
     profile_memory_and_time,
 )
 from gpatch_v4.utils.communication_utils import BroadcastUtils
-from gpatch_v4.utils.training_utils import get_dump_moe_metrics
+from gpatch_v4.utils.dynamic_cp_utils import reverse_reroute_logprobs
+from gpatch_v4.utils.training_utils import (
+    from_parallel_logits_to_logprobs,
+    get_dump_moe_metrics,
+    logprobs_from_linear_ce,
+)
 
 try:
     from megatron.core.gcore_utils import (
@@ -97,6 +103,8 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                 override_transformer_config=self.policy_config.override_transformer_config
             )
         self.is_critic_model = is_critic_model
+        # Reward-model training reuses the scalar value head (LinearForLastLayer).
+        self.build_reward_head = isinstance(config, RewardConfig)
         self.peft = None
         if not self.policy_config.without_ref:
             # disable moe router replay for ref model
@@ -156,7 +164,7 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                 load_weights_from_bridge=load_hf_base_weights,
                 model_type=f"policy model",
                 wrap_with_ddp=self.policy_config.wrap_with_ddp,
-                build_value_model=self.is_critic_model,
+                build_value_model=self.is_critic_model or self.build_reward_head,
             )
         installed = install_welm_v45_myfa_hooks(self.model, self.hf_config)
         if installed:
@@ -182,7 +190,9 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             self.vocab_size = unwrapped_model[0].language_model.vocab_size
         prev_ppo_step = 0
         if self.policy_config.without_optim:
-            logging_memory_usage_details("memory tracking after setup_model_and_get_optimizer", rank=0)
+            logging_memory_usage_details(
+                "memory tracking after setup_model_and_get_optimizer", rank=0
+            )
             return prev_ppo_step
 
         optimizer, optimizer_scheduler = get_optimizer_and_scheduler(self.config, self.model)
@@ -255,26 +265,27 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
     def compute_log_probs(
         self,
         rollout_batches: List[Dict[str, List[Any]]],
-        compute_pre_logps=True,
-        topk_gather_ids_key: str = None,
-        ref_topk_gather_ids_key: str = None,
+        compute_pre_logps: bool = True,
+        policy_compute_topk: bool = False,
+        policy_gather_ids_key: str = None,
+        ref_gather_ids_key: str = None,
+        skip_ref: bool = False,  # (rionawang)TODO union
     ):
-        """计算 ref model 和 actor model 的 log-probs。
+        """Compute log-probs for the policy model and (optionally) the ref model.
 
         Args:
-            topk_gather_ids_key: 用于 teacher engine —— 从 batch dict 取该 key
-                对应的 ``[S-1, K]`` token-id tensor，在这些 ID 上 gather log-probs。
-            ref_topk_gather_ids_key: 用于 G-OPD student engine —— 交换 student/ref
-                forward 顺序，先跑 student 产出 topk_ids，再让 ref 在这些 ID 上
-                gather log-probs。
-            两参数互斥。
+            compute_pre_logps: Whether to run the policy model forward.
+            policy_compute_topk: If True, policy produces its own top-K ids and logprobs.
+            policy_gather_ids_key: If set, policy gathers logprobs at batch[key] ids.
+                Can be used together with policy_compute_topk.
+            ref_gather_ids_key: If set, ref gathers logprobs at batch[key] ids.
+                When policy_compute_topk=True and this is set, policy runs first
+                (to produce topk_ids that ref depends on).
+            skip_ref: If True, skip ref model computation entirely.
 
         Returns:
-            ref_logps: ref model 的 log-probs。设置 ``ref_topk_gather_ids_key``
-                时返回 ``{"logprobs", "gather_logprobs"}`` dict list，否则为
-                ref_logps 2D tensor list。
-            prev_logps: actor model 的 prev-step log-probs。``log_prob_top_k > 0``
-                时返回 dict list（含 3D topk 字段），否则为 prev_logps 2D tensor list。
+            (ref_logps_list, prev_logps_list) — each is a nested list or None.
+            When top-K modes are active, elements are dicts with 3D tensor fields.
         """
         assert not self.is_critic_model
 
@@ -294,34 +305,31 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
         batches_list = expand_rollout_batches(rollout_batches)
         assert len(batches_list) == samples_per_batch * len(rollout_batches)
 
-        # G-OPD 在 log_prob_top_k>0 且 without_ref False时，ref_logps需要用
-        # student forward 的 topk-ids 来拿到 base_on_stu_topk_logprobs.
-        need_ref_gather_swap = (
-            ref_topk_gather_ids_key is not None and log_prob_top_k > 0 and
-            not self.policy_config.without_ref and compute_pre_logps
-        )
-        assert not (need_ref_gather_swap and topk_gather_ids_key is not None), (
-            "topk_gather_ids_key (teacher path) cannot be combined with "
-            "ref_topk_gather_ids_key (student-engine ref-gather path)."
-        )
+        has_ref = not self.policy_config.without_ref and not skip_ref
+        # Policy runs first when it produces topk_ids that ref depends on.
+        policy_first = (policy_compute_topk and ref_gather_ids_key is not None and has_ref)
 
         ref_logps = None
         prev_logps = None
-        if need_ref_gather_swap:
-            # Student forward first so its top-K ids can drive the ref gather.
+
+        if policy_first:
+            # Policy forward first — produce topk_ids, then ref gathers on them.
             self.onload_model()
             for model_module in self.model:
                 model_module.eval()
+            policy_kw: Dict[str, Any] = {"compute_topk": True}
+            if policy_gather_ids_key is not None:
+                policy_kw["gather_target_ids_key"] = policy_gather_ids_key
             with self.get_router_replay_ctx():
                 prev_logps = call_logps_func(
                     self.model,
                     batches_list,
                     batch_log_str=batch_log_str.format(name="policy_logprobs"),
-                    compute_topk=True,
+                    **policy_kw,
                 )
-            # prev_logps is a list of per-sample dicts containing "topk_ids".
+            # Write policy topk_ids into batch for ref to use.
             for i, d in enumerate(prev_logps):
-                batches_list[i][ref_topk_gather_ids_key] = d["topk_ids"]
+                batches_list[i][ref_gather_ids_key] = d["topk_ids"]
 
             self.offload_model()
             self.onload_ref_model()
@@ -331,12 +339,13 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                 self.ref_model,
                 batches_list,
                 batch_log_str=batch_log_str.format(name="ref_policy_logprobs"),
-                gather_target_ids_key=ref_topk_gather_ids_key,
+                gather_target_ids_key=ref_gather_ids_key,
             )
             self.offload_ref_model()
             self.onload_model()
         else:
-            if not self.policy_config.without_ref:
+            # Ref first (can be offloaded early), then policy.
+            if has_ref:
                 self.offload_model()
                 self.onload_ref_model()
                 for model_module in self.ref_model:
@@ -345,6 +354,9 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                     self.ref_model,
                     batches_list,
                     batch_log_str=batch_log_str.format(name="ref_policy_logprobs"),
+                    **({
+                        "gather_target_ids_key": ref_gather_ids_key
+                    } if ref_gather_ids_key else {}),
                 )
                 self.offload_ref_model()
 
@@ -352,22 +364,19 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                 self.onload_model()
                 for model_module in self.model:
                     model_module.eval()
-                # maybe enable r3 replay if required
-                prev_kw: Dict[str, Any] = {}
-                if log_prob_top_k > 0:
-                    if topk_gather_ids_key is not None:
-                        prev_kw["gather_target_ids_key"] = topk_gather_ids_key
-                    else:
-                        prev_kw["compute_topk"] = True
+                policy_kw: Dict[str, Any] = {}
+                if policy_compute_topk:
+                    policy_kw["compute_topk"] = True
+                if policy_gather_ids_key is not None:
+                    policy_kw["gather_target_ids_key"] = policy_gather_ids_key
                 with self.get_router_replay_ctx():
                     prev_logps = call_logps_func(
                         self.model,
                         batches_list,
                         batch_log_str=batch_log_str.format(name="policy_logprobs"),
-                        **prev_kw,
+                        **policy_kw,
                     )
-            elif not self.policy_config.without_ref:
-                # Policy was offloaded for ref forward; re-onload for training.
+            else:
                 self.onload_model()
 
         # 这里后面就要训练了，应该是不需要多 offload 一次
@@ -391,6 +400,207 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             prev_logps_list = restor_shape(prev_logps)
             assert prev_logps_list is not None
         return ref_logps_list, prev_logps_list
+
+    def compute_log_probs_dynamic_cp(
+        self,
+        rollout_batches: List[Dict[str, List[Any]]],
+        compute_pre_logps=True,
+    ):
+        """Compute log-probs using dynamic CP (THD + Ring Attention path).
+
+        Uses the same forward path as training to ensure numerical consistency
+        between prev/ref log-probs and curr_log_probs. Reroute is performed
+        once and shared across ref/prev model forward passes.
+
+        Goes through Megatron's ``forward_backward_func`` for PP support and
+        progress logging consistency with the non-dynamic-CP path.
+
+        Returns
+        -------
+        ref_logps_list : list[list[Tensor]] or None
+        prev_logps_list : list[list[Tensor]] or None
+            Same format as ``compute_log_probs``.
+        """
+        assert not self.is_critic_model
+
+        samples_per_batch = len(rollout_batches[0]['tokens'])
+        batches_list = expand_rollout_batches(rollout_batches)
+        num_local_samples = len(batches_list)
+
+        packed_batches, num_micro_batches, _, _, routing_info = (
+            self.prepare_data.rl_reroute_data_for_dynamic_cp(
+                batches_list,
+                self.tokenizer.pad_token_id,
+                vocab_size=self.vocab_size,
+                pad_with_random_token=self.config.training.moe_pad_with_random_tokens,
+                max_seqlen_per_dp_cp_rank=self.dist_config.max_seqlen_per_dp_cp_rank_fwd_only,
+            )
+        )
+
+        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        global_ids_this_rank = routing_info["global_ids_this_rank"]
+        global_id_logprob_lens = routing_info["global_id_logprob_lens"]
+        gid_to_compute_rank = routing_info["gid_to_compute_rank"]
+        gid_to_orig_dcp_rank = routing_info["gid_to_orig_dcp_rank"]
+
+        seqlen = self.dist_config.max_seqlen_per_dp_cp_rank_fwd_only
+
+        ref_logps = None
+        prev_logps = None
+
+        if not self.policy_config.without_ref:
+            self.offload_model()
+            self.onload_ref_model()
+            for model_module in self.ref_model:
+                model_module.eval()
+            per_sample_ref = self._forward_packed_batches_unified(
+                self.ref_model,
+                packed_batches,
+                num_micro_batches,
+                seqlen,
+                batch_log_str="get_ref_policy_logprobs (dyn_cp) microbatch ",
+            )
+            ref_logps = self._reverse_and_collect(
+                per_sample_ref,
+                global_ids_this_rank,
+                global_id_logprob_lens,
+                gid_to_compute_rank,
+                gid_to_orig_dcp_rank,
+                dp_cp_group,
+                num_local_samples,
+            )
+            self.offload_ref_model()
+
+        if compute_pre_logps:
+            self.onload_model()
+            for model_module in self.model:
+                model_module.eval()
+            per_sample_prev = self._forward_packed_batches_unified(
+                self.model,
+                packed_batches,
+                num_micro_batches,
+                seqlen,
+                batch_log_str="get_policy_logprobs (dyn_cp) microbatch ",
+            )
+            prev_logps = self._reverse_and_collect(
+                per_sample_prev,
+                global_ids_this_rank,
+                global_id_logprob_lens,
+                gid_to_compute_rank,
+                gid_to_orig_dcp_rank,
+                dp_cp_group,
+                num_local_samples,
+            )
+        else:
+            self.onload_model()
+
+        def restor_shape(logps):
+            if logps is None:
+                return None
+            res = []
+            bs = len(logps) // samples_per_batch
+            assert bs * samples_per_batch == len(logps)
+            for i in range(bs):
+                res.append(logps[i * samples_per_batch:(i + 1) * samples_per_batch])
+            return res
+
+        ref_logps_list = restor_shape(ref_logps)
+        if self.policy_config.without_ref:
+            assert ref_logps_list is None
+
+        prev_logps_list = None
+        if compute_pre_logps:
+            prev_logps_list = restor_shape(prev_logps)
+            assert prev_logps_list is not None
+        return ref_logps_list, prev_logps_list
+
+    @torch.no_grad()
+    def _forward_packed_batches_unified(
+        self,
+        model,
+        packed_batches: List[Dict[str, torch.Tensor]],
+        num_micro_batches: int,
+        seqlen: int,
+        batch_log_str: str = "",
+    ) -> Dict[int, torch.Tensor]:
+        """Forward packed microbatches through forward_backward_func and collect
+        per-sample logprobs keyed by global ID.
+
+        Uses the same Megatron pipeline scheduler as the non-dynamic-CP path,
+        giving PP support and progress logging for free.
+        """
+        self.batch_iters = 0
+        self.total_iters = num_micro_batches
+        self.batch_log_str = batch_log_str
+
+        batch_iter = iter(packed_batches[:num_micro_batches])
+
+        fwd_bwd_function = get_forward_backward_func()
+        fwd_results = fwd_bwd_function(
+            forward_step_func=self.get_logprob_output_only_func_dynamic_cp(seqlen),
+            data_iterator=batch_iter,
+            model=model,
+            num_microbatches=num_micro_batches,
+            forward_only=True,
+            seq_length=seqlen,
+            micro_batch_size=1,
+            collect_non_loss_data=True,
+            decoder_seq_length=seqlen,
+        )
+
+        # Collect per-sample logprobs keyed by global ID.
+        # fwd_results is a list of per-microbatch results (List[torch.Tensor] each).
+        # Only populated on the last PP stage.
+        per_sample_logprobs: Dict[int, torch.Tensor] = {}
+        if mpu.is_pipeline_last_stage():
+            for mb_idx, sample_logprobs_list in enumerate(fwd_results):
+                sample_ids = packed_batches[mb_idx]["_dyn_cp_sample_ids"]
+                if isinstance(sample_ids, torch.Tensor) and not sample_ids.is_cuda:
+                    sample_ids = sample_ids.cuda(non_blocking=True)
+                assert len(sample_logprobs_list) == sample_ids.shape[0], (
+                    f"Expected {sample_ids.shape[0]} samples, got {len(sample_logprobs_list)}"
+                )
+                for idx, lp in enumerate(sample_logprobs_list):
+                    gid = int(sample_ids[idx].item())
+                    per_sample_logprobs[gid] = lp
+
+        return per_sample_logprobs
+
+    def _reverse_and_collect(
+        self,
+        per_sample_logprobs: Dict[int, torch.Tensor],
+        global_ids_this_rank: torch.Tensor,
+        global_id_logprob_lens,
+        gid_to_compute_rank: Dict[int, int],
+        gid_to_orig_dcp_rank: Dict[int, List[int]],
+        dp_cp_group,
+        num_local_samples: int,
+    ) -> List[torch.Tensor]:
+        """Reverse all-to-all and collect results as CPU tensors.
+
+        Only the last PP stage runs the DP×CP reverse reroute; the per-sample
+        list is then broadcast within PP, matching the non-dynamic-CP logprob path.
+        """
+        if mpu.is_pipeline_last_stage():
+            restored_logprobs = reverse_reroute_logprobs(
+                per_sample_logprobs,
+                global_ids_this_rank,
+                global_id_logprob_lens,
+                gid_to_compute_rank,
+                gid_to_orig_dcp_rank,
+                dp_cp_group,
+            )
+
+            result = []
+            for i in range(num_local_samples):
+                gid = int(global_ids_this_rank[i])
+                lp = restored_logprobs[gid]
+                result.append(lp.float().cpu())
+            clear_memory()
+        else:
+            result = []
+
+        return BroadcastUtils.broadcast_object_within_pp(result)
 
     def _rl_collect_mb_dumped_metrics(self, _metric, dumped_metrics_per_ppo_step):
         """each microbatch collect dumped loss_fn and moe metrics"""
@@ -438,8 +648,8 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             mb_num_microbatches = num_microbatches
             dyn_cp_stats = None
             if self.config.policy.dist_config.dynamic_context_parallel:
-                batch, mb_num_microbatches, seqlen_sum, seqlen_sq_sum = (
-                    self.prepare_data.grpo_reroute_data_for_dynamic_cp(
+                batch, mb_num_microbatches, seqlen_sum, seqlen_sq_sum, _ = (
+                    self.prepare_data.rl_reroute_data_for_dynamic_cp(
                         batch,
                         self.tokenizer.pad_token_id,
                         vocab_size=self.vocab_size,
@@ -616,10 +826,9 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
 
                 padded_prefix_len = target_len - value_len
                 if (
-                    prefix_len is not None
-                    and padded_prefix_len > 0
-                    and padded_prefix_len <= prefix_len
-                    and (response_len is None or value_len >= response_len)
+                    prefix_len is not None and padded_prefix_len > 0 and
+                    padded_prefix_len <= prefix_len and
+                    (response_len is None or value_len >= response_len)
                 ):
                     batch_values[i] = torch.nn.functional.pad(
                         value,
@@ -629,16 +838,13 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                     continue
 
                 if (
-                    prefix_len is not None
-                    and (
+                    prefix_len is not None and (
                         (
-                            value_len == target_len - prefix_len
-                            and (response_len is None or value_len >= response_len)
-                        )
-                        or (
-                            response_len is not None
-                            and value_len == response_len
-                            and prefix_len + value_len <= target_len
+                            value_len == target_len - prefix_len and
+                            (response_len is None or value_len >= response_len)
+                        ) or (
+                            response_len is not None and value_len == response_len and
+                            prefix_len + value_len <= target_len
                         )
                     )
                 ):
@@ -763,9 +969,7 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             )
 
             values = []
-            values_list = smart_pad_helper.get_rowed_based_forward_results(
-                is_row_based_rets=True
-            )
+            values_list = smart_pad_helper.get_rowed_based_forward_results(is_row_based_rets=True)
             if mpu.is_pipeline_last_stage():
                 for per_forward_step_results in values_list:
                     for value in per_forward_step_results:

@@ -49,6 +49,10 @@ class DeviceProtocol(ABC):
         """
         ...
 
+    @property
+    def propagate_env_keys(self) -> list[str]:
+        return []
+
     @abstractmethod
     def get_flash_attn_varlen_func(self, **kwargs):
         ...

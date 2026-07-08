@@ -4,6 +4,7 @@
 from typing import List
 
 import torch
+import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.parallel_state import (

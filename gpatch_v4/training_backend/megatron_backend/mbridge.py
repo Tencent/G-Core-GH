@@ -1,4 +1,6 @@
 import inspect
+import re
+from typing import List, Optional
 
 try:
     from mbridge import AutoBridge
@@ -59,4 +61,57 @@ def freeze_multimodal(
     model.freeze(**kwargs)
 
 
-__all__ = ["AutoBridge", "make_value_model", "freeze_moe_router", "freeze_multimodal"]
+def apply_freeze_unfreeze_patterns(
+    model,
+    freeze_patterns: Optional[List[str]] = None,
+    unfreeze_patterns: Optional[List[str]] = None,
+):
+    """Freeze/unfreeze parameters by wildcard-matching their names.
+
+    Matching uses the same ``*`` wildcard syntax (``*`` matches any substring)
+    as mbridge's LoRA ``target_modules``/``exclude_modules``, via
+    ``mbridge.peft.utils.wildcard_match`` (see ``ModuleMatcher.match``).
+
+    ``unfreeze_patterns`` takes priority over ``freeze_patterns``: a parameter
+    matching both stays/becomes trainable.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        A single model chunk (e.g. one element of the ``model`` list returned
+        by ``bridge.get_model``).
+    freeze_patterns : list of str, optional
+        Parameter names matching any of these patterns get ``requires_grad =
+        False``.
+    unfreeze_patterns : list of str, optional
+        Parameter names matching any of these patterns get ``requires_grad =
+        True``, overriding ``freeze_patterns``.
+    """
+    def _wildcard_match(pattern: str, key: Optional[str]) -> Optional[bool]:
+        if key is None:
+            return None
+        regex_pattern = re.compile("^" + pattern.replace("*", "(.*)") + "$")
+        match = regex_pattern.match(key)
+        return match is not None
+
+    freeze_patterns = freeze_patterns or []
+    unfreeze_patterns = unfreeze_patterns or []
+    if not freeze_patterns and not unfreeze_patterns:
+        return
+
+    for name, param in model.named_parameters():
+        if any(_wildcard_match(pattern, name) for pattern in freeze_patterns):
+            param.requires_grad = False
+
+    for name, param in model.named_parameters():
+        if any(_wildcard_match(pattern, name) for pattern in unfreeze_patterns):
+            param.requires_grad = True
+
+
+__all__ = [
+    "AutoBridge",
+    "make_value_model",
+    "freeze_moe_router",
+    "freeze_multimodal",
+    "apply_freeze_unfreeze_patterns",
+]

@@ -4,5 +4,6 @@ from gpatch_v4.trainer.grpo_single_ctrl_trainer import GrpoSingleCtrlTrainer
 from gpatch_v4.trainer.grpo_trainer import GrpoTrainer
 from gpatch_v4.trainer.off_policy_distill_trainer import OffPolicyDistillTrainer
 from gpatch_v4.trainer.on_policy_distill_trainer import OnPolicyDistillTrainer
+from gpatch_v4.trainer.reward_trainer import RewardTrainer
 from gpatch_v4.trainer.t2i_edit_sft_trainer import T2iEditSftTrainer
 from gpatch_v4.trainer.t2i_grpo_trainer import T2iGrpoTrainer

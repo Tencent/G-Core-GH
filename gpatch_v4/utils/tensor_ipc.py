@@ -10,7 +10,9 @@ No sglang / vllm dependency — only ``torch`` and stdlib.
 """
 
 import io
+import os
 import pickle
+from contextlib import contextmanager
 from dataclasses import dataclass
 from multiprocessing.reduction import ForkingPickler
 from typing import List, Tuple
@@ -145,3 +147,27 @@ def deserialize_ipc(data):
     if isinstance(data, str):
         data = pybase64.b64decode(data, validate=True)
     return pickle.loads(data)
+
+
+@contextmanager
+def disable_expandable_segments():
+    """Temporarily disable ``expandable_segments`` for CUDA IPC compatibility.
+
+    On kernels that lack ``pidfd_getfd``, CUDA IPC handles created from
+    tensors allocated with ``expandable_segments:True`` cannot be rebuilt
+    in another process.  This context manager switches the allocator to
+    ``expandable_segments:False`` for the duration of the block and
+    restores the original setting on exit.
+
+    If ``PYTORCH_CUDA_ALLOC_CONF`` does not contain ``expandable_segments:True``,
+    this is a no-op.
+    """
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    need_disable = "expandable_segments:True" in alloc_conf
+    if need_disable:
+        torch._C._accelerator_setAllocatorSettings("expandable_segments:False")
+    try:
+        yield
+    finally:
+        if need_disable:
+            torch._C._accelerator_setAllocatorSettings("expandable_segments:True")

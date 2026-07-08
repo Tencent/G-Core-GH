@@ -16,7 +16,6 @@ from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross
 from gpatch_v4.configs.config import OnPolicyDistillConfig
 from gpatch_v4.core.correction_helper import compute_off_policy_correction_weights
 from gpatch_v4.core.mappings import all_gather_from_context_parallel_region
-from gpatch_v4.kernel import linear_cross_entropy, set_linear_ce_backend
 from gpatch_v4.training_backend.vocab_parallel_entropy import vocab_parallel_entropy
 from gpatch_v4.utils import (
     all_reduce_autograd,
@@ -28,6 +27,11 @@ from gpatch_v4.utils import (
 from gpatch_v4.utils.common_utils import import_fn_from_path
 from gpatch_v4.utils.ppo_utils import calculate_kl_loss
 from gpatch_v4.utils.training_utils import from_parallel_logits_to_topk_logprobs
+try:
+    from gpatch_v4.kernel import linear_cross_entropy, set_linear_ce_backend
+except Exception:
+    linear_cross_entropy = None
+    set_linear_ce_backend = None
 
 LOSS_FUNC_REGISTRY: Dict[str, Callable] = {}
 
@@ -106,6 +110,64 @@ class PolicyLossInput:
     # log-probs，用于 ``advantages.dim() == 3`` 时用于 3D PPO ratio 计算。
     prev_topk_logprobs: Optional[torch.Tensor] = None
     curr_topk_logprobs: Optional[torch.Tensor] = None
+    # cu_seqlens_padded: sample boundaries in THD packed format. When set,
+    # loss aggregation uses per-sample mean instead of global per-token mean
+    # to eliminate the length bias inherent in token-weighted averaging.
+    cu_seqlens_padded: Optional[torch.Tensor] = None
+    local_cp_size: int = 1
+
+
+def masked_mean_per_sample_or_token(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    cu_seqlens_padded: Optional[torch.Tensor] = None,
+    calculate_per_token_loss: bool = False,
+    local_cp_size: int = 1,
+) -> torch.Tensor:
+    """Aggregate per-token loss values into a scalar.
+
+    When ``cu_seqlens_padded`` is None (non-THD), falls back to global
+    ``masked_mean`` (token-weighted average).
+
+    When ``cu_seqlens_padded`` is provided (THD packed format), computes
+    per-sample masked_mean first, then averages across samples. This gives
+    each sample equal weight regardless of response length, eliminating the
+    length bias of per-token averaging.
+
+    When ``local_cp_size > 1``, samples are split across CP ranks. In that
+    case the per-sample numerator and denominator are all-reduced across the
+    local CP group before division to obtain the correct global per-sample mean.
+    """
+    if cu_seqlens_padded is None or calculate_per_token_loss:
+        return masked_mean(values, mask)
+
+    assert not calculate_per_token_loss, (
+        "THD per-sample loss is incompatible with calculate_per_token_loss=True"
+    )
+
+    # THD packed format: per-sample
+    values_flat = torch.where(mask > 0, values, 0.0).reshape(-1)
+    mask_flat = mask.reshape(-1)
+    num_samples = cu_seqlens_padded.shape[0] - 1
+    per_sample_sums = []
+    per_sample_counts = []
+    for i in range(num_samples):
+        s = cu_seqlens_padded[i].item()
+        e = cu_seqlens_padded[i + 1].item()
+        per_sample_sums.append(values_flat[s:e].sum())
+        per_sample_counts.append(mask_flat[s:e].sum())
+    sums = torch.stack(per_sample_sums)
+    counts = torch.stack(per_sample_counts)
+
+    local_cp_size = local_cp_size.item() if isinstance(local_cp_size,
+                                                       torch.Tensor) else int(local_cp_size)
+    if local_cp_size > 1:
+        cp_group = mpu.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
+        combined = torch.stack([sums, counts])
+        dist.all_reduce(combined, group=cp_group, op=dist.ReduceOp.SUM)
+        sums, counts = combined[0], combined[1]
+
+    return (sums / counts.clamp(min=1)).mean()
 
 
 @dataclass
@@ -396,7 +458,13 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
     if config.ppo.enable_off_policy_correction:
         actor_loss = actor_loss * correction_ratio
 
-    actor_loss = masked_mean(actor_loss, response_mask)
+    actor_loss = masked_mean_per_sample_or_token(
+        actor_loss,
+        response_mask,
+        loss_input.cu_seqlens_padded,
+        config.policy.override_transformer_config.get("calculate_per_token_loss", False),
+        loss_input.local_cp_size,
+    )
     loss = actor_loss - scaled_entropy * ppo_config.ppo_entropy_bonus
 
     with torch.no_grad():
@@ -618,7 +686,13 @@ def opd_loss_func(config, loss_input: PolicyLossInput):
         ratios_for_metric = ratios.detach()
         ratios_clamped_for_metric = ratios_clamped.detach()
 
-    actor_loss = masked_mean(actor_loss, response_mask)
+    actor_loss = masked_mean_per_sample_or_token(
+        actor_loss,
+        response_mask,
+        loss_input.cu_seqlens_padded,
+        config.policy.override_transformer_config.get("calculate_per_token_loss", False),
+        loss_input.local_cp_size,
+    )
     loss = actor_loss - scaled_entropy * ppo_config.ppo_entropy_bonus
 
     with torch.no_grad():
@@ -704,6 +778,10 @@ def gspo_loss_func(config, loss_input: PolicyLossInput):
          mean over sequences (each sequence has equal weight regardless of length).
       3. Metrics use plain mean/min/max over the full ratio tensor.
     """
+    assert loss_input.cu_seqlens_padded is None, (
+        "gspo_loss_func does not yet support THD packed format (dynamic CP). "
+        "Please disable dynamic_context_parallel or use grpo loss."
+    )
     ppo_config = config.ppo
     advantages = loss_input.advantages
     prev_log_probs = loss_input.prev_log_probs
@@ -991,7 +1069,13 @@ def cispo_loss_func(config, loss_input: PolicyLossInput):
     if config.ppo.enable_off_policy_correction:
         actor_loss = actor_loss * correction_ratio
 
-    actor_loss = masked_mean(actor_loss, response_mask)
+    actor_loss = masked_mean_per_sample_or_token(
+        actor_loss,
+        response_mask,
+        loss_input.cu_seqlens_padded,
+        config.policy.override_transformer_config.get("calculate_per_token_loss", False),
+        loss_input.local_cp_size,
+    )
     loss = actor_loss - scaled_entropy * ppo_config.ppo_entropy_bonus
 
     # ------------------------------------------------------------------
@@ -1055,9 +1139,7 @@ def cispo_loss_func(config, loss_input: PolicyLossInput):
             ratios_tmp = ratios.detach()
             ratios_clamped_tmp = clipped_ratio_sg
             dumped_ppo_ratio_unclamped = ratios_tmp.to(dtype=torch.bfloat16, device="cpu")
-            dumped_is_ppo_ratio_clamped = (
-                (ratios_tmp == ratios_clamped_tmp) & mask_bool
-            ).cpu()
+            dumped_is_ppo_ratio_clamped = ((ratios_tmp == ratios_clamped_tmp) & mask_bool).cpu()
             dumped_mask = response_mask.detach().bool().to(device="cpu")
 
     metrics = {
@@ -1123,6 +1205,10 @@ def sapo_loss_func(config, loss_input: PolicyLossInput):
     weighted equally), identical to ``gspo_loss_func``. There is no hard / dual
     clipping; ``ppo_clip_ratio_*`` and ``ppo_dual_clip_ratio_c`` are inert here.
     """
+    assert loss_input.cu_seqlens_padded is None, (
+        "sapo_loss_func does not yet support THD packed format (dynamic CP). "
+        "Please disable dynamic_context_parallel or use grpo loss."
+    )
     ppo_config = config.ppo
     advantages = loss_input.advantages
     prev_log_probs = loss_input.prev_log_probs
@@ -1493,7 +1579,13 @@ def fipo_loss_func(config, loss_input: PolicyLossInput):
     if config.ppo.enable_off_policy_correction:
         actor_loss_per_token = actor_loss_per_token * correction_ratio
 
-    actor_loss = masked_mean(actor_loss_per_token, final_mask)
+    actor_loss = masked_mean_per_sample_or_token(
+        actor_loss_per_token,
+        final_mask,
+        loss_input.cu_seqlens_padded,
+        config.policy.override_transformer_config.get("calculate_per_token_loss", False),
+        loss_input.local_cp_size,
+    )
     loss = actor_loss - scaled_entropy * ppo_config.ppo_entropy_bonus
 
     # ------------------------------------------------------------------
@@ -1748,22 +1840,29 @@ def linear_ce_loss(
     labels = labels.transpose(0, 1).contiguous()
 
     hidden_states = linear_ce_input["hidden_states"]
-    if linear_ce_input['output_layer'].sequence_parallel:
+    output_layer = linear_ce_input['output_layer']
+    tp_group = output_layer.tp_group
+    if output_layer.sequence_parallel:
         hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
             hidden_states,
             tensor_parallel_output_grad=True,
         )
+    else:
+        assert tp_group is None or dist.get_world_size(tp_group) <= 1, (
+            "linear_cross_entropy backward does not all-reduce d_hidden across TP ranks. "
+            "With TP > 1 and sequence_parallel=False there is no reduce-scatter to compensate, "
+            "so d_hidden would be incorrect. Enable sequence_parallel or use vocab_parallel_cross_entropy."
+        )
     weight = linear_ce_input["weight"]
     if weight is None:
-        # 不 shared embedding 时会走到这个分支
-        weight = linear_ce_input["output_layer"].weight
+        weight = output_layer.weight
     loss = linear_cross_entropy(
         hidden_states,
         weight,
         labels,
         1.0,
         "none",
-        linear_ce_input['output_layer'].tp_group,
+        tp_group,
     )
 
     # [s b] => [b, s]
@@ -1905,7 +2004,8 @@ def off_policy_loss_func(
         labels,
         loss_mask,
         kl_alpha_mask=kl_alpha_mask if
-        (config.training.enable_teacher_kl_loss and config.distill.enable_data_with_alpha) else None,
+        (config.training.enable_teacher_kl_loss and
+         config.distill.enable_data_with_alpha) else None,
         loss_weights=loss_weights,
     )
     ce_numel = loss[1].detach()  # token count for metrics
@@ -1962,37 +2062,51 @@ def off_policy_loss_func(
         return (loss.clone(), metrics)
 
 
+def compute_dpo_loss_core(
+    policy_chosen_logps: torch.Tensor,
+    policy_rejected_logps: torch.Tensor,
+    ref_chosen_logps: torch.Tensor,
+    ref_rejected_logps: torch.Tensor,
+    beta: float,
+    label_smoothing: float = 0.0,
+    loss_type: str = "sigmoid",
+):
+    """Backend-agnostic DPO loss from pre-computed per-sequence log-probs.
+
+    Parameters
+    ----------
+    policy_chosen_logps, policy_rejected_logps : Tensor ``[rbs]``
+    ref_chosen_logps, ref_rejected_logps : Tensor ``[rbs]``
+    beta : float
+    label_smoothing : float
+    loss_type : ``"sigmoid"``
+
+    Returns
+    -------
+    losses : Tensor ``[rbs]``
+    chosen_rewards : Tensor ``[rbs]``  (detached)
+    rejected_rewards : Tensor ``[rbs]``  (detached)
+    """
+    chosen_rewards = beta * (policy_chosen_logps - ref_chosen_logps)
+    rejected_rewards = beta * (policy_rejected_logps - ref_rejected_logps)
+    logits = chosen_rewards - rejected_rewards
+
+    if loss_type == "sigmoid":
+        losses = (
+            -F.logsigmoid(logits) * (1 - label_smoothing) - F.logsigmoid(-logits) * label_smoothing
+        )
+    else:
+        raise ValueError(f"unknown DPO loss type {loss_type}")
+
+    return losses, chosen_rewards.detach(), rejected_rewards.detach()
+
+
 @register_loss("dpo")
 def dpo_loss_func(
     config,
     loss_input: FinetuneLossInput,
 ):
-    """DPO loss.
-
-    Args:
-        logits (Tensor): ``[B, S, V]`` from the output layer.
-        batch (Dict[str, Tensor]): contains ``ref_logprobs``, ``tokens``, ``loss_mask``.
-    Returns:
-        Tensor: ``[B, S]``.
-    """
-    def dpo_loss(
-        config, policy_chosen_logps, policy_rejected_logps, ref_chosen_logps, ref_rejected_logps
-    ):
-        chosen_rewards = config.training.dpo_beta * (policy_chosen_logps - ref_chosen_logps)
-        rejected_rewards = config.training.dpo_beta * (policy_rejected_logps - ref_rejected_logps)
-        logits = chosen_rewards - rejected_rewards
-
-        # sigmoid
-        if config.training.dpo_loss_type == 'sigmoid':
-            losses = (
-                -F.logsigmoid(logits) * (1 - config.training.dpo_label_smoothing) -
-                F.logsigmoid(-logits) * config.training.dpo_label_smoothing
-            )
-        else:
-            raise ValueError(f'unknown loss type {config.training.dpo_loss_type}')
-
-        return losses, chosen_rewards.detach(), rejected_rewards.detach()
-
+    """Megatron-backend DPO loss (uses ``from_parallel_logits_to_logprobs``)."""
     logits = loss_input.logits.float()
     batch = loss_input.batch
     labels = batch["labels"]
@@ -2014,12 +2128,14 @@ def dpo_loss_func(
     policy_chosen_logps, policy_rejected_logps = logps.split(rbs, dim=0)
     ref_chosen_logps, ref_rejected_logps = ref_logps.split(rbs, dim=0)
 
-    losses, chosen_rewards, rejected_rewards = dpo_loss(
-        config,
+    losses, chosen_rewards, rejected_rewards = compute_dpo_loss_core(
         policy_chosen_logps,
         policy_rejected_logps,
         ref_chosen_logps,
         ref_rejected_logps,
+        beta=config.training.dpo_beta,
+        label_smoothing=config.training.dpo_label_smoothing,
+        loss_type=config.training.dpo_loss_type,
     )
     reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
@@ -2223,8 +2339,159 @@ def value_loss_func(ppo_config, old_values, values, returns, mask):
     return loss, metrics
 
 
+@register_loss("rm_bt")
+def rm_bt_loss_func(
+    config,
+    loss_input: FinetuneLossInput,
+):
+    """Bradley-Terry pairwise reward-model loss (sequence-level scalar reward).
+
+    The model carries a scalar value head (``LinearForLastLayer`` -> 1), so
+    ``logits`` here is the per-token scalar ``[B, S, 1]``. The sequence-level
+    reward is read at each sequence's last valid token (index
+    ``sequence_lengths - 1``). Within a micro-batch the first half are the
+    chosen sequences and the second half the rejected ones.
+
+    Parameters
+    ----------
+    loss_input : FinetuneLossInput
+        ``logits`` shape ``[B, S, 1]``; ``batch["sequence_lengths"]`` shape
+        ``[B]`` holds the valid-token count per sequence (last index + 1).
+    """
+    batch = loss_input.batch
+    scores = loss_input.logits
+    assert scores is not None, "rm_bt loss requires the scalar head output as logits"
+    assert scores.dim() == 3 and scores.shape[-1] == 1, \
+        f"rm_bt expects [B, S, 1] scalar head output, got {tuple(scores.shape)}"
+
+    sequence_lengths = batch["sequence_lengths"]
+    bs = scores.shape[0]
+    assert bs % 2 == 0, f"reward model micro-batch must be 2*n (chosen|rejected), got {bs}"
+
+    # last-token pooling: hidden_state at index (sequencxe_lengths - 1)
+    last_idx = (sequence_lengths.long() - 1).clamp(min=0)
+    rewards = scores[torch.arange(bs, device=scores.device), last_idx, 0].float()  # [B]
+
+    r_chosen, r_rejected = rewards.split(bs // 2, dim=0)
+    loss = -F.logsigmoid(r_chosen - r_rejected).mean()
+
+    with torch.no_grad():
+        acc = (r_chosen > r_rejected).float().mean()
+        margin = (r_chosen - r_rejected).mean()
+        metrics = {
+            "rm-metrics/loss": loss.detach().float(),
+            "rm-metrics/acc": acc.float(),
+            "rm-metrics/reward_margin": margin.float(),
+            "rm-metrics/reward_chosen": r_chosen.mean().float(),
+            "rm-metrics/reward_rejected": r_rejected.mean().float(),
+        }
+    keys = sorted(metrics.keys())
+    avg_metrics = average_losses_across_data_parallel_group([metrics[k] for k in keys])
+    metrics = {k: v for k, v in zip(keys, avg_metrics)}
+
+    return (loss, metrics)
+
+
 def get_policy_loss_fn(name: str) -> Callable:
     if name not in LOSS_FUNC_REGISTRY:
         available = ", ".join(sorted(LOSS_FUNC_REGISTRY.keys())) or "(none)"
         raise ValueError(f"Unknown loss type: '{name}'. Available: [{available}]")
     return LOSS_FUNC_REGISTRY[name]
+
+
+class CpMean(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, dim, cp_group):
+        ctx.local_nel = tensor.shape[dim]
+        nel = torch.tensor(tensor.shape[dim], device=tensor.device)
+        dist.all_reduce(nel, group=cp_group)
+        ctx.nel = int(nel.item())
+        ctx.dim = dim
+        out = tensor.sum(dim=dim)
+        dist.all_reduce(out, group=cp_group)
+        out = out / ctx.nel
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_output = grad_output / ctx.nel
+        grad_output = grad_output.unsqueeze(
+            ctx.dim
+        ).expand(*grad_output.shape[:ctx.dim], ctx.local_nel,
+                 *grad_output.shape[ctx.dim:]).contiguous()
+        return grad_output, None, None
+
+
+def load_balancing_loss_func(
+    *,
+    gate_logits: tuple[torch.Tensor, ...],
+    num_experts: int,
+    top_k: int,
+    cp_group=None,
+) -> torch.Tensor | int:
+    r"""
+    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
+
+    See Switch Transformer (https://huggingface.co/papers/2101.03961) for more details. This function implements the loss
+    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
+    experts is too unbalanced.
+
+    Args:
+        gate_logits:
+            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
+            shape [batch_size X sequence_length, num_experts].
+        num_experts:
+            Number of experts
+        top_k:
+            The number of experts to route per-token, can be also interpreted as the `top-k` routing
+            parameter.
+        attention_mask (`torch.Tensor`, *optional*):
+            The attention_mask used in forward function
+            shape [batch_size X sequence_length] if not None.
+
+    Returns:
+        The auxiliary loss.
+    """
+
+    # [t, e], t=l*b*s
+    compute_device = gate_logits[0].device
+    concatenated_gate_logits = torch.cat(
+        [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
+    )
+
+    # [t, e]
+    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+
+    # [t, top_k]
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+
+    # [t, top_k, e]
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+
+    if cp_group is None or dist.get_world_size(cp_group) == 1:
+        # Compute the percentage of tokens routed to each experts
+        # [top_k, e]
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+
+        # Compute the average probability of routing to these experts
+        # [e]
+        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+    else:
+        # tokens_per_expert comes from topk/one_hot and carries no gradient,
+        # so a plain (detached) CP all-reduce global mean is enough.
+        # [top_k, e]
+        t_local = expert_mask.shape[0]
+        tokens_per_expert = expert_mask.float().sum(dim=0)
+        dist.all_reduce(tokens_per_expert, group=cp_group)
+        t_global = torch.tensor(t_local, device=tokens_per_expert.device)
+        dist.all_reduce(t_global, group=cp_group)
+        tokens_per_expert = tokens_per_expert / t_global.item()
+
+        # router_prob_per_expert is a global average over CP tokens; route it
+        # through the autograd-aware mean so gradients reach the local
+        # router_logits with the correct 1/T scale.
+        # [e]
+        router_prob_per_expert = CpMean.apply(routing_weights, 0, cp_group)
+
+    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+    return overall_loss * num_experts

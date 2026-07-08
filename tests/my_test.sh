@@ -10,8 +10,8 @@ export PYTHONPATH="$RCDIR/gcore-dev:$RCDIR/gcore-dev/tests:$RCDIR/gcore-dev/test
 # 第三部分：多 GPU 集群测试（需要 Ray）
 # ============================================================
 echo "=== 初始化 Ray 集群 ==="
-source tests/test_gpatch_v4/mpirun-stop-ray.sh
-source tests/test_gpatch_v4/mpirun-init-ray.sh
+# source tests/test_gpatch_v4/mpirun-stop-ray.sh
+# source tests/test_gpatch_v4/mpirun-init-ray.sh
 
 # pytest -v -s --timeout=7200 tests/test_gfused/test_deepseek_v4_kernel_ops.py
 # pytest -v -s --timeout=2400 tests/test_gfused/test_deepseek_v4_ep_cp_thd.py::TestEpCpThd::test_pack_runs_eager_topk
@@ -26,6 +26,13 @@ source tests/test_gpatch_v4/mpirun-init-ray.sh
 # pytest -v -s --timeout=7200 tests/test_gfused/test_deepseek_v4_ep_cp.py::TestFsdpVsEpCp::test_fsdp_vs_ep_cp_s512
 # pytest -v -s --timeout=7200 tests/test_gfused/test_myfa_hca_fwd.py::test_bench
 # pytest -v -s --timeout=2400 tests/test_gfused/test_deepseek_v4_ep_cp_thd.py::TestEpCpThd::test_bench_long
+# pytest -v -s --timeout=1800 tests/test_gfused/test_deepseek_v4_allgather_perf.py::DeepSeekV4AllGatherPerfTest::test_allgather_avg_time
+# pytest -v -s --timeout=1800 tests/test_gfused/test_deepseek_v4_allgather_perf.py::DeepSeekV4AllGatherPerfTest::test_indexer_causal_head_tail
+# pytest -v -s --timeout=7200 tests/test_gfused/test_deepseek_v4_mtp_smoke.py::TestDeepseekV4MtpSmoke::test_mtp_bshd_vs_thd
+# pytest -v -s --timeout=7200 tests/test_gfused/test_deepseek_v4_mtp_smoke.py::TestDeepseekV4MtpSmoke::test_mtp_thd_vs_thd_cp
+# pytest -v -s --timeout=7200 tests/test_gpatch_v4/test_deepseek_v4_sft_thd.py::TestDsv4SftThd::test_thd_mtp_vs_bshd_mtp
+# pytest -v -s tests/test_gpatch_v4/test_fsdp2_balance_loss.py
+# pytest -v -s --timeout=2400 tests/test_gfused/test_deepseek_v4_qat.py
 
 # pytest -v -s --timeout=7200 tests/test_gfused/test_myfa_varlen.py::test_bench_fwd_throughput
 # pytest -v -s --timeout=7200 tests/test_gfused/test_myfa_varlen.py
@@ -33,9 +40,7 @@ source tests/test_gpatch_v4/mpirun-init-ray.sh
 # pytest -v -s --timeout=7200 tests/test_gfused/test_myfa_varlen_sw_sinks.py::test_bench_fwd
 # pytest -v -s --timeout=7200 tests/test_gfused/test_myfa_varlen_sw_sinks.py::test_bench_bwd
 
-# pytest -v -s --timeout=1800 tests/test_gfused/test_deepseek_v4_allgather_perf.py::DeepSeekV4AllGatherPerfTest::test_allgather_avg_time
-# pytest -v -s --timeout=1800 tests/test_gfused/test_deepseek_v4_allgather_perf.py::DeepSeekV4AllGatherPerfTest::test_indexer_causal_head_tail
+# pytest -v -s --timeout=2400 tests/test_gfused/test_deepseek_v4_ep_cp_thd.py::TestEpCpThd::test_pack_runs_eager
+# pytest -v -s --timeout=2400 tests/test_gfused/test_deepseek_v4_ep_cp_thd.py::TestEpCpThd::test_cp_balance_loss_equivalence
 
-# pytest -v -s --timeout=7200 tests/test_gfused/test_deepseek_v4_mtp_smoke.py::TestDeepseekV4MtpSmoke::test_mtp_bshd_vs_thd
-# pytest -v -s --timeout=7200 tests/test_gfused/test_deepseek_v4_mtp_smoke.py::TestDeepseekV4MtpSmoke::test_mtp_thd_vs_thd_cp
-pytest -v -s --timeout=7200 tests/test_gpatch_v4/test_deepseek_v4_sft_thd.py::TestDsv4SftThd::test_thd_mtp_vs_bshd_mtp
+pytest -v -s tests/test_gfused/test_gemm_fp8.py

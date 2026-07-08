@@ -72,6 +72,7 @@ from .cp import build_cp_causal_mask, compressor_cp_ag, compressor_cp_ring, swa_
 from .deepep_a2a import fused_combine, fused_dispatch
 from .kernel.tilelang_indexer_fwd import _make_causal_cu_seqlens, batched_indexer_fwd
 from .kernel.tilelang_sparse_mla import sparse_attn_tilelang
+from .qat import fp8_simulate_qat
 from .thd import PackedSeqParams
 
 
@@ -192,6 +193,10 @@ class DeepseekV4HCACompressor(nn.Module):
 
             cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
             compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+            if self.config.fp8_qat:
+                # hca compressed torch.Size([1, 1, 512])
+                nope = self.config.head_dim - self.config.qk_rope_head_dim
+                compressed = torch.cat([fp8_simulate_qat(compressed[..., :nope], 64), compressed[..., nope:]], dim=-1)
         else:
             compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
@@ -399,6 +404,10 @@ class DeepseekV4Indexer(nn.Module):
             positions = positions.unsqueeze(0).expand(batch, -1)
             cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
             compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+            if self.config.fp8_qat:
+                # indexer compressed torch.Size([1, 32, 128])
+                idx_nope = self.head_dim - self.config.qk_rope_head_dim
+                compressed = torch.cat([fp8_simulate_qat(compressed[..., :idx_nope], 64), compressed[..., idx_nope:]], dim=-1)
         else:
             compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
@@ -417,6 +426,10 @@ class DeepseekV4Indexer(nn.Module):
         cos_q, sin_q = self.rotary_emb(local_hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
         q = self.q_b_proj(q_residual).view(batch, s_local, -1, self.head_dim).transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
+        if self.config.fp8_qat:
+            # indexer q torch.Size([1, 128, 64, 128])
+            idx_nope = self.head_dim - self.config.qk_rope_head_dim
+            q = torch.cat([fp8_simulate_qat(q[..., :idx_nope], 64), q[..., idx_nope:]], dim=-1)
 
         # ReLU(q·kᵀ) * weights, then top-k
         if self.config.indexer_backend == 'fused':
@@ -615,6 +628,10 @@ class DeepseekV4CSACompressor(nn.Module):
             positions = positions.unsqueeze(0).expand(batch, -1)
             cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
             compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+            if self.config.fp8_qat:
+                # csa compressed torch.Size([1, 32, 512])
+                nope = self.config.head_dim - self.config.qk_rope_head_dim
+                compressed = torch.cat([fp8_simulate_qat(compressed[..., :nope], 64), compressed[..., nope:]], dim=-1)
         else:
             compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
@@ -765,6 +782,10 @@ class DeepseekV4Attention(nn.Module):
 
         kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
         kv = apply_rotary_pos_emb(kv, cos, sin)
+        if self.config.fp8_qat:
+            # attn kv torch.Size([1, 1, 128, 512])
+            nope = self.config.head_dim - self.config.qk_rope_head_dim
+            kv = torch.cat([fp8_simulate_qat(kv[..., :nope], 64), kv[..., nope:]], dim=-1)
 
         if past_key_values is not None:  # sliding where K==V
             kv = past_key_values.update(kv, kv, self.layer_idx)[0]
@@ -908,6 +929,7 @@ class DeepseekV4Experts(nn.Module):
 
     def __init__(self, config: DeepseekV4Config):
         super().__init__()
+        self.config = config
         self.num_experts = config.num_local_experts
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.intermediate_size
@@ -1073,10 +1095,19 @@ class DeepseekV4Experts(nn.Module):
         )
         offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
 
+        # Weight QAT: simulate FP8 quantization noise on expert weights so
+        # the model learns to be robust against inference-time weight quantization.
+        gate_up_w = self.gate_up_proj
+        down_w = self.down_proj
+        if self.config.fp8_qat:
+            # vllm 和 sglang 的 moe 的 fp8 block (128, 128)
+            gate_up_w = fp8_simulate_qat(gate_up_w, 128)
+            down_w = fp8_simulate_qat(down_w, 128)
+
         # Up projection (gate||up packed): [S, 2I]
         proj_out = _grouped_linear(
-            x_g.to(self.gate_up_proj.dtype),
-            self.gate_up_proj,
+            x_g.to(gate_up_w.dtype),
+            gate_up_w,
             offsets,
             bias=None,
             is_transposed=False,
@@ -1086,8 +1117,8 @@ class DeepseekV4Experts(nn.Module):
 
         # Down projection: [S, H]
         proj_out = _grouped_linear(
-            proj_out.to(self.down_proj.dtype),
-            self.down_proj,
+            proj_out.to(down_w.dtype),
+            down_w,
             offsets,
             bias=None,
             is_transposed=False,
@@ -1588,6 +1619,8 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
         )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        # NOTE There is a naming issue here in transformers: this is not an attention mask [b, s, s],
+        # but it's actually a padding mask [b, s].
         use_mtp = self.mtp is not None and self.training
         outputs: MoeModelOutputWithPast = self.model(
             input_ids=input_ids,
@@ -1611,7 +1644,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
         if labels is not None:
             loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
 
-        # TODO 这里 trainer 加一下
+        # not used, see `moe_balance_loss_coef` in `training_config.py` for more details.
         aux_loss = None
         if output_router_logits:
             aux_loss = load_balancing_loss_func(

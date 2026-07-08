@@ -90,6 +90,17 @@ class DistConfig(MappingProtocol):
                 "Max tokens per DPxCP rank for Dynamic CP scheduling. Required when dynamic_context_parallel=True."
         },
     )
+    max_seqlen_per_dp_cp_rank_fwd_only: Optional[int] = field(
+        default=None,
+        metadata={
+            "help":
+                (
+                    "Max tokens per DPxCP rank for Dynamic CP forward-only paths "
+                    "(logprob / eval inference, no backward). "
+                    "Defaults to 4 * max_seqlen_per_dp_cp_rank when unset."
+                )
+        },
+    )
     min_dynamic_context_parallel_size: int = field(
         default=1,
         metadata={"help": "Minimum CP group size for dynamic context parallel."},
@@ -159,6 +170,8 @@ class DistConfig(MappingProtocol):
             assert self.max_seqlen_per_dp_cp_rank is not None, (
                 "max_seqlen_per_dp_cp_rank must be set when dynamic_context_parallel=True"
             )
+            if self.max_seqlen_per_dp_cp_rank_fwd_only is None:
+                self.max_seqlen_per_dp_cp_rank_fwd_only = (self.max_seqlen_per_dp_cp_rank * 4)
             assert 1 <= self.min_dynamic_context_parallel_size <= self.context_parallel_size, (
                 "min_dynamic_context_parallel_size must be in "
                 f"[1, context_parallel_size={self.context_parallel_size}], "

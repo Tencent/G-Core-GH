@@ -108,6 +108,7 @@ class GrpoTrainActor(
 
         self.build_tokenizer()
         self.tokenizer = self.actor_tokenizer
+        self.post_process_tokenizer_template(self.tokenizer, config.policy.model_arch)
         self.disp_rng = random.Random(self.config.training.seed)
 
         self.build_dataset_and_dataloader()
@@ -277,6 +278,105 @@ class GrpoTrainActor(
             f"skip_prev_logps requires ppo_initial_policy_kl_penalty == 0, "
             f"got {ppo_config.ppo_initial_policy_kl_penalty}"
         )
+
+    def _compute_log_probs(
+        self,
+        rollout_batches: List[Dict[str, Any]],
+        training_config,
+        effective_keep_n: int,
+    ) -> List[Dict[str, Any]]:
+        """Compute ref and prev log-probs for rollout batches (BSH forward path).
+
+        Returns the (possibly rebalanced-then-restored) rollout_batches with
+        ``ref_logprobs`` and ``logprobs`` fields populated.
+        """
+        samples_per_batch = training_config.rollout_mbs * effective_keep_n
+        restore_info = None
+        for data in rollout_batches:
+            ll = len(data["tokens"])
+            src_dp = [torch.tensor(mpu.get_data_parallel_rank())] * ll
+            data["src_dp"] = src_dp
+
+        balance_dp_seqlen = self.config.policy.balance_dp_seqlen
+        if balance_dp_seqlen:
+            rebalanced_batches, restore_info = DPBalanceHelper.rebalance_for_compute_log_probs(
+                rollout_batches,
+                samples_per_batch,
+                add_custom_keys=getattr(self.config.task, "add_custom_keys", None),
+            )
+            origin_rollout_batches = rollout_batches
+            rollout_batches = rebalanced_batches
+
+        skip_prev = self.config.ppo.skip_prev_logps
+        ref_logprobs, prev_logprobs = self.policy_engine.compute_log_probs(
+            rollout_batches,
+            compute_pre_logps=not skip_prev,
+        )
+        cpu_barrier()
+
+        if not self.config.policy.without_ref:
+            for rb, ref_logps in zip(rollout_batches, ref_logprobs):
+                rb["ref_logprobs"] = ref_logps
+        if skip_prev:
+            for rb in rollout_batches:
+                rb["logprobs"] = [
+                    torch.zeros(len(t) - 1, dtype=torch.float32) for t in rb["tokens"]
+                ]
+        else:
+            for rb, prev_logps in zip(rollout_batches, prev_logprobs, strict=True):
+                rb["logprobs"] = prev_logps
+
+        if balance_dp_seqlen:
+            rollout_batches = DPBalanceHelper.restore_log_probs_to_original_batches(
+                origin_rollout_batches,
+                rollout_batches,
+                restore_info,
+                without_ref=self.config.policy.without_ref,
+            )
+
+        return rollout_batches
+
+    def _compute_log_probs_dynamic_cp(
+        self,
+        rollout_batches: List[Dict[str, Any]],
+        training_config,
+        effective_keep_n: int,
+    ) -> List[Dict[str, Any]]:
+        """Compute ref and prev log-probs using dynamic CP (THD + Ring Attention path).
+
+        Uses the same forward path as training (THD packed format with dynamic
+        context parallelism), ensuring numerical consistency between prev/ref
+        log-probs and curr_log_probs during the training step.
+
+        After computation, restores per-sample log-probs back to the original
+        rollout_batches structure (reversing the all-to-all redistribution).
+        """
+        samples_per_batch = training_config.rollout_mbs * effective_keep_n
+        for data in rollout_batches:
+            ll = len(data["tokens"])
+            src_dp = [torch.tensor(mpu.get_data_parallel_rank())] * ll
+            data["src_dp"] = src_dp
+
+        skip_prev = self.config.ppo.skip_prev_logps
+        ref_logprobs, prev_logprobs = self.policy_engine.compute_log_probs_dynamic_cp(
+            rollout_batches,
+            compute_pre_logps=not skip_prev,
+        )
+        cpu_barrier()
+
+        if not self.config.policy.without_ref:
+            for rb, ref_logps in zip(rollout_batches, ref_logprobs):
+                rb["ref_logprobs"] = ref_logps
+        if skip_prev:
+            for rb in rollout_batches:
+                rb["logprobs"] = [
+                    torch.zeros(len(t) - 1, dtype=torch.float32) for t in rb["tokens"]
+                ]
+        else:
+            for rb, prev_logps in zip(rollout_batches, prev_logprobs, strict=True):
+                rb["logprobs"] = prev_logps
+
+        return rollout_batches
 
     @catch_exception_ctx_async("GrpoTrainActor.setup_client")
     async def setup_client(self):
@@ -592,51 +692,20 @@ class GrpoTrainActor(
         )
 
         # compute logps
-        samples_per_batch = training_config.rollout_mbs * effective_keep_n
-        restore_info = None
-        for data in rollout_batches:
-            ll = len(data["tokens"])
-            src_dp = [torch.tensor(mpu.get_data_parallel_rank())] * ll
-            data["src_dp"] = src_dp
-
-        balance_dp_seqlen = self.config.policy.balance_dp_seqlen
-        if balance_dp_seqlen:
-            rebalanced_batches, restore_info = DPBalanceHelper.rebalance_for_compute_log_probs(
-                rollout_batches,
-                samples_per_batch,
-                add_custom_keys=getattr(self.config.task, "add_custom_keys", None),
-            )
-            origin_rollout_batches = rollout_batches
-            rollout_batches = rebalanced_batches
-
-        skip_prev = self.config.ppo.skip_prev_logps
         timers("compute_logps", log_level=0).start(barrier=True)
-        ref_logprobs, prev_logprobs = self.policy_engine.compute_log_probs(
-            rollout_batches,
-            compute_pre_logps=not skip_prev,
-        )
-        cpu_barrier()
-        timers("compute_logps").stop()
-
-        if not self.config.policy.without_ref:
-            for rb, ref_logps in zip(rollout_batches, ref_logprobs):
-                rb["ref_logprobs"] = ref_logps
-        if skip_prev:
-            for rb in rollout_batches:
-                rb["logprobs"] = [
-                    torch.zeros(len(t) - 1, dtype=torch.float32) for t in rb["tokens"]
-                ]
-        else:
-            for rb, prev_logps in zip(rollout_batches, prev_logprobs, strict=True):
-                rb["logprobs"] = prev_logps
-
-        if balance_dp_seqlen:
-            rollout_batches = DPBalanceHelper.restore_log_probs_to_original_batches(
-                origin_rollout_batches,
+        if self.config.policy.dist_config.dynamic_context_parallel:
+            rollout_batches = self._compute_log_probs_dynamic_cp(
                 rollout_batches,
-                restore_info,
-                without_ref=self.config.policy.without_ref,
+                training_config,
+                effective_keep_n,
             )
+        else:
+            rollout_batches = self._compute_log_probs(
+                rollout_batches,
+                training_config,
+                effective_keep_n,
+            )
+        timers("compute_logps").stop()
 
         if external_reward_task is not None:
             reward_updates = await external_reward_task
@@ -990,10 +1059,13 @@ class GrpoTrainActor(
         # save final ckpt
         cpu_barrier()
         if ppo_step % training_config.save_interval != 0:
+            logging_memory_usage_details("memory tracking before vllm sleep", rank=0)
             if self.config.placement_type != "disaggregated":
                 for sampler_idx in range(self.sampler_client.num_samplers):
                     await self.sampler_client.sleep(sampler_idx)
                 cpu_barrier()
+            logging_memory_usage_details("memory tracking after vllm sleep", rank=0)
+            clear_memory()
             self.policy_engine.onload_model()
             self.policy_engine.onload_optimizer()
             await self.save_checkpoint(ppo_step)

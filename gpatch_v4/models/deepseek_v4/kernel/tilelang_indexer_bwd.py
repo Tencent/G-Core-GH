@@ -1,7 +1,10 @@
 # ruff: noqa
 # Adapted from miles_plugins/models/glm5/ops/tilelang_indexer_bwd.py for DeepSeek-V4.
-import tilelang as tl
-import tilelang.language as T
+try:
+    import tilelang as tl
+    import tilelang.language as T
+except ImportError:
+    from gfused.fake_tilelang_stub import tilelang_stub as tl, language_stub as T
 import torch
 
 BF16 = T.bfloat16

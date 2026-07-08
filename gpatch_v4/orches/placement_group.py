@@ -13,6 +13,7 @@ from gpatch_v4.configs.config import (
     InferenceConfig,
     OffPolicyDistillConfig,
     OnPolicyDistillConfig,
+    RewardConfig,
     RlConfig,
     T2iRlConfig,
 )
@@ -261,7 +262,7 @@ def create_placement_groups(config):
     if isinstance(
         config, (
             EvaluateConfig, FinetuneConfig, RlConfig, T2iRlConfig, OnPolicyDistillConfig,
-            OffPolicyDistillConfig, DpoConfig
+            OffPolicyDistillConfig, DpoConfig, RewardConfig
         )
     ):
         # ``kv`` / ``teacher_*`` slice widths intentionally use the **policy**

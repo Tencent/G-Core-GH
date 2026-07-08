@@ -1,0 +1,73 @@
+# @package _global_
+#
+# DSV4 FSDP2 DPO test: 4 layers, EP=8 CP=1, 8 GPUs.
+# policy == ref (same weights), lr=0 => loss = ln(2).
+
+_target_: gpatch_v4.configs.config.DpoConfig
+
+training:
+  training_backend: fsdp2
+  use_fast_tokenizer: True
+  train_gbs: 8
+  train_mbs: 1
+  seq_length: 4096
+  data_parallel_random_init: False
+  save_interval: 999999
+  num_train_epoches: 1
+  comput_attn_mask: False
+  sort_batched: False
+  build_from_mbridge: True
+  auto_load_from_save_ckpt: False
+  exit_step: 1
+  recompute: True
+  enable_mtp: False
+  loss_func: dpo
+  dpo_beta: 0.1
+  dpo_label_smoothing: 0.0
+  dpo_loss_type: sigmoid
+  dpo_ftx_gamma: 0.0
+
+policy:
+  dist_config:
+    nnodes: -1
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8
+    context_parallel_size: 1
+  model_arch: "deepseek_v4"
+  ppo_pack_seq: False
+  attn_implementation: "fused"
+  indexer_backend: "fused"
+  without_ref: False
+  hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
+  hf_tokenizer_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
+  ref_hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
+
+checkpoint:
+  load_ckpt_path: unittest_dsv4_dpo
+  save_ckpt_path: unittest_dsv4_dpo
+  convert_mcore_to_hf_online: False
+  mbridge_distributed_filesystem: True
+  override_tokenizer_special_token:
+    eos_token: "<｜end▁of▁sentence｜>"
+
+optimizer:
+  lr: 0
+  lr_warmup_steps: 0
+  lr_decay_style: "constant"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  py_path: "tasks/math_dsv4/dpo_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+debug:
+  save_first_rollout_data: False
+  debug_truncate_num_hidden_layers: 4
+  disable_save_checkpoint: True
+  trainer_return_ppo_step_metrics: True

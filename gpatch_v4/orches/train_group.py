@@ -16,6 +16,7 @@ from gpatch_v4.actor import (
     GrpoAsyncTrainActor,
     GrpoTrainActor,
     OffPolicyDistillStudentActor,
+    RewardActor,
     T2iEditSftActor,
     T2iGrpoTrainActor,
 )
@@ -25,6 +26,7 @@ from gpatch_v4.configs.config import (
     FinetuneConfig,
     OffPolicyDistillConfig,
     OnPolicyDistillConfig,
+    RewardConfig,
     RlConfig,
     T2iEditSftConfig,
     T2iRlConfig,
@@ -104,6 +106,8 @@ class RayTrainGroup:
             actor_impl = EvaluateActor
         elif isinstance(self.config, DpoConfig):
             actor_impl = DpoActor
+        elif isinstance(self.config, RewardConfig):
+            actor_impl = RewardActor
         else:
             raise NotImplementedError(f"unknown config {type(self.config)}")
         ActorClass = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(actor_impl)
@@ -164,6 +168,7 @@ class RayTrainGroup:
                 OnPolicyDistillConfig,
                 OffPolicyDistillConfig,
                 DpoConfig,
+                RewardConfig,
             )
         ), f"config {type(self.config)}"
         futs = [actor.setup_model_and_optimizer.remote() for actor in self._actor_handlers]
