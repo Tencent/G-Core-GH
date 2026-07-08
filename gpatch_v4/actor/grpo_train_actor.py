@@ -80,6 +80,7 @@ from gpatch_v4.utils import (
 from gpatch_v4.utils.common_utils import compress_ppo_save_train_data
 from gpatch_v4.utils.resumable_distributed_sampler import ResumableDistributedSampler
 from gpatch_v4.utils.test_utils import save_data
+from gpatch_v4.utils.training_utils import align_sampler_num_samples
 
 
 class GrpoTrainActor(
@@ -549,9 +550,20 @@ class GrpoTrainActor(
 
         self.train_iter = None
         if resume_step is not None:
-            # 此时说明是第二次调用了，就不重复算了
+            self.align_and_resume_sampler(resume_step)
             return
         self.auto_calc_ppo_step()
+
+    def align_and_resume_sampler(self, resume_step):
+        if not isinstance(self.train_sampler, ResumableDistributedSampler):
+            return
+        dp_size = mpu.get_data_parallel_world_size()
+        rollout_mbs = self.config.training.rollout_mbs
+        rollout_gas = self.config.training.rollout_gbs // (dp_size * rollout_mbs)
+        step_per_epoch = self.train_sampler.num_samples // (rollout_gas * rollout_mbs)
+        assert self.config.training.ppo_step_per_epoch == step_per_epoch, f"ppo_step_per_epoch {self.config.training.ppo_step_per_epoch} != {step_per_epoch}"
+        align_sampler_num_samples(self.train_sampler, step_per_epoch, rollout_mbs, rollout_gas)
+        self.train_sampler.set_start_index(resume_step * rollout_gas, rollout_mbs)
 
     def auto_calc_ppo_step(self):
         """Automatically compute total PPO steps, gradient accumulation steps, etc."""

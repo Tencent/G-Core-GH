@@ -87,3 +87,9 @@ def run_regression_perf():
         return (latency_e4m3 + latency_e5m2) / 2
     latency_e4m3 = profiler_e4m3.do_bench()
     return latency_e4m3
+
+
+if __name__ == "__main__":
+    for shape in MODEL_SHAPES:
+        test_gemm_fp8(shape, determine_fp8_type())
+        test_gemm_fp8(shape, determine_fp8_type("e5m2"))

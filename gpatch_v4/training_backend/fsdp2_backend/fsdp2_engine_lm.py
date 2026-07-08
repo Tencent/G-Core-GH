@@ -70,7 +70,7 @@ class Fsdp2EngineLm(
         if load_latest_step is not None:
             ref_hf_model_path = load_latest_step
         log(f"creating ref model from {ref_hf_model_path}", rank=0)
-        self.ref_model = self.get_fsdp2_model(init_context, self.policy_config.ref_hf_model_path)
+        self.ref_model = self.get_fsdp2_model(init_context, ref_hf_model_path)
         with profile_memory_and_time(f"offload_ref_model", rank=0):
             self.offload_ref_model()
 

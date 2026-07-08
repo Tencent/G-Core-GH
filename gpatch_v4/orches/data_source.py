@@ -77,6 +77,7 @@ class RolloutDataSource(DataSourceBase):
         """Build dataset and dataloader as a single reader (dp_rank=0, dp_size=1)."""
         fn = import_fn_from_path(self.config.data.py_path, self.config.data.fn_name)
         fn_kwargs = inspect.signature(fn).parameters
+        self.dp_size = 1
 
         cond1 = all(
             [
@@ -92,7 +93,7 @@ class RolloutDataSource(DataSourceBase):
                 config=self.config,
                 tokenizer=self.tokenizer,
                 dp_rank=0,
-                dp_size=1,
+                dp_size=self.dp_size,
             )
         else:
             raise ValueError(f'unexpected data factory signature: {fn_kwargs}')

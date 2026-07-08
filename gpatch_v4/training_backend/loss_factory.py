@@ -27,6 +27,7 @@ from gpatch_v4.utils import (
 from gpatch_v4.utils.common_utils import import_fn_from_path
 from gpatch_v4.utils.ppo_utils import calculate_kl_loss
 from gpatch_v4.utils.training_utils import from_parallel_logits_to_topk_logprobs
+
 try:
     from gpatch_v4.kernel import linear_cross_entropy, set_linear_ce_backend
 except Exception:
@@ -2110,7 +2111,7 @@ def dpo_loss_func(
     logits = loss_input.logits.float()
     batch = loss_input.batch
     labels = batch["labels"]
-    loss_mask = batch["loss_mask"][:, :-1]
+    loss_mask = batch["full_loss_mask"][:, :-1]
     target = batch["tokens"]
 
     assert logits.shape[0] % 2 == 0, "mbs must be 2*n"

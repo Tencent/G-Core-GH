@@ -7,7 +7,7 @@ training:
   train_mbs: 1
   seq_length: 4096
   data_parallel_random_init: False
-  save_interval: 5000
+  save_interval: 20
   num_train_epoches: 1
   comput_attn_mask: False
   sort_batched: False

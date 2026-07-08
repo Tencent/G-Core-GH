@@ -24,11 +24,13 @@ from gpatch_v4.core.parallel_state import (
     is_mp_and_cp_head,
 )
 from gpatch_v4.utils import BroadcastUtils, all_reduce_autograd, log, logging_rank0
+from gpatch_v4.utils.resumable_distributed_sampler import ResumableDistributedSampler
 
 try:
     from megatron.core.gcore_utils import (
         get_gathered_routing_info,  # only branch wxdev support
     )
+
     from gpatch_v4.kernel import linear_cross_entropy, set_linear_ce_backend
 except (ImportError, Exception) as e:
     get_gathered_routing_info = None
@@ -1659,3 +1661,12 @@ def format_token_weight_table(tokenizer, full_text, weights, target_start, spans
                     break
         lines.append(f"{i:4d} | {tok_text:20s} | {span_str:12s} | {weights[i]:6.2f} | {region}")
     return "\n".join(lines)
+
+
+def align_sampler_num_samples(sampler, train_step_per_epoch: int, mbs: int, gas: int):
+    if not isinstance(sampler, ResumableDistributedSampler):
+        return
+    aligned = train_step_per_epoch * gas * mbs
+    assert sampler.num_samples >= aligned, f"sampler.num_samples={sampler.num_samples} < aligned={aligned}"
+    sampler.num_samples = aligned
+    sampler.total_size = aligned * sampler.num_replicas

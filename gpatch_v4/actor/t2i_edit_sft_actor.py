@@ -53,10 +53,15 @@ from gpatch_v4.utils import (
 from gpatch_v4.utils.common_utils import compress_ppo_save_train_data
 from gpatch_v4.utils.resumable_distributed_sampler import ResumableDistributedSampler
 from gpatch_v4.utils.test_utils import save_data
-from gpatch_v4.utils.training_utils import get_dump_moe_metrics
+from gpatch_v4.utils.training_utils import (
+    align_sampler_num_samples,
+    get_dump_moe_metrics,
+)
 
 try:
-    from megatron.core.gcore_utils import clear_gathered_routing_info  # only branch wxdev support
+    from megatron.core.gcore_utils import (
+        clear_gathered_routing_info,  # only branch wxdev support
+    )
 except ImportError:
     clear_gathered_routing_info = None
 
@@ -125,9 +130,20 @@ class T2iEditSftActor(BaseActor, MetricsMixin, RetryActorMixin, ProfileMixin):
 
         self.train_iter = None
         if resume_step is not None:
-            # 此时说明是第二次调用了，就不重复算了
+            self.align_and_resume_sampler(resume_step)
             return
         self.auto_calc_train_step()
+
+    def align_and_resume_sampler(self, resume_step):
+        if not isinstance(self.train_sampler, ResumableDistributedSampler):
+            return
+        dp_size = mpu.get_data_parallel_world_size()
+        mbs = self.config.training.train_mbs
+        gas = self.config.training.train_gbs // (dp_size * mbs)
+        step_per_epoch = self.train_sampler.num_samples // (gas * mbs)
+        assert self.config.training.train_step_per_epoch == step_per_epoch, f"train_step_per_epoch {self.config.training.train_step_per_epoch} != {step_per_epoch}"
+        align_sampler_num_samples(self.train_sampler, step_per_epoch, mbs, gas)
+        self.train_sampler.set_start_index(resume_step * gas, mbs)
 
     def auto_calc_train_step(self):
         training_config = self.config.training

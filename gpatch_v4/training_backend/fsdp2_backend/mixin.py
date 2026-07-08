@@ -21,7 +21,10 @@ from gpatch_v4.core.mappings import (
     all_gather_from_context_parallel_region,
     all_gather_from_context_parallel_region_no_zigzag,
 )
-from gpatch_v4.extended_model import DeepseekV4PrepareDataForwardLLM
+from gpatch_v4.extended_model import (
+    DeepseekV4DpoPrepareDataForwardLLM,
+    DeepseekV4PrepareDataForwardLLM,
+)
 
 try:
     from gpatch_v4.models.deepseek_v4 import DeepseekV4ForCausalLM, apply_hp
@@ -497,7 +500,10 @@ class ForwardStepMixin(RouterReplayMixin):
         cp_size = mpu.get_context_parallel_world_size()
         if cp_size <= 1:
             return local_tensor
-        if isinstance(self.prepare_data, DeepseekV4PrepareDataForwardLLM):
+        if isinstance(
+            self.prepare_data,
+            (DeepseekV4PrepareDataForwardLLM, DeepseekV4DpoPrepareDataForwardLLM)
+        ):
             return all_gather_from_context_parallel_region_no_zigzag(local_tensor, gather_dim)
         else:
             return all_gather_from_context_parallel_region(local_tensor, gather_dim)
@@ -724,9 +730,13 @@ class ForwardStepMixin(RouterReplayMixin):
                 ref_logprobs = batch["ref_logprobs"]
                 safe_labels = labels_2d.clamp(min=0)
                 policy_logps = selective_log_softmax_raw(logits, safe_labels)
+
+                policy_logps = self._all_gather_cp_aware(policy_logps)
+                full_loss_mask = batch["full_loss_mask"].float()
+
                 ref_len = ref_logprobs.shape[1]
                 policy_logps = policy_logps[:, :ref_len]
-                dpo_loss_mask = loss_mask_2d[:, :ref_len].float()
+                dpo_loss_mask = full_loss_mask[:, :ref_len].float()
 
                 policy_seq_logps = (policy_logps * dpo_loss_mask).sum(-1)
                 ref_seq_logps = (ref_logprobs.to(policy_logps.device) * dpo_loss_mask).sum(-1)
@@ -746,7 +756,6 @@ class ForwardStepMixin(RouterReplayMixin):
                     label_smoothing=dpo_label_smoothing,
                     loss_type=training_config.dpo_loss_type,
                 )
-                log(f"DEBUG dpo loss {losses} {chosen_rewards=} {rejected_rewards=}")
 
                 if dpo_ftx_gamma > 1e-6:
                     chosen_mask_sum = dpo_loss_mask[:rbs].sum(-1).clamp_min(1.0)
@@ -855,7 +864,7 @@ class ForwardStepMixin(RouterReplayMixin):
 
             tmp = loss.detach().clone()
             tmp_main = main_loss.detach().clone()
-            if self.cp_size > 1:
+            if self.cp_size > 1 and not is_dpo:
                 dist.all_reduce(tmp, group=self.model._cp_group)
                 dist.all_reduce(tmp_main, group=self.model._cp_group)
             report_loss += tmp.item()

@@ -5,9 +5,9 @@ export PYTHONPATH="$PWD:$MCORE_PATH:$MBRIDGE_PATH:$MLM_BRIDGE_PATH/src:$PYTHONPA
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
+export GCORE_GPU=16
 source tasks/math_dsv4/scripts/mpirun-init-ray.sh
 
 python3 -u gpatch_v4/entry/train_dpo.py \
     --config-path="../../tasks/math_dsv4/yaml" \
-    --config-name="dsv4_dpo.yaml" \
-    +debug.debug_truncate_num_hidden_layers=4
+    --config-name="dsv4_dpo.yaml"

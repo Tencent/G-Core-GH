@@ -3,19 +3,17 @@ _target_: gpatch_v4.configs.config.DpoConfig
 training:
   training_backend: fsdp2
   use_fast_tokenizer: True
-  train_gbs: 128
+  train_gbs: 64
   # train_mbs 是取数据的 mbs，一个 dpo 样本产出 chosen + rejected 两条数据，
   # 所以实际 microbatch size = train_mbs * 2。
   train_mbs: 1
-  seq_length: 65536
+  seq_length: 8192
   data_parallel_random_init: False
   save_interval: 400
   num_train_epoches: 10
   comput_attn_mask: False
   sort_batched: False
   build_from_mbridge: True
-  moe_pad_with_random_tokens: True
-  pad_to_mulitiple_of: 1024
   auto_load_from_save_ckpt: True
   use_dynamic_mbs: False
   recompute: True
@@ -42,9 +40,16 @@ optimizer:
   adam_beta2: 0.999
   adam_epsilon: 1.0e-8
 
+# data:
+#   data_pathes:
+#     - "/mnt/ceph-hz1-csp/mm-base-plt2/user_xiaotaoliu/data/dqa-dpo/"
+#   py_path: "tasks/math_dsv4/dpo_dataset.py"
+#   fn_name: "get_dataset_and_dataloader"
+#   dataloader_num_workers: 1
+#   dataloader_pin_memory: True
 data:
   data_pathes:
-    - "/mnt/geminihzceph/user_jingtaoxu/datas/dpo/"
+    - "/mnt/ceph-hz1-csp/mm-base-plt2/user_xiaotaoliu/data/dpo_data2/"
   py_path: "tasks/math_dsv4/dpo_dataset_v2.py"
   fn_name: "get_dataset_and_dataloader"
   dataloader_num_workers: 1
@@ -54,15 +59,15 @@ policy:
   dist_config:
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
-    expert_model_parallel_size: 8
-    context_parallel_size: 8
+    expert_model_parallel_size: 4
+    context_parallel_size: 1
   model_arch: "deepseek_v4"
   attn_implementation: "fused"
   indexer_backend: "fused"
   without_ref: False
-  hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_bak"
-  hf_tokenizer_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_bak"
-  ref_hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_bak"
+  hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_small"
+  hf_tokenizer_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_small"
+  ref_hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_small"
 
 debug:
   save_first_rollout_data: true

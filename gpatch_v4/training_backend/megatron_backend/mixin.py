@@ -568,6 +568,11 @@ class BridgeUtilsMixin:
             # When PEFT is enabled, always defer DDP wrapping so we can
             # load base weights first, then inject adapters, then wrap.
             post_wrap_with_ddp = post_wrap_with_ddp or (self.peft is not None and wrap_with_ddp)
+            # ddp wrap 之后，不能再 freeze/unfreeze 参数，所以需要提前判断是否需要 freeze/unfreeze 参数了
+            has_freeze_patterns = bool(
+                self.policy_config.freeze_patterns or self.policy_config.unfreeze_patterns
+            )
+            post_wrap_with_ddp = post_wrap_with_ddp or (wrap_with_ddp and has_freeze_patterns)
             model = bridge.get_model(
                 bf16=True,
                 wrap_with_ddp=wrap_with_ddp and not post_wrap_with_ddp,

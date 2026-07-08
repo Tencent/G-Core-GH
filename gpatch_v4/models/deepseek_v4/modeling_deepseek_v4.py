@@ -72,7 +72,11 @@ from .cp import build_cp_causal_mask, compressor_cp_ag, compressor_cp_ring, swa_
 from .deepep_a2a import fused_combine, fused_dispatch
 from .kernel.tilelang_indexer_fwd import _make_causal_cu_seqlens, batched_indexer_fwd
 from .kernel.tilelang_sparse_mla import sparse_attn_tilelang
-from .qat import fp8_simulate_qat
+
+try:
+    from .qat import fp8_simulate_qat
+except ImportError:
+    fp8_simulate_qat = None
 from .thd import PackedSeqParams
 
 

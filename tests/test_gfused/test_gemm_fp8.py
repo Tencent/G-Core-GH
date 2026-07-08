@@ -20,15 +20,43 @@ import os
 import unittest
 
 import torch
+import pytest
 
 os.environ.setdefault("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
 
-import transformer_engine.pytorch as te  # noqa: E402
-from transformer_engine.common.recipe import Float8BlockScaling, Format  # noqa: E402
+_HAS_TE = False
+try:
+    import transformer_engine.pytorch as te  # noqa: E402
+    from transformer_engine.common.recipe import Float8BlockScaling, Format  # noqa: E402
+    _HAS_TE = True
+except ImportError:
+    te = None  # type: ignore[assignment]
+    Float8BlockScaling = None  # type: ignore[assignment,misc]
+    Format = None  # type: ignore[assignment,misc]
+
+_SKIP_TE = not _HAS_TE
+_SKIP_TE_REASON = "transformer_engine not installed"
+
+def _gpu_cc() -> tuple[int, int]:
+    if not torch.cuda.is_available():
+        return (0, 0)
+    return torch.cuda.get_device_capability()
+
+def _cuda_version() -> tuple[int, int]:
+    if not torch.cuda.is_available():
+        return (0, 0)
+    v = torch.version.cuda
+    if v is None:
+        return (0, 0)
+    parts = v.split(".")
+    return (int(parts[0]), int(parts[1]))
+
+_SKIP_CC = _gpu_cc() < (9, 0) or _cuda_version() < (12, 9)
+_SKIP_CC_REASON = "requires compute capability >= 9.0 (Hopper) and CUDA >= 12.9"
 
 
 # ======================================================================
-# Part 1: torch._scaled_mm 直接调用（不依赖 TE recipe）
+# Part 1a: torch._scaled_mm 直接调用（不依赖 TE recipe）
 # ======================================================================
 
 def _quantize_per_tensor(x: torch.Tensor):
@@ -88,14 +116,112 @@ class TestScaledMmFp8(unittest.TestCase):
                 self.assertLess(rel_diff, 0.1)
 
 
-def _make_recipe():
-    return Float8BlockScaling(fp8_format=Format.E4M3)
+# ======================================================================
+# Part 1b: torch._scaled_mm + blockwise scale（需要 sm90 + CUDA 12.9）
+# ======================================================================
+
+def _quantize_blockwise(x: torch.Tensor, block_size: int = 128):
+    """Block-wise FP8 E4M3 quantization along the last dim.
+
+    Each contiguous block of ``block_size`` elements gets its own fp32
+    scale = max(|block|) / 448.  Returns ``(x_fp8, scale_inv)`` where
+    ``scale_inv`` has shape ``(*x.shape[:-1], num_blocks)`` — one
+    inverse-scale per block — ready for ``torch._scaled_mm``.
+    """
+    assert x.shape[-1] % block_size == 0
+    FP8_MAX = torch.finfo(torch.float8_e4m3fn).max          # 448
+    leading = x.shape[:-1]
+    N = x.shape[-1]
+    num_blocks = N // block_size
+
+    blocks = x.float().reshape(*leading, num_blocks, block_size)
+    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    scale = amax / FP8_MAX                                   # per-block scale
+    q = (blocks / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    q = q.reshape(*leading, N).contiguous()
+    scale_inv = scale.squeeze(-1)                            # (*leading, num_blocks)
+    return q, scale_inv
+
+
+@pytest.mark.skipif(_SKIP_CC, reason=_SKIP_CC_REASON)
+class TestScaledMmBlockScaling(unittest.TestCase):
+    """torch._scaled_mm + 手写 block-wise FP8 量化（零 TE 依赖）。"""
+
+    device = "cuda"
+
+    def _run_blockwise_mm(self, M, K, N, block_size=128):
+        x = torch.randn(M, K, device=self.device, dtype=torch.bfloat16)
+        w = torch.randn(N, K, device=self.device, dtype=torch.bfloat16)
+
+        x_fp8, sx = _quantize_blockwise(x, block_size)      # sx: [M, K//bs]
+        w_fp8, sw = _quantize_blockwise(w, block_size)      # sw: [N, K//bs]
+
+        out = torch._scaled_mm(
+            x_fp8,
+            w_fp8.t(),
+            scale_a=sx,
+            scale_b=sw,
+            out_dtype=torch.bfloat16,
+            use_fast_accum=True,
+        )
+
+        ref = x @ w.t()
+        rel_diff = (out - ref).float().norm() / ref.float().norm()
+        return out, rel_diff.item()
+
+    def test_blockwise_forward_finite(self):
+        out, rel_diff = self._run_blockwise_mm(128, 512, 1024)
+        print(f"  blockwise scaled_mm rel_diff = {rel_diff:.4e}")
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertLess(rel_diff, 0.05)
+
+    def test_blockwise_various_shapes(self):
+        shapes = [
+            (16, 128, 256),
+            (64, 256, 128),
+            (256, 1024, 2048),
+            (32, 7168, 2048),
+        ]
+        for m, k, n in shapes:
+            with self.subTest(M=m, K=k, N=n):
+                out, rel_diff = self._run_blockwise_mm(m, k, n)
+                print(f"  blockwise shape ({m}, {k}, {n}): rel_diff = {rel_diff:.4e}")
+                self.assertTrue(torch.isfinite(out).all())
+                self.assertLess(rel_diff, 0.1)
+
+    def test_blockwise_vs_per_tensor(self):
+        """Block-wise 应比 per-tensor 更精确（scale 粒度更细）。"""
+        M, K, N = 256, 1024, 2048
+        x = torch.randn(M, K, device=self.device, dtype=torch.bfloat16)
+        w = torch.randn(N, K, device=self.device, dtype=torch.bfloat16)
+        ref = x @ w.t()
+
+        x_pt, sx_pt = _quantize_per_tensor(x)
+        w_pt, sw_pt = _quantize_per_tensor(w)
+        out_pt = torch._scaled_mm(x_pt, w_pt.t(), scale_a=sx_pt, scale_b=sw_pt,
+                                  out_dtype=torch.bfloat16, use_fast_accum=True)
+
+        x_bw, sx_bw = _quantize_blockwise(x)
+        w_bw, sw_bw = _quantize_blockwise(w)
+        out_bw = torch._scaled_mm(x_bw, w_bw.t(), scale_a=sx_bw, scale_b=sw_bw,
+                                  out_dtype=torch.bfloat16, use_fast_accum=True)
+
+        err_pt = (out_pt - ref).float().norm() / ref.float().norm()
+        err_bw = (out_bw - ref).float().norm() / ref.float().norm()
+        print(f"  per-tensor rel_diff = {err_pt.item():.4e}, blockwise rel_diff = {err_bw.item():.4e}")
+        self.assertLessEqual(err_bw.item(), err_pt.item() + 1e-4)
 
 
 # ======================================================================
 # Part 2: TE Linear + fp8_autocast (Float8BlockScaling)
 # ======================================================================
 
+def _make_recipe():
+    return Float8BlockScaling(fp8_format=Format.E4M3)
+
+
+@pytest.mark.skipif(_SKIP_TE, reason=_SKIP_TE_REASON)
+@pytest.mark.skipif(_SKIP_CC, reason=_SKIP_CC_REASON)
 class TestTeGemmFp8BlockScaling(unittest.TestCase):
     """TE Linear FP8 block-scaling 冒烟。"""
 
@@ -219,9 +345,128 @@ class TestTeGemmFp8BlockScaling(unittest.TestCase):
 
 
 # ======================================================================
+# Part 2b: TE GroupedLinear + fp8_autocast (Float8BlockScaling)
+# ======================================================================
+
+@pytest.mark.skipif(_SKIP_TE, reason=_SKIP_TE_REASON)
+@pytest.mark.skipif(_SKIP_CC, reason=_SKIP_CC_REASON)
+class TestTeGroupedLinearFp8(unittest.TestCase):
+    """TE GroupedLinear FP8 block-scaling 冒烟（模拟 MoE expert GEMMs）。"""
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    NUM_EXPERTS = 4
+    H_IN = 256
+    H_OUT = 512
+
+    def _make_grouped_linear(self, bias=False):
+        return te.GroupedLinear(
+            num_gemms=self.NUM_EXPERTS,
+            in_features=self.H_IN,
+            out_features=self.H_OUT,
+            bias=bias,
+        ).to(device=self.device, dtype=self.dtype)
+
+    def _make_input_and_splits(self):
+        tokens_per_expert = [32, 16, 48, 32]
+        total = sum(tokens_per_expert)
+        x = torch.randn(total, self.H_IN, device=self.device, dtype=self.dtype, requires_grad=True)
+        m_splits = torch.tensor(tokens_per_expert, dtype=torch.int64)
+        return x, m_splits
+
+    def test_grouped_forward_fp8_finite(self):
+        gl = self._make_grouped_linear()
+        x, m_splits = self._make_input_and_splits()
+        recipe = _make_recipe()
+        with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+            out = gl(x, m_splits)
+        total = m_splits.sum().item()
+        self.assertEqual(out.shape, (total, self.H_OUT))
+        self.assertEqual(out.dtype, self.dtype)
+        self.assertTrue(torch.isfinite(out).all(), "GroupedLinear FP8 fwd inf/nan")
+
+    def test_grouped_backward_fp8_finite(self):
+        gl = self._make_grouped_linear()
+        x, m_splits = self._make_input_and_splits()
+        recipe = _make_recipe()
+        with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+            out = gl(x, m_splits)
+        out.sum().backward()
+
+        self.assertIsNotNone(x.grad)
+        self.assertEqual(x.grad.dtype, self.dtype)
+        self.assertTrue(torch.isfinite(x.grad).all(), "input grad inf/nan")
+        for name, p in gl.named_parameters():
+            if p.grad is not None:
+                self.assertEqual(p.grad.dtype, self.dtype, f"{name} grad dtype 应为 {self.dtype}")
+                self.assertTrue(torch.isfinite(p.grad).all(), f"{name} grad inf/nan")
+
+    def test_grouped_fp8_vs_bf16_forward_close(self):
+        gl = self._make_grouped_linear()
+        x, m_splits = self._make_input_and_splits()
+
+        with torch.no_grad():
+            ref = gl(x, m_splits)
+
+        recipe = _make_recipe()
+        with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+            fp8_out = gl(x, m_splits)
+
+        rel_diff = (fp8_out - ref).float().norm() / ref.float().norm()
+        print(f"  [GroupedLinear] fwd rel_diff = {rel_diff.item():.4e}")
+        self.assertLess(rel_diff.item(), 0.05)
+
+    def test_grouped_multi_step_stability(self):
+        gl = self._make_grouped_linear(bias=True)
+        optimizer = torch.optim.Adam(gl.parameters(), lr=1e-3)
+        recipe = _make_recipe()
+        losses = []
+
+        for step in range(5):
+            optimizer.zero_grad()
+            x, m_splits = self._make_input_and_splits()
+            target = torch.randn(m_splits.sum().item(), self.H_OUT, device=self.device, dtype=self.dtype)
+            with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                out = gl(x, m_splits)
+            loss = torch.nn.functional.mse_loss(out, target)
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+            print(f"  step {step}: loss = {loss.item():.6f}")
+
+        for i, l in enumerate(losses):
+            self.assertTrue(0 < l < 1e6, f"step {i} loss 异常: {l}")
+
+    def test_grouped_uneven_splits(self):
+        """不均匀 split（含 0 token expert）。"""
+        gl = self._make_grouped_linear()
+        splits_list = [
+            [64, 0, 32, 32],
+            [0, 0, 128, 0],
+            [16, 16, 16, 16],
+        ]
+        recipe = _make_recipe()
+        for splits in splits_list:
+            total = sum(splits)
+            if total == 0:
+                continue
+            with self.subTest(splits=splits):
+                x = torch.randn(total, self.H_IN, device=self.device, dtype=self.dtype, requires_grad=True)
+                m_splits = torch.tensor(splits, dtype=torch.int64)
+                with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                    out = gl(x, m_splits)
+                out.sum().backward()
+                self.assertTrue(torch.isfinite(out).all(), f"splits={splits} fwd inf/nan")
+                self.assertTrue(torch.isfinite(x.grad).all(), f"splits={splits} bwd inf/nan")
+                print(f"  splits={splits}: PASS")
+
+
+# ======================================================================
 # Part 3: TE 内部算子直接调用 — 验证量化 dtype + GEMM output dtype
 # ======================================================================
 
+@pytest.mark.skipif(_SKIP_TE, reason=_SKIP_TE_REASON)
+@pytest.mark.skipif(_SKIP_CC, reason=_SKIP_CC_REASON)
 class TestTeInternalOps(unittest.TestCase):
     """直接调用 Float8BlockQuantizer + general_gemm，验证 FP8 内部 dtype。"""
 

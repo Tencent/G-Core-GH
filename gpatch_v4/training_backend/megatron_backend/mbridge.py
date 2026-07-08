@@ -75,6 +75,12 @@ def apply_freeze_unfreeze_patterns(
     ``unfreeze_patterns`` takes priority over ``freeze_patterns``: a parameter
     matching both stays/becomes trainable.
 
+    The leading ``module.`` prefix added by DDP wrapping is stripped from both
+    the parameter name and the pattern before matching, so the same pattern
+    works whether the model chunk has been DDP-wrapped or not (e.g. both
+    ``module.audio_model.*`` and ``audio_model.*`` match a parameter reported
+    as either ``module.audio_model.proj1.weight`` or ``audio_model.proj1.weight``).
+
     Parameters
     ----------
     model : torch.nn.Module
@@ -87,6 +93,13 @@ def apply_freeze_unfreeze_patterns(
         Parameter names matching any of these patterns get ``requires_grad =
         True``, overriding ``freeze_patterns``.
     """
+    def _strip_module_prefix(s: Optional[str]) -> Optional[str]:
+        if s is None:
+            return None
+        while s.startswith("module."):
+            s = s[len("module."):]
+        return s
+
     def _wildcard_match(pattern: str, key: Optional[str]) -> Optional[bool]:
         if key is None:
             return None
@@ -94,18 +107,32 @@ def apply_freeze_unfreeze_patterns(
         match = regex_pattern.match(key)
         return match is not None
 
-    freeze_patterns = freeze_patterns or []
-    unfreeze_patterns = unfreeze_patterns or []
+    freeze_patterns = [_strip_module_prefix(p) for p in (freeze_patterns or [])]
+    unfreeze_patterns = [_strip_module_prefix(p) for p in (unfreeze_patterns or [])]
     if not freeze_patterns and not unfreeze_patterns:
         return
 
+    frozen_count = 0
+    unfrozen_count = 0
     for name, param in model.named_parameters():
-        if any(_wildcard_match(pattern, name) for pattern in freeze_patterns):
+        canonical_name = _strip_module_prefix(name)
+        if any(_wildcard_match(pattern, canonical_name) for pattern in freeze_patterns):
             param.requires_grad = False
+            frozen_count += 1
 
     for name, param in model.named_parameters():
-        if any(_wildcard_match(pattern, name) for pattern in unfreeze_patterns):
+        canonical_name = _strip_module_prefix(name)
+        if any(_wildcard_match(pattern, canonical_name) for pattern in unfreeze_patterns):
             param.requires_grad = True
+            unfrozen_count += 1
+
+    total_params = sum(1 for _ in model.parameters())
+    log(
+        f"apply_freeze_unfreeze_patterns: frozen={frozen_count} "
+        f"unfrozen={unfrozen_count} total={total_params} "
+        f"freeze_patterns={freeze_patterns} unfreeze_patterns={unfreeze_patterns}",
+        rank=0,
+    )
 
 
 __all__ = [
