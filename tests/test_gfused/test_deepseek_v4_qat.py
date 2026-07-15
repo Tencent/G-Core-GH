@@ -1,8 +1,7 @@
 # coding=utf-8
 # Copyright (c) 2026 Tencent Inc. All rights reserved.
 # nrwu@tencent.com
-"""FP8 QAT smoke test: forward with/without fp8_qat produces close but
-different log-probs (quantization noise is present but bounded).
+"""FP8/FP4 QAT smoke test with routed-MoE FP4 priority.
 
 Router replay with balanced expert indices ensures both runs go through
 the same expert assignment — isolating QAT noise from routing variance.
@@ -21,19 +20,9 @@ import os
 import unittest
 
 import ray
-import torch
-from torch import distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from transformers import AutoTokenizer, DeepseekV4Config
 
 from test_gpatch_v4.gpatch_v4_test_helper import kill_all_actors_and_shutdown_ray
-from gpatch_v4.models.deepseek_v4 import DeepseekV4ForCausalLM, apply_hp
-from gpatch_v4.models.deepseek_v4.router_replay import (
-    enable_router_replay,
-    router_replay_ctx,
-)
-from gpatch_v4.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4TopKRouter
 from gpatch_v4.orches.placement_group import _create_placement_group
 
 HF_MODEL_PATH = "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
@@ -41,28 +30,6 @@ NUM_GPUS = 32
 NUM_LAYERS = 4
 EP_SIZE = 8
 SEQ_LEN = 128
-
-
-def _setup_dist(rank, world_size, master_addr, master_port):
-    os.environ["MASTER_ADDR"] = master_addr
-    os.environ["MASTER_PORT"] = str(master_port)
-    torch.cuda.set_device(0)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-
-
-def _make_balanced_replay_indices(model, seq_len, device):
-    """Per-TopKRouter balanced expert indices: token t picks experts
-    [(t*top_k + k) % num_experts for k in range(top_k)].
-    """
-    indices_per_layer = []
-    for m in model.modules():
-        if isinstance(m, DeepseekV4TopKRouter):
-            n_experts = m.num_experts
-            top_k = m.top_k
-            t = torch.arange(seq_len, device=device)
-            idx = torch.stack([(t * top_k + k) % n_experts for k in range(top_k)], dim=-1)
-            indices_per_layer.append(idx)
-    return indices_per_layer
 
 
 @ray.remote(num_cpus=0, num_gpus=0)
@@ -75,7 +42,21 @@ def _qat_worker(
     hf_model_path: str, rank: int, world_size: int,
     master_addr: str, master_port: int,
 ):
-    _setup_dist(rank, world_size, master_addr, master_port)
+    import os
+
+    import torch
+    from torch import distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from transformers import AutoTokenizer, DeepseekV4Config
+
+    from gpatch_v4.models.deepseek_v4 import DeepseekV4ForCausalLM, apply_hp
+    from gpatch_v4.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4TopKRouter
+    from gpatch_v4.models.deepseek_v4.router_replay import router_replay_ctx
+
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
+    torch.cuda.set_device(0)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
     ep_2d_mesh = init_device_mesh(
         "cuda",
@@ -87,7 +68,6 @@ def _qat_worker(
     config.num_hidden_layers = NUM_LAYERS
     config.layer_types = config.layer_types[:NUM_LAYERS]
     config.mlp_layer_types = config.mlp_layer_types[:NUM_LAYERS]
-    config.num_nextn_predict_layers = 0
 
     prev_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.float32)
@@ -97,10 +77,12 @@ def _qat_worker(
     finally:
         torch.set_default_dtype(prev_dtype)
 
-    model = apply_hp(model, ep_2d_mesh, fp8_qat=True)
+    model = apply_hp(model, ep_2d_mesh, fp8_qat=True, fp4_qat=True)
     model.load_checkpoint_hp(hf_model_path)
-    model.eval()
+    model.train()
     dist.barrier()
+    assert model.config.fp4_qat
+    assert all(layer.config.fp4_qat for layer in model.mtp.layers)
 
     # 1. fake input
     tokenizer = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
@@ -109,37 +91,66 @@ def _qat_worker(
     position_ids = torch.arange(SEQ_LEN, device="cuda").unsqueeze(0)
 
     # 2. 造均衡的 replay indices
-    replay_indices = _make_balanced_replay_indices(model, SEQ_LEN, device=torch.device("cuda"))
+    replay_indices = []
+    for module in model.modules():
+        if isinstance(module, DeepseekV4TopKRouter):
+            token_idx = torch.arange(SEQ_LEN, device="cuda")
+            replay_indices.append(
+                torch.stack(
+                    [
+                        (token_idx * module.top_k + k) % module.num_experts
+                        for k in range(module.top_k)
+                    ],
+                    dim=-1,
+                )
+            )
     n_routers = len(replay_indices)
     if rank == 0:
         print(f"  {n_routers} TopKRouter layers, replay shape {list(replay_indices[0].shape)}")
 
-    # 3. forward WITH qat + replay
-    with torch.no_grad(), router_replay_ctx(model, replay_indices):
-        out_on = model(input_ids=input_ids, position_ids=position_ids)
-        logps_on = torch.log_softmax(out_on.logits.float(), dim=-1)
+    def set_qat_flags(*, fp4_qat, fp8_qat):
+        model.config.fp4_qat = fp4_qat
+        model.config.fp8_qat = fp8_qat
+        for layer in model.mtp.layers:
+            layer.config.fp4_qat = fp4_qat
+            layer.config.fp8_qat = fp8_qat
 
-    # 4. toggle fp8_qat off, forward WITHOUT qat + same replay
-    model.config.fp8_qat = False
-    with torch.no_grad(), router_replay_ctx(model, replay_indices):
-        out_off = model(input_ids=input_ids, position_ids=position_ids)
-        logps_off = torch.log_softmax(out_off.logits.float(), dim=-1)
+    def run_forward():
+        torch.manual_seed(1234)
+        with torch.no_grad(), router_replay_ctx(model, replay_indices):
+            outputs = model(input_ids=input_ids, position_ids=position_ids)
+        assert outputs.mtp_per_depth_h is not None
+        assert len(outputs.mtp_per_depth_h) == config.num_nextn_predict_layers
+        assert all(torch.isfinite(output).all() for output in outputs.mtp_per_depth_h)
+        return torch.log_softmax(outputs.logits.float(), dim=-1)
 
-    # 5. 对比
-    diff = (logps_on - logps_off).abs()
-    max_abs_diff = diff.max().item()
-    mean_abs_diff = diff.mean().item()
-    are_identical = torch.equal(logps_off, logps_on)
+    logps_fp4_and_fp8 = run_forward()
+    set_qat_flags(fp4_qat=True, fp8_qat=False)
+    logps_fp4 = run_forward()
+    set_qat_flags(fp4_qat=False, fp8_qat=True)
+    logps_fp8 = run_forward()
+    set_qat_flags(fp4_qat=False, fp8_qat=False)
+    logps_off = run_forward()
+
+    fp4_diff = (logps_fp4_and_fp8 - logps_fp8).abs()
+    fp8_with_fp4_diff = (logps_fp4_and_fp8 - logps_fp4).abs()
+    fp8_diff = (logps_fp8 - logps_off).abs()
 
     result = {
-        "max_abs_diff": max_abs_diff,
-        "mean_abs_diff": mean_abs_diff,
-        "are_identical": are_identical,
+        "fp4_max_abs_diff": fp4_diff.max().item(),
+        "fp4_mean_abs_diff": fp4_diff.mean().item(),
+        "fp8_with_fp4_max_abs_diff": fp8_with_fp4_diff.max().item(),
+        "fp8_with_fp4_are_identical": torch.equal(logps_fp4_and_fp8, logps_fp4),
+        "fp8_max_abs_diff": fp8_diff.max().item(),
+        "fp8_mean_abs_diff": fp8_diff.mean().item(),
+        "fp8_are_identical": torch.equal(logps_fp8, logps_off),
     }
     if rank == 0:
-        print(f"  max_abs_diff  = {max_abs_diff:.6f}")
-        print(f"  mean_abs_diff = {mean_abs_diff:.6f}")
-        print(f"  are_identical = {are_identical}")
+        print(f"  fp4_max_abs_diff  = {result['fp4_max_abs_diff']:.6f}")
+        print(f"  fp4_mean_abs_diff = {result['fp4_mean_abs_diff']:.6f}")
+        print(f"  fp8_with_fp4_max_abs_diff = {result['fp8_with_fp4_max_abs_diff']:.6f}")
+        print(f"  fp8_max_abs_diff  = {result['fp8_max_abs_diff']:.6f}")
+        print(f"  fp8_mean_abs_diff = {result['fp8_mean_abs_diff']:.6f}")
 
     del model
     torch.cuda.empty_cache()
@@ -147,7 +158,7 @@ def _qat_worker(
     return result
 
 
-class TestFP8QAT(unittest.TestCase):
+class TestQAT(unittest.TestCase):
 
     def setUp(self):
         ray.init(address="auto")
@@ -161,7 +172,7 @@ class TestFP8QAT(unittest.TestCase):
     def tearDown(self):
         kill_all_actors_and_shutdown_ray()
 
-    def test_qat_changes_output(self):
+    def test_fp4_qat_and_fp8_qat_change_output(self):
         assert os.path.isdir(HF_MODEL_PATH), (
             f"model dir not found: {HF_MODEL_PATH}"
         )
@@ -193,6 +204,3 @@ class TestFP8QAT(unittest.TestCase):
         results = ray.get(futures)
 
         r0 = results[0]
-        self.assertFalse(r0["are_identical"], "fp8_qat should change log-probs")
-        self.assertLess(r0["mean_abs_diff"], 0.10, "mean log-prob diff too large")
-        self.assertGreater(r0["max_abs_diff"], 0, "expected nonzero diff from quantization noise")

@@ -74,8 +74,10 @@ from .kernel.tilelang_indexer_fwd import _make_causal_cu_seqlens, batched_indexe
 from .kernel.tilelang_sparse_mla import sparse_attn_tilelang
 
 try:
-    from .qat import fp8_simulate_qat
+    from .qat import fp4_simulate_qat, fp8_qat_linear, fp8_simulate_qat
 except ImportError:
+    fp4_simulate_qat = None
+    fp8_qat_linear = None
     fp8_simulate_qat = None
 from .thd import PackedSeqParams
 
@@ -161,6 +163,7 @@ class DeepseekV4HCACompressor(nn.Module):
         else:
             cp_rank = torch.distributed.get_rank(cp_group)
             m = self.compress_rate
+            # todo zz: validate chunks and derive folded HCA positions
             assert s_local % m == 0
             first_window_position = cp_rank * s_local
             n_local_windows = s_local // m
@@ -190,7 +193,6 @@ class DeepseekV4HCACompressor(nn.Module):
                 positions = torch.arange(n_windows, device=compressed.device)
                 positions = (positions * self.compress_rate + first_window_position).unsqueeze(0).expand(batch, -1)
             else:
-                # todo zz: redo wnd pos ids
                 positions = packed_seq_params.layout.per_m[self.compress_rate].wnd_pos_ids
                 assert positions.shape == (n_windows,)
                 positions = positions.unsqueeze(0).expand(batch, -1)
@@ -210,6 +212,7 @@ class DeepseekV4HCACompressor(nn.Module):
         # sequence in absolute-position order.
         if cp_group is not None:
             assert n_local_windows is not None
+            # todo zz: restore global HCA window order
             compressed_kv = compressor_cp_ag(
                 compressed_kv, cp_group, 0, n_local_windows,
             )
@@ -232,8 +235,6 @@ class DeepseekV4HCACompressor(nn.Module):
                 )
             else:
                 # [b=1, h=1, s_local, n_windows]
-                # todo zz: redo causal threshold, seg_id_per_token
-                # todo zz: wnd idx = arange(compressed_len//2) + arange(half + compressed_len//2)
                 wnd_idx = torch.arange(compressed_len, device=device)
                 per_m = packed_seq_params.layout.per_m[self.compress_rate]
                 future_mask = wnd_idx.view(1, 1, 1, -1) >= per_m.causal_threshold_per_token.view(1, 1, -1, 1)
@@ -328,6 +329,7 @@ class DeepseekV4Indexer(nn.Module):
         packed_seq_params: PackedSeqParams | None = None,
     ) -> torch.LongTensor:
         s_local = position_ids.shape[1]
+        # q_residual.shape=torch.Size([1, s_local, q_lora_rank=1024])
         assert q_residual.shape[1] == s_local
         if cp_group is None:
             cp_rank = 0
@@ -338,16 +340,15 @@ class DeepseekV4Indexer(nn.Module):
         else:
             cp_rank = torch.distributed.get_rank(cp_group)
             m = self.compress_rate
+            # todo zz: validate every folded chunk is m-aligned
             assert s_local % m == 0
             l_prefix = 0 if cp_rank == 0 else m
 
-            # todo zz: 去掉 +cp -thd 路径，用 thd + 1 seg 路径即可。
+            # todo zz: represent interleaved per-piece prefixes; one leading trim is invalid
             first_window_position = cp_rank * s_local - l_prefix
             n_local_windows = s_local // m
             n_prefix_windows = l_prefix // m
             if n_prefix_windows > 0:
-                # todo zz: 2 x lprefix
-                # todo zz: middle slice + cat ? expensive ? 2 prefix at head?
                 assert hidden_states.shape[1] == l_prefix + s_local
                 local_hidden_states = hidden_states[:, l_prefix:, :]
             else:
@@ -371,7 +372,6 @@ class DeepseekV4Indexer(nn.Module):
             chunk_kv = chunk_kv.view(batch, n_windows, ratio, -1)
             chunk_gate = chunk_gate.view(batch, n_windows, ratio, -1) + self.position_bias.to(chunk_gate.dtype)
 
-            # todo zz: write a op to mv
             # Same Ca / Cb overlap layout as the outer CSA compressor, at index_head_dim.
             new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
             new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float("-inf"))
@@ -387,7 +387,6 @@ class DeepseekV4Indexer(nn.Module):
             # (pad logits would otherwise dilute the per-window softmax).
             if packed_seq_params is not None:
                 per_m = packed_seq_params.layout.per_m[self.compress_rate]
-                # todo zz: zz it
                 first_of_seg = per_m.first_of_seg_window_mask_with_prefix  # [n_windows]
                 new_gate[:, first_of_seg, :ratio] = float("-inf")
                 new_kv[:, first_of_seg, :ratio] = 0
@@ -400,6 +399,7 @@ class DeepseekV4Indexer(nn.Module):
             # position ids compat with THD format
             if packed_seq_params is None:
                 positions = torch.arange(n_windows, device=compressed.device)
+                # todo zz: derive Indexer window positions from folded prefix layout
                 positions = positions * self.compress_rate + first_window_position
             else:
                 positions = packed_seq_params.layout.per_m[self.compress_rate].wnd_pos_ids_with_prefix
@@ -418,15 +418,16 @@ class DeepseekV4Indexer(nn.Module):
         # [B, n_windows, head_dim]
         compressed_kv = compressed
 
-        # todo zz: drop middle zz head
         # ---- CP stage-2: trim duplicate prefix windows + all-gather ----
         if cp_group is not None:
             assert n_local_windows is not None
             # compressor_cp_post operates on a [B, 1, T, D] layout
+            # todo zz: trim all folded prefixes and restore global Indexer window order
             compressed_kv = compressor_cp_ag(
                 compressed_kv.unsqueeze(1), cp_group, n_prefix_windows, n_local_windows,
             ).squeeze(1)
 
+        # todo zz: keep query-local states separate from interleaved prefix states
         cos_q, sin_q = self.rotary_emb(local_hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
         q = self.q_b_proj(q_residual).view(batch, s_local, -1, self.head_dim).transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
@@ -477,7 +478,6 @@ class DeepseekV4Indexer(nn.Module):
                 invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
             else:
                 # [b=1, s_local, n_windows]
-                # todo zz: redo wnd idx
                 wnd_idx = torch.arange(compressed_len, device=device)
                 per_m = packed_seq_params.layout.per_m[self.compress_rate]
                 future_mask = wnd_idx.view(1, 1, -1) >= per_m.causal_threshold_per_token.view(1, -1, 1)
@@ -559,10 +559,12 @@ class DeepseekV4CSACompressor(nn.Module):
         else:
             cp_rank = torch.distributed.get_rank(cp_group)
             m = self.compress_rate
+            # todo zz: validate every folded chunk is m-aligned
             assert s_local % m == 0
 
             # Stage 1: send last m hidden_states to next rank, recv from prev.
             # NOTE: l_prefix is always 0 for rank 0, and m for rank > 0.
+            # todo zz: build per-segment folded compressor prefix views
             hs_with_prefix, l_prefix = compressor_cp_ring(hidden_states, m, cp_group)
             hidden_states = hs_with_prefix
 
@@ -624,6 +626,7 @@ class DeepseekV4CSACompressor(nn.Module):
             # position ids compat with THD format
             if packed_seq_params is None:
                 positions = torch.arange(n_windows, device=compressed.device)
+                # todo zz: derive CSA window positions from folded prefix layout
                 positions = positions * self.compress_rate + first_window_position
             else:
                 positions = packed_seq_params.layout.per_m[self.compress_rate].wnd_pos_ids_with_prefix
@@ -645,6 +648,7 @@ class DeepseekV4CSACompressor(nn.Module):
         # ---- CP stage-2: trim duplicate prefix windows + all-gather ----
         if cp_group is not None:
             assert n_local_windows is not None
+            # todo zz: trim all folded prefixes and restore global CSA window order
             compressed_kv = compressor_cp_ag(
                 compressed_kv, cp_group, n_prefix_windows, n_local_windows,
             )
@@ -658,6 +662,7 @@ class DeepseekV4CSACompressor(nn.Module):
         # at the valid top-k entries and leaves `-inf` everywhere else (the
         # scatter sentinel `compressed_len` falls into a one-wider tail column
         # that we drop afterwards).
+        # todo zz: pass unprefixed query states separately to Indexer
         top_k_indices = self.indexer(
             hidden_states, q_residual, position_ids, past_key_values, layer_idx,
             cp_group=cp_group,
@@ -677,18 +682,6 @@ class DeepseekV4CSACompressor(nn.Module):
         else:
             block_bias = None
         return compressed_kv, block_bias, top_k_indices.int()
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 COMPRESSOR_CLASSES = {
@@ -779,12 +772,23 @@ class DeepseekV4Attention(nn.Module):
         # one that matches this layer's rope type (sliding → main, CSA/HCA → compress).
         cos, sin = position_embeddings[self.rope_layer_type]
 
-        q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-        q = self.q_b_proj(q_residual).view(*hidden_shape).transpose(1, 2)
+        if self.config.fp8_qat:
+            q_residual = self.q_a_norm(
+                fp8_qat_linear(self.q_a_proj, hidden_states, 128)
+            )
+            q = fp8_qat_linear(self.q_b_proj, q_residual, 128).view(*hidden_shape).transpose(1, 2)
+        else:
+            q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
+            q = self.q_b_proj(q_residual).view(*hidden_shape).transpose(1, 2)
         q = self.q_b_norm(q)
         q = apply_rotary_pos_emb(q, cos, sin)
 
-        kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
+        if self.config.fp8_qat:
+            kv = self.kv_norm(
+                fp8_qat_linear(self.kv_proj, hidden_states, 128)
+            ).view(*hidden_shape).transpose(1, 2)
+        else:
+            kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
         kv = apply_rotary_pos_emb(kv, cos, sin)
         if self.config.fp8_qat:
             # attn kv torch.Size([1, 1, 128, 512])
@@ -811,7 +815,7 @@ class DeepseekV4Attention(nn.Module):
             cp_group = self.cp_group
 
             # SWA ring: prepend prev-rank's last sliding_window-1 KVs.
-            # todo zz: double the slide
+            # todo zz: build per-segment folded SWA KV prefix views
             kv = swa_ring_kv(kv, cp_group, self.sliding_window)
             swa_kv_len = kv.shape[2]
 
@@ -909,7 +913,10 @@ class DeepseekV4Attention(nn.Module):
 
         grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
         grouped = self.o_a_proj(grouped).flatten(2)
-        output = self.o_b_proj(grouped)
+        if self.config.fp8_qat:
+            output = fp8_qat_linear(self.o_b_proj, grouped, 128)
+        else:
+            output = self.o_b_proj(grouped)
         return output, attn_weights
 
 
@@ -1099,34 +1106,50 @@ class DeepseekV4Experts(nn.Module):
         )
         offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
 
-        # Weight QAT: simulate FP8 quantization noise on expert weights so
-        # the model learns to be robust against inference-time weight quantization.
         gate_up_w = self.gate_up_proj
         down_w = self.down_proj
-        if self.config.fp8_qat:
+        if self.config.fp4_qat:
+            gate_up_w = fp4_simulate_qat(gate_up_w)
+            down_w = fp4_simulate_qat(down_w)
+        elif self.config.fp8_qat:
             # vllm 和 sglang 的 moe 的 fp8 block (128, 128)
             gate_up_w = fp8_simulate_qat(gate_up_w, 128)
             down_w = fp8_simulate_qat(down_w, 128)
 
         # Up projection (gate||up packed): [S, 2I]
-        proj_out = _grouped_linear(
-            x_g.to(gate_up_w.dtype),
-            gate_up_w,
-            offsets,
-            bias=None,
-            is_transposed=False,
-        )
+        if self.config.fp8:
+            m_splits = tokens_per_expert.tolist()
+            proj_out = self.fp8_grouped_linear(
+                x_g.to(gate_up_w.dtype),
+                gate_up_w,
+                m_splits,
+            )
+        else:
+            proj_out = _grouped_linear(
+                x_g.to(gate_up_w.dtype),
+                gate_up_w,
+                offsets,
+                bias=None,
+                is_transposed=False,
+            )
         # Apply swiglu_limit clamp + SiLU on gate, clamp on up, then gate*up.
         proj_out = self._apply_gate(proj_out)            # [S, I]
 
         # Down projection: [S, H]
-        proj_out = _grouped_linear(
-            proj_out.to(down_w.dtype),
-            down_w,
-            offsets,
-            bias=None,
-            is_transposed=False,
-        )
+        if self.config.fp8:
+            proj_out = self.fp8_grouped_linear(
+                proj_out.to(down_w.dtype),
+                down_w,
+                m_splits,
+            )
+        else:
+            proj_out = _grouped_linear(
+                proj_out.to(down_w.dtype),
+                down_w,
+                offsets,
+                bias=None,
+                is_transposed=False,
+            )
 
         weighted = proj_out * weights_g.unsqueeze(-1)    # [S, H]
 
@@ -1206,7 +1229,19 @@ class DeepseekV4SparseMoeBlock(nn.Module):
         else:
             _, weights, indices = self.gate(hidden_states)
         routed = self.experts(flat, indices, weights).view(batch, seq_len, hidden_dim)
-        return routed + self.shared_experts(residual)
+        # Shared-experts weight QAT: simulate FP8 quantization noise on
+        # shared expert weights (matching sglang FP8 weight quantization).
+        # NOTE: deepseek v4 shared experts weights dtype is fp8, not `float4_e2m1fn`.
+        se = self.shared_experts
+        if self.experts.config.fp8_qat:
+            gate_w = fp8_simulate_qat(se.gate_proj.weight, 128)
+            up_w = fp8_simulate_qat(se.up_proj.weight, 128)
+            down_w = fp8_simulate_qat(se.down_proj.weight, 128)
+            intermediate = se.act_fn(F.linear(residual, gate_w, se.gate_proj.bias)) * F.linear(residual, up_w, se.up_proj.bias)
+            se_out = F.linear(intermediate, down_w, se.down_proj.bias)
+        else:
+            se_out = se(residual)
+        return routed + se_out
 
 
 class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
@@ -1300,6 +1335,19 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"(^|\.)mtp\..*"]
     _is_stateful = True
 
+    def __init__(self, config: DeepseekV4Config):
+        super().__init__(config)
+        if getattr(config, "fp8_qat", False):
+            assert fp8_simulate_qat is not None, (
+                "fp8_qat enabled but fp8_simulate_qat unavailable "
+                "(tilelang/tile_kernels not installed?)"
+            )
+        if getattr(config, "fp4_qat", False):
+            assert fp4_simulate_qat is not None, (
+                "fp4_qat enabled but fp4_simulate_qat unavailable "
+                "(tilelang/tile_kernels not installed?)"
+            )
+
     @torch.no_grad()
     def _init_weights(self, module):
         super()._init_weights(module)
@@ -1348,6 +1396,7 @@ def _build_swa_topk(
     Handles both BSHD (``packed_seq_params=None``) and THD
     (cross-seg positions masked to ``-1``).
     """
+    # todo zz: index folded q rows against interleaved SWA KV slots
     assert sliding_window <= s_local
     ta = torch.arange(s_local, device=device).view(1, -1, 1)
     tb = torch.arange(sliding_window, device=device).view(1, 1, -1)
@@ -1389,6 +1438,7 @@ def _build_attn_mask_or_swa_topk(
         if cp_active:
             s_local = inputs_embeds.shape[1]
             assert config.sliding_window <= s_local
+            # todo zz: build eager mask from folded q and KV position maps
             swa_prefix_len = 0 if cp_rank == 0 else config.sliding_window - 1
             causal_mask = build_cp_causal_mask(
                 s_local, cp_rank, swa_prefix_len, config.sliding_window,
@@ -1501,6 +1551,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             # `create_masks_for_generate`; all V4 layer types use the same sliding-window
             # mask, so use the prebuilt one directly. Otherwise build it here.
 
+        # todo zz: pass cp_size and folded metadata to mask/top-k builder
         causal_mask, swa_topk = _build_attn_mask_or_swa_topk(
             config=self.config,
             inputs_embeds=inputs_embeds,

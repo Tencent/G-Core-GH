@@ -123,7 +123,7 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         position_ids = get_tensor_on_this_cp_rank(position_ids, 1, key_name="position_ids")
         return tokens, position_ids, attention_mask
 
-    def _rl_train_cp_chunk_single_data(
+    def rl_train_cp_chunk_single_data(
         self,
         data: torch.Tensor,
     ):
@@ -144,6 +144,7 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
 
         tokens_l = []
         for batch in batches:
+            actual_len = int(batch["sequence_lengths"].item())
             tokens_l.append(
                 pad_or_truncate_last_dim(
                     batch["tokens"],
@@ -151,6 +152,7 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                     pad_token_id,
                     pad_with_random_token=pad_with_random_token,
                     vocab_size=vocab_size,
+                    valid_len=actual_len,
                 )
             )
 
@@ -195,6 +197,8 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         has_rollout_logprobs = "rollout_log_probs" in batches[0]
         has_ref_logprobs = "ref_logprobs" in batches[0]
         for batch in batches:
+            actual_len = int(batch["sequence_lengths"].item())
+            prediction_len = max(actual_len - 1, 0)
             tokens_l.append(
                 pad_or_truncate_last_dim(
                     batch['tokens'],
@@ -202,20 +206,41 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                     pad_token_id,
                     pad_with_random_token=pad_with_random_token,
                     vocab_size=vocab_size,
+                    valid_len=actual_len,
                 )
             )
-            advantages_l.append(pad_or_truncate_last_dim(batch['advantages'], seqlen - 1, 0))
-            mask_l.append(pad_or_truncate_last_dim(batch['mask'], seqlen - 1, 0))
-            logprobs_l.append(pad_or_truncate_last_dim(batch['logprobs'], seqlen - 1, 0))
+            advantages_l.append(
+                pad_or_truncate_last_dim(
+                    batch['advantages'], seqlen - 1, 0, valid_len=prediction_len
+                )
+            )
+            mask_l.append(
+                pad_or_truncate_last_dim(batch['mask'], seqlen - 1, 0, valid_len=prediction_len)
+            )
+            logprobs_l.append(
+                pad_or_truncate_last_dim(
+                    batch['logprobs'], seqlen - 1, 0, valid_len=prediction_len
+                )
+            )
             if has_ref_logprobs:
                 ref_logprobs_l.append(
-                    pad_or_truncate_last_dim(batch['ref_logprobs'], seqlen - 1, 0)
+                    pad_or_truncate_last_dim(
+                        batch['ref_logprobs'],
+                        seqlen - 1,
+                        0,
+                        valid_len=prediction_len,
+                    )
                 )
             if has_rollout_logprobs:
                 rollout_logprobs_l.append(
-                    pad_or_truncate_last_dim(batch['rollout_log_probs'], seqlen - 1, 0)
+                    pad_or_truncate_last_dim(
+                        batch['rollout_log_probs'],
+                        seqlen - 1,
+                        0,
+                        valid_len=prediction_len,
+                    )
                 )
-            sequence_lengths_l.append(batch['sequence_lengths'])
+            sequence_lengths_l.append(batch['sequence_lengths'].clamp(max=seqlen))
 
         tokens = torch.stack(tokens_l).cuda(non_blocking=non_blocking)
         advantages = torch.stack(advantages_l)
@@ -332,6 +357,8 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         mask_l = []
         sequence_lengths_l = []
         for batch in batches:
+            actual_len = int(batch["sequence_lengths"].item())
+            prediction_len = max(actual_len - 1, 0)
             tokens_l.append(
                 pad_or_truncate_last_dim(
                     batch['tokens'],
@@ -339,20 +366,29 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                     pad_token_id,
                     pad_with_random_token=pad_with_random_token,
                     vocab_size=vocab_size,
+                    valid_len=actual_len,
                 )
             )
-            values_l.append(pad_or_truncate_last_dim(
-                batch['values'],
-                seqlen - 1,
-                0.0,
-            ))
-            returns_l.append(pad_or_truncate_last_dim(
-                batch['returns'],
-                seqlen - 1,
-                0.0,
-            ))
-            mask_l.append(pad_or_truncate_last_dim(batch['mask'], seqlen - 1, 0))
-            sequence_lengths_l.append(batch['sequence_lengths'])
+            values_l.append(
+                pad_or_truncate_last_dim(
+                    batch['values'],
+                    seqlen - 1,
+                    0.0,
+                    valid_len=prediction_len,
+                )
+            )
+            returns_l.append(
+                pad_or_truncate_last_dim(
+                    batch['returns'],
+                    seqlen - 1,
+                    0.0,
+                    valid_len=prediction_len,
+                )
+            )
+            mask_l.append(
+                pad_or_truncate_last_dim(batch['mask'], seqlen - 1, 0, valid_len=prediction_len)
+            )
+            sequence_lengths_l.append(batch['sequence_lengths'].clamp(max=seqlen))
 
         tokens = torch.stack(tokens_l).cuda(non_blocking=non_blocking)
         mask = torch.stack(mask_l)
@@ -467,8 +503,10 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         rejected_seqlen_l = []
         for batch in batches:
             required = (
-                "chosen_tokens", "rejected_tokens",
-                "chosen_sequence_length", "rejected_sequence_length",
+                "chosen_tokens",
+                "rejected_tokens",
+                "chosen_sequence_length",
+                "rejected_sequence_length",
             )
             assert all(k in batch for k in required), \
                 f"reward model dataset must provide {required}"
@@ -655,7 +693,6 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
             labels, -100, False, False, True, compute_attention_mask=comput_attn_mask
         )
         full_loss_mask = loss_mask
-
         full_labels = labels.clone().detach()  # full tensor unchunked
         if dist.get_world_size(mpu.get_context_parallel_group()) > 1:
             tokens, labels, loss_mask, position_ids, attention_mask = (
@@ -811,6 +848,8 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         is_single_teacher = len(teacher_names) == 1
         routing_field = getattr(self.config.ppo, "g_opd_teacher_routing_field", "teacher_type")
         for bi, batch in enumerate(batches):
+            actual_len = int(batch["sequence_lengths"].item())
+            prediction_len = max(actual_len - 1, 0)
             tokens_l.append(
                 pad_or_truncate_last_dim(
                     batch['tokens'],
@@ -818,15 +857,24 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                     pad_token_id,
                     pad_with_random_token=pad_with_random_token,
                     vocab_size=vocab_size,
+                    valid_len=actual_len,
                 )
             )
             adv = batch['advantages']
             if adv.dim() == 2:
-                advantages_l.append(pad_3d_seq_dim(adv, seqlen - 1, 0))
+                advantages_l.append(pad_3d_seq_dim(adv[:prediction_len], seqlen - 1, 0))
             else:
-                advantages_l.append(pad_or_truncate_last_dim(adv, seqlen - 1, 0))
-            mask_l.append(pad_or_truncate_last_dim(batch['mask'], seqlen - 1, 0))
-            logprobs_l.append(pad_or_truncate_last_dim(batch['logprobs'], seqlen - 1, 0))
+                advantages_l.append(
+                    pad_or_truncate_last_dim(adv, seqlen - 1, 0, valid_len=prediction_len)
+                )
+            mask_l.append(
+                pad_or_truncate_last_dim(batch['mask'], seqlen - 1, 0, valid_len=prediction_len)
+            )
+            logprobs_l.append(
+                pad_or_truncate_last_dim(
+                    batch['logprobs'], seqlen - 1, 0, valid_len=prediction_len
+                )
+            )
 
             if is_single_teacher:
                 teacher_name = teacher_names[0]
@@ -842,22 +890,40 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                 )
 
             teacher_logprobs_l.append(
-                pad_or_truncate_last_dim(batch[f'teacher_logprobs_{teacher_name}'], seqlen - 1, 0)
+                pad_or_truncate_last_dim(
+                    batch[f'teacher_logprobs_{teacher_name}'],
+                    seqlen - 1,
+                    0,
+                    valid_len=prediction_len,
+                )
             )
             if has_ref_logprobs:
                 ref_logprobs_l.append(
-                    pad_or_truncate_last_dim(batch['ref_logprobs'], seqlen - 1, 0)
+                    pad_or_truncate_last_dim(
+                        batch['ref_logprobs'],
+                        seqlen - 1,
+                        0,
+                        valid_len=prediction_len,
+                    )
                 )
             if has_rollout_logprobs:
                 rollout_logprobs_l.append(
-                    pad_or_truncate_last_dim(batch['rollout_log_probs'], seqlen - 1, 0)
+                    pad_or_truncate_last_dim(
+                        batch['rollout_log_probs'],
+                        seqlen - 1,
+                        0,
+                        valid_len=prediction_len,
+                    )
                 )
             if has_topk:
+                #TODO@rionawang: 这里你记得改一下
                 prev_topk_logprobs_l.append(
-                    pad_3d_seq_dim(batch['prev_topk_logprobs'], seqlen - 1, 0)
+                    pad_3d_seq_dim(batch['prev_topk_logprobs'][:prediction_len], seqlen - 1, 0)
                 )
-                opd_topk_ids_l.append(pad_3d_seq_dim(batch['opd_topk_ids'], seqlen - 1, 0))
-            sequence_lengths_l.append(batch['sequence_lengths'])
+                opd_topk_ids_l.append(
+                    pad_3d_seq_dim(batch['opd_topk_ids'][:prediction_len], seqlen - 1, 0)
+                )
+            sequence_lengths_l.append(batch['sequence_lengths'].clamp(max=seqlen))
 
         tokens = torch.stack(tokens_l).cuda(non_blocking=non_blocking)
         advantages = torch.stack(advantages_l)
@@ -1403,17 +1469,38 @@ class DpoPrepareDataForwardLLM(PrepareDataForwardLLM):
         pad_with_random_token: bool = False,
         **kwargs,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """DPO prepare: inject ref_logprobs and keep unchunked full tokens.
+
+        Base ``PrepareDataForwardLLM.sft_train`` pops ``tokens`` into
+        ``input_ids`` (and CP-chunks them when CP>1). ``dpo_loss_func`` needs
+        the full-sequence unshifted target for ``from_parallel_logits_to_logprobs``,
+        so rebuild it here without changing the SFT base path.
+        """
+        vocab_size = kwargs.get("vocab_size", 0)
         ref_logps_l = []
-        for batch in batches:
-            assert "ref_logprobs" in batch, f"{batch=}"
-            ref_logps = pad_or_truncate_last_dim(batch["ref_logprobs"], seq_len - 1, 0)
+        token_list = []
+        for sample in batches:
+            assert "ref_logprobs" in sample, f"{sample=}"
+            ref_logps = pad_or_truncate_last_dim(sample["ref_logprobs"], seq_len - 1, 0)
             ref_logps_l.append(ref_logps)
+            token, _, _ = self._prepare_tokens_and_labels(
+                sample["tokens"],
+                sample["labels"],
+                seq_len,
+                pad_token_id,
+                vocab_size,
+                pad_with_random_token,
+            )
+            token_list.append(token)
 
         non_blocking = True
         ref_logprobs = torch.stack(ref_logps_l).view(len(ref_logps_l),
                                                      -1).cuda(non_blocking=non_blocking)
+        full_tokens = torch.stack(token_list).view(len(token_list),
+                                                   -1).cuda(non_blocking=non_blocking)
         batch, fwd_kwargs = super(DpoPrepareDataForwardLLM, self).sft_train(
             batches, seq_len, pad_token_id, comput_attn_mask, pad_with_random_token, **kwargs
         )
         batch["ref_logprobs"] = ref_logprobs
+        batch["full_tokens"] = full_tokens
         return batch, fwd_kwargs

@@ -18,7 +18,7 @@ class DynamicSamplingRolloutGenerator(RolloutGeneratorAbc):
         pass
 
     @override
-    async def rollout_samples(self, data_iter, num_microbatches, curr_ppo_step):
+    async def rollout_samples(self, data_iter, num_microbatches, curr_ppo_step, dp_rank=None):
         raise NotImplementedError(f"{self.__class__.__name__}.rollout_samples is not implemented")
 
     @override

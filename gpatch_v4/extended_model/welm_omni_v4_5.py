@@ -1,7 +1,10 @@
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from typing_extensions import override
+
+logger = logging.getLogger(__name__)
 
 from megatron.core import mpu
 
@@ -38,6 +41,10 @@ class WelmOmniV45PrepareDataForward(PrepareDataForward):
     ) -> torch.Tensor:
         raise NotImplementedError("prepare_loss_weights is not implemented")
 
+    @property
+    def audio_token_id(self) -> int:
+        return self.config.policy.hf_config.audio_token_id
+
     def _prepare_tokens_and_labels(
         self,
         tokens: torch.Tensor,
@@ -47,6 +54,9 @@ class WelmOmniV45PrepareDataForward(PrepareDataForward):
         vocab_size: int,
         pad_with_random_token: bool = False,
     ):
+        # Resolve the audio token id up front; forbid random padding from
+        # producing it (handled inside pad_or_truncate_last_dim).
+        audio_token_id = self.audio_token_id
         # 先判断 labels 是否有被 shift 过
         assert tokens.shape == labels.shape, f"{tokens.shape=}, {labels.shape=}"
         assert torch.equal(
@@ -61,8 +71,10 @@ class WelmOmniV45PrepareDataForward(PrepareDataForward):
                 pad_token_id,
                 pad_with_random_token=pad_with_random_token,
                 vocab_size=vocab_size,
+                truncate_left=False,
+                forbidden_token_ids=[audio_token_id],
             )
-            labels = pad_or_truncate_last_dim(labels, seq_len + 1, -100)
+            labels = pad_or_truncate_last_dim(labels, seq_len + 1, -100, truncate_left=False)
             tokens = tokens[:-1]
             labels = labels[1:]
         else:

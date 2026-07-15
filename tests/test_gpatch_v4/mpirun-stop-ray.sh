@@ -1,4 +1,8 @@
-cp /etc/mpi/hostfile /root/hostfile
+if [ -z "${GCORE_GPU}" ]; then
+    cp /etc/mpi/hostfile /root/hostfile
+else
+    head -n $GCORE_GPU /etc/mpi/hostfile > /root/hostfile
+fi
 sed -i 's/slots=8/slots=1/g' /root/hostfile
 
 export RAY_DEDUP_LOGS=0

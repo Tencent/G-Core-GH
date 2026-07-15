@@ -39,9 +39,14 @@ from gpatch_v4.training_backend.megatron_backend.optimizer import (
     get_megatron_last_lr,
     get_optimizer_and_scheduler,
 )
-from gpatch_v4.training_backend.megatron_backend.welm_v45_myfa import (
-    install_welm_v45_myfa_hooks,
-)
+
+try:
+    from gpatch_v4.training_backend.megatron_backend.welm_v45_myfa import (
+        install_welm_v45_myfa_hooks,
+    )
+except:
+    install_welm_v45_myfa_hooks = None
+
 from gpatch_v4.utils import (
     cpu_dict,
     expand_rollout_batches,
@@ -129,7 +134,9 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             model_type=f"ref model",
             wrap_with_ddp=False,
         )
-        installed = install_welm_v45_myfa_hooks(self.ref_model, self.ref_hf_config)
+
+        installed = (install_welm_v45_myfa_hooks is not None
+                    ) and install_welm_v45_myfa_hooks(self.ref_model, self.ref_hf_config)
         if installed:
             log(f"installed WeLM v4.5 MyFA hooks on ref model: {installed}", rank=0)
         if not load_weights_from_bridge:
@@ -154,8 +161,15 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
 
         load_latest_step = get_latest_checkpoint_folder(self.checkpoint_config.load_ckpt_path)
         has_peft = is_peft_enabled(self.policy_config)
+        # Only skip HF load when this engine will later restore weights from dist
+        # checkpoint. Teacher / other without_optim roles never call
+        # load_checkpoint; if we also skip HF load whenever a student ckpt
+        # exists, they keep random-init weights (OPD resume: teacher_kl ~ log V).
+        will_load_dist_ckpt = (
+            load_latest_step is not None and not self.policy_config.without_optim
+        )
         # PEFT checkpoints store adapters only; base weights always come from HF.
-        load_hf_base_weights = load_latest_step is None or has_peft
+        load_hf_base_weights = (not will_load_dist_ckpt) or has_peft
         ctx = self.disable_moe_router_replay() if self.is_critic_model else nullcontext()
         with ctx:
             self.model, self.mcore_config = self.get_model_from_bridge(
@@ -166,7 +180,8 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                 wrap_with_ddp=self.policy_config.wrap_with_ddp,
                 build_value_model=self.is_critic_model or self.build_reward_head,
             )
-        installed = install_welm_v45_myfa_hooks(self.model, self.hf_config)
+        installed = (install_welm_v45_myfa_hooks
+                     is not None) and install_welm_v45_myfa_hooks(self.model, self.hf_config)
         if installed:
             log(f"installed WeLM v4.5 MyFA hooks on policy model: {installed}", rank=0)
         logging_memory_usage_details("memory tracking after policy model load", rank=0)

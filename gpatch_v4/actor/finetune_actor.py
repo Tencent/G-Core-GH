@@ -454,7 +454,7 @@ class FinetuneActor(
 
                 train_step += 1
                 if train_step % training_config.save_interval == 0 and not self.config.debug.disable_save_checkpoint:
-                    self.model_engine.save_checkpoint(train_step)
+                    self.model_engine.save_checkpoint(train_step, dataloader=self.train_dataloader)
 
                 if train_step == training_config.exit_step:
                     break
@@ -470,7 +470,7 @@ class FinetuneActor(
         cpu_barrier()
         if not self.config.debug.disable_save_checkpoint:
             if train_step % training_config.save_interval != 0:
-                self.model_engine.save_checkpoint(train_step)
+                self.model_engine.save_checkpoint(train_step, dataloader=self.train_dataloader)
 
         if is_last_rank():
             TrainReporterSingleton.finish()

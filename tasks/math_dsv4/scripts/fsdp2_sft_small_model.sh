@@ -9,12 +9,11 @@ source tasks/math_dsv4/scripts/mpirun-init-ray.sh
 
 python3 -u gpatch_v4/entry/train_lm_finetune.py \
     --config-path="../../tasks/math_dsv4/yaml" --config-name="math_sft_with_mtp_fsdp2.yaml" \
-    policy.dist_config.context_parallel_size=2 \
     debug.debug_truncate_num_hidden_layers=4 \
     training.auto_load_from_save_ckpt=False \
-    training.save_interval=20 \
+    training.save_interval=1000 \
     training.enable_mtp=True \
-    training.exit_step=22 \
+    training.exit_step=50 \
     +report.log_level=debug \
     optimizer.lr=1e-5 \
     checkpoint.save_ckpt_path=save_dsv4_sft_cp2_l4_wo_mtp \

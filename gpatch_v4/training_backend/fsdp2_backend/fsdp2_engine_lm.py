@@ -9,7 +9,14 @@ from typing_extensions import override
 from megatron.core import mpu
 from megatron.core.utils import divide
 
-from gpatch_v4.extended_model import PrepareDataForwardFactory
+from gpatch_v4.configs.config import OnPolicyDistillConfig
+from gpatch_v4.extended_model import (
+    PrepareDataForwardFactory,
+    PostInitModelFactory,
+    CheckpointContextFnFactory,
+    ResetRouterCorrectionBiasAccumFactory,
+    UpdateRouterCorrectionBiasFactory,
+)
 from gpatch_v4.training_backend.base_engine import BaseEngine
 from gpatch_v4.training_backend.common.swap_mixin import EngineSwapMixin
 from gpatch_v4.training_backend.fsdp2_backend.checkpoint import (
@@ -27,7 +34,11 @@ from gpatch_v4.training_backend.fsdp2_backend.optimizer import (
     setup_optimizer,
 )
 from gpatch_v4.training_backend.fsdp2_backend.weight_exportor import get_weight_exportor
-from gpatch_v4.training_backend.loss_factory import PolicyLossInput, get_policy_loss_fn
+from gpatch_v4.training_backend.loss_factory import (
+    PolicyLossInput,
+    get_policy_loss_fn,
+    is_seq_mean_rl_loss_fn,
+)
 from gpatch_v4.utils import (
     cache_hf_metadata_files,
     clear_memory,
@@ -56,6 +67,10 @@ class Fsdp2EngineLm(
         self._setup_device_mesh()
         self.swap_impl = Fsdp2SwapImpl()
         self.prepare_data = PrepareDataForwardFactory.get_prepare_data_fwd(config)
+        self.post_init_model = PostInitModelFactory.get_post_init_model(config)
+        self.checkpoint_context_fn = CheckpointContextFnFactory.get_checkpoint_context_fn(config)
+        self.reset_router_correction_bias_accum = ResetRouterCorrectionBiasAccumFactory.get_reset_router_correction_bias_accum(config)
+        self.update_router_correction_bias = UpdateRouterCorrectionBiasFactory.get_update_router_correction_bias(config)
 
         cache_hf_metadata_files(
             self.policy_config.hf_model_path,
@@ -88,7 +103,20 @@ class Fsdp2EngineLm(
         self.model = self.get_fsdp2_model(init_context, self.policy_config.hf_model_path)
 
         if self.config.training.recompute:
-            self.model.gradient_checkpointing_enable()
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={
+                    "use_reentrant": False,
+                    "context_fn": self.checkpoint_context_fn,
+                }
+            )
+
+        self.post_init_model(self.model)
+
+        if self.policy_config.without_optim:
+            self.optimizer = None
+            self.lr_scheduler = None
+            self.hf_config = self.model.config
+            return 0
 
         if self.config.debug.debug_no_optim:
             optimizer = None
@@ -140,18 +168,27 @@ class Fsdp2EngineLm(
         self.set_model_train()
 
         loss_fn = get_policy_loss_fn(self.config.ppo.advantage_type)
+        seq_mean_loss = is_seq_mean_rl_loss_fn(loss_fn)
         metrics = {}
 
         for batch in dataloader_iter:
             self.optimizer.zero_grad()
+            if not self.training_config.freeze_router_correction_bias:
+                self.reset_router_correction_bias_accum(self.model)
             seq_length = get_batches_max_seqlen(batch, self.training_config.pad_to_mulitiple_of)
             seq_length = get_max_seqlen_within_dp(seq_length)
 
             data_iter = get_k_split_list(batch, num_microbatches)
 
             use_r3 = self.config.training.moe_router_replay
+
+            if isinstance(self.config, OnPolicyDistillConfig):
+                prepare_data_func = self.prepare_data.opd_train
+            else:
+                prepare_data_func = self.prepare_data.grpo_train
+
             for batches in data_iter:
-                batch_data, fwd_kwargs = self.prepare_data.grpo_train(
+                batch_data, fwd_kwargs = prepare_data_func(
                     batches,
                     seq_length,
                     self.tokenizer.pad_token_id,
@@ -163,7 +200,13 @@ class Fsdp2EngineLm(
                     if use_r3 else nullcontext()
                 )
                 with replay_ctx:
-                    logits = self.model(**fwd_kwargs).logits.float()
+                    train_forward_context = (
+                        nullcontext()
+                        if self.training_config.recompute
+                        else self.checkpoint_context_fn()[0]
+                    )
+                    with train_forward_context:
+                        logits = self.model(**fwd_kwargs).logits.float()
                     target = batch_data["target"]
 
                     # CP-aware logprobs
@@ -184,17 +227,28 @@ class Fsdp2EngineLm(
                     loss_input = PolicyLossInput(
                         advantages=advantages,
                         prev_log_probs=batch_data["prev_log_probs"],
-                        ref_log_probs=batch_data["ref_log_probs"],
+                        ref_log_probs=batch_data.get("ref_log_probs", None),
                         curr_log_probs=curr_log_probs,
                         response_mask=response_mask,
                         scaled_entropy=scaled_entropy,
                         rollout_log_probs=batch_data.get("rollout_log_probs", None),
                         per_token_entropy=entropy,
+                        teacher_log_probs=batch_data.get("teacher_log_probs", None),
                         should_dump_metrics=False,
                     )
 
                     bwd_loss, step_metrics = loss_fn(self.config, loss_input)
-                    (bwd_loss / num_microbatches).backward()
+                    # Keep router_replay_ctx alive through backward: gradient
+                    # checkpointing re-runs forward during recompute and still
+                    # needs the pinned expert indices from rollout.
+                    if seq_mean_loss:
+                        # bwd_loss = sum of per-seq token-means in this mb. Dividing
+                        # by train_gbs and multiplying by dp_size makes the FSDP
+                        # gradient (averaged over DP) equal (1/train_gbs) * sum over
+                        # the global batch of d(per-seq token-mean)/dθ.
+                        (bwd_loss * self.dp_size / self.training_config.train_gbs).backward()
+                    else:
+                        (bwd_loss / num_microbatches).backward()
                 extend_value_to_dict(metrics, {f"policy/{k}": v for k, v in step_metrics.items()})
 
             grad_norm = self.clip_grad_norm_()
@@ -203,6 +257,14 @@ class Fsdp2EngineLm(
                 self.optimizer.zero_grad()
             else:
                 self.optimizer.step()
+            if not self.training_config.freeze_router_correction_bias:
+                maxvio_max, maxvio_mean = self.update_router_correction_bias(
+                    model=self.model,
+                    update_speed=self.training_config.router_correction_bias_update_speed,
+                    use_abs_update=self.training_config.router_correction_bias_use_abs_update,
+                )
+                extend_value_to_dict(metrics, {"policy/maxvio_max": maxvio_max})
+                extend_value_to_dict(metrics, {"policy/maxvio_mean": maxvio_mean})
             extend_value_to_dict(metrics, {"policy/grad_norm": grad_norm})
             extend_value_to_dict(metrics, {"policy/seq_length": seq_length})
 
@@ -238,6 +300,8 @@ class Fsdp2EngineLm(
     def finetune_step(self, batch: List[Dict[str, Any]], num_microbatches: int, step: int):
         self.set_model_train()
         self.optimizer.zero_grad()
+        if not self.training_config.freeze_router_correction_bias:
+            self.reset_router_correction_bias_accum(self.model)
 
         metric = self._finetune_step(batch, num_microbatches=num_microbatches)
 
@@ -247,6 +311,14 @@ class Fsdp2EngineLm(
             self.optimizer.zero_grad()
         else:
             self.optimizer.step()
+        if not self.training_config.freeze_router_correction_bias:
+            maxvio_max, maxvio_mean = self.update_router_correction_bias(
+                model=self.model,
+                update_speed=self.training_config.router_correction_bias_update_speed,
+                use_abs_update=self.training_config.router_correction_bias_use_abs_update,
+            )
+            metric["finetune/maxvio_max"] = maxvio_max
+            metric["finetune/maxvio_mean"] = maxvio_mean
         lr = self.step_and_get_lr()
 
         metric["finetune/grad_norm"] = grad_norm

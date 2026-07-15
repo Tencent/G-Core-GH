@@ -72,6 +72,7 @@ def _ring_all_to_all(
     return recv_flat.movedim(0, seq_dim).contiguous()
 
 
+# todo zz: support forward and reverse fold-prefix exchange
 class _SendLastAndPrepend(Function):
     r"""Send last ``k`` tokens along ``seq_dim`` to the next CP rank, recv
     the corresponding prefix from the previous CP rank, and **return the
@@ -283,6 +284,7 @@ def cp_chunk_data(
         If ``tokens.shape[1] % cp_size != 0``, or if ``position_ids`` is
         provided and its shape does not match ``tokens``.
     """
+    # todo zz: shard BSHD globally and THD independently per segment
     s_full = tokens.shape[1]
     assert s_full % cp_size == 0, (
         f"tokens seq_len ({s_full}) must be divisible by cp_size ({cp_size})"
@@ -347,6 +349,7 @@ def swa_ring_kv(
         Shape ``[B, 1, s_local + N_ring, head_dim]`` on rank > 0,
         ``[B, 1, s_local, head_dim]`` on rank 0.
     """
+    # todo zz: exchange both fold-half SWA prefixes per segment
     if cp_group is None:
         return kv_local
     cp_size = dist.get_world_size(cp_group)
@@ -385,6 +388,7 @@ def compressor_cp_ring(
         ``m`` on rank > 0, ``0`` on rank 0. Use as ``start_position`` offset
         for the compressor so window absolute positions stay correct.
     """
+    # todo zz: exchange per-segment folded compressor prefixes
     if cp_group is None:
         return hidden_states, 0
     cp_size = dist.get_world_size(cp_group)
@@ -434,6 +438,7 @@ def compressor_cp_ag(
     torch.Tensor
         Shape ``[B, 1, cp_size * n_local_windows, head_dim]``, same on all ranks.
     """
+    # todo zz: trim folded prefixes and restore global window order
     if cp_group is None:
         return local_compressed
     cp_size = dist.get_world_size(cp_group)
@@ -499,6 +504,7 @@ def build_cp_causal_mask(
         Shape ``[1, 1, s_local, s_local + swa_prefix_len]``.
         ``0.0`` for visible positions, ``-inf`` otherwise.
     """
+    # todo zz: build mask from folded q and KV position maps
     device = device or torch.device("cuda")
     q_pos = torch.arange(s_local, device=device) + cp_rank * s_local  # [s_local]
     k_pos = torch.arange(s_local + swa_prefix_len, device=device

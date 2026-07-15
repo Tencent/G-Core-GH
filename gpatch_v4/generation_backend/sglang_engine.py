@@ -31,6 +31,44 @@ from gpatch_v4.generation_backend.infer_engine import InferEngine
 from gpatch_v4.generation_backend.routed_experts_utils import extract_routed_experts
 from gpatch_v4.utils import log
 
+
+def cuda_graph_max_bs_args(value):
+    """Return the right kwarg dict for ServerArgs across sglang versions.
+
+    Older sglang uses ``cuda_graph_max_bs``; newer versions (>=0.5.5) split it
+    into ``cuda_graph_max_bs_decode`` and ``cuda_graph_max_bs_prefill``.
+    """
+    import dataclasses
+    fields = {f.name for f in dataclasses.fields(sgl.ServerArgs)}
+    if "cuda_graph_max_bs_decode" in fields:
+        return {"cuda_graph_max_bs_decode": value, "cuda_graph_max_bs_prefill": value}
+    return {"cuda_graph_max_bs": value}
+
+
+def save_sharded_model_kwargs(path, pattern=None, max_size=None):
+    """Return kwargs for ``Engine.save_sharded_model`` across sglang versions.
+
+    - sglang (e.g. 0.5.14): RPC target takes ``path`` / ``pattern`` /
+      ``max_size`` directly, so pass them as top-level kwargs.
+    - sglang (e.g. 0.5.10 with ``SchedulerUpdateWeightsMixin``): target is
+      ``save_sharded_model(self, params)`` and expects a single ``params`` dict.
+    """
+    import inspect
+
+    save_args = {"path": path, "pattern": pattern, "max_size": max_size}
+    try:
+        from sglang.srt.managers.scheduler_update_weights_mixin import (
+            SchedulerUpdateWeightsMixin,
+        )
+        params = inspect.signature(
+            SchedulerUpdateWeightsMixin.save_sharded_model
+        ).parameters
+        if "params" in params and "path" not in params:
+            return {"params": save_args}
+    except Exception:
+        pass
+    return save_args
+
 # sglang engine 这里有一些 TODO：
 # 1. 输入从 prompt_ids 换成 text
 # 2. 减少支持的版本，比如 0.4.6.post5 直接不支持了
@@ -299,6 +337,11 @@ class SglangEngine(InferEngine):
         else:
             await self.infer_engine.tokenizer_manager.resume_memory_occupation(obj, None)
 
+    async def _wait_for_idle(self, timeout_s: float = 30):
+        """Flush cache and wait for the scheduler to become idle.
+        """
+        await self.infer_engine.tokenizer_manager.flush_cache(timeout_s=timeout_s)
+
     @override
     async def sleep(self, *args, **kwargs):
         """Release memory occupation for specified tag groups."""
@@ -314,6 +357,7 @@ class SglangEngine(InferEngine):
         for tag in should_sleep_tags:
             self.wake_up_tag[tag] = False
 
+        await self._wait_for_idle()
         obj = ReleaseMemoryOccupationReqInput(*args, **kwargs)
         await self.infer_engine.tokenizer_manager.release_memory_occupation(obj, None)
 
@@ -323,6 +367,7 @@ class SglangEngine(InferEngine):
             log("release_kv_cache_for_weight_update: kv_cache already released", rank=0)
             return
         self.wake_up_tag["kv_cache"] = False
+        await self._wait_for_idle()
         obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
         await self.infer_engine.tokenizer_manager.release_memory_occupation(obj, None)
         log("SglangEngine release_kv_cache_for_weight_update done", rank=0)
@@ -431,10 +476,10 @@ class SglangEngine(InferEngine):
             Save result.
         """
         ret = self.infer_engine.save_sharded_model(
-            params={
-                "path": save_ckpt_path,
-                "pattern": None,
-                "max_size": (16 * 1024**3),
-            }
+            **save_sharded_model_kwargs(
+                path=save_ckpt_path,
+                pattern=None,
+                max_size=(16 * 1024**3),
+            ),
         )
         return ret

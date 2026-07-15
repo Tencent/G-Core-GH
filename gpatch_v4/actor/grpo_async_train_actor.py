@@ -192,10 +192,16 @@ class GrpoAsyncTrainActor(GrpoTrainActor):
 
         skip_prev = self.config.ppo.skip_prev_logps
         timers("compute_logps", log_level=0).start(barrier=True)
-        ref_logprobs, prev_logprobs = self.policy_engine.compute_log_probs(
-            rollout_batches,
-            compute_pre_logps=not skip_prev,
-        )
+        if self.config.policy.dist_config.dynamic_context_parallel:
+            ref_logprobs, prev_logprobs = self.policy_engine.compute_log_probs_dynamic_cp(
+                rollout_batches,
+                compute_pre_logps=not skip_prev,
+            )
+        else:
+            ref_logprobs, prev_logprobs = self.policy_engine.compute_log_probs(
+                rollout_batches,
+                compute_pre_logps=not skip_prev,
+            )
         cpu_barrier()
         timers("compute_logps").stop()
 

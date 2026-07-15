@@ -198,7 +198,7 @@ class UpdateWeightTest(unittest.IsolatedAsyncioTestCase):
     @requires_sglang
     async def test_colocate_sglang(self):
         """Colocate + sglang -> flattened IPC bucket path in
-        ``UpdateWeightIpcMixin._update_weights_by_ipc_handle_sglang``."""
+        ``UpdateWeightMixin`` / ``SglangUpdateWeightFactory.update_weights_by_ipc_handle``."""
         config = self._make_config("test_update_weight_colocate", "sglang")
         assert config.placement_type != "disaggregated"
         await self._run_debug(config, GrpoTrainer)
@@ -208,7 +208,7 @@ class UpdateWeightTest(unittest.IsolatedAsyncioTestCase):
     async def test_colocate_vllm(self):
         """Colocate + vllm -> ``IPCWeightTransferEngine`` /
         ``reduce_tensor`` path in
-        ``UpdateWeightIpcMixin._update_weights_by_bucketed_ipc_vllm``."""
+        ``UpdateWeightMixin`` / ``VllmUpdateWeightFactory._update_bucketed_ipc``."""
         config = self._make_config("test_update_weight_colocate", "vllm")
         assert config.placement_type != "disaggregated"
         await self._run_debug(config, GrpoTrainer)
@@ -219,7 +219,7 @@ class UpdateWeightTest(unittest.IsolatedAsyncioTestCase):
     # ------------------------------------------------------------------ #
     @requires_sglang
     async def test_disaggregated_sglang(self):
-        """Disaggregated + sglang -> ``_update_weights_by_distributed_sglang``
+        """Disaggregated + sglang -> ``SglangUpdateWeightFactory.update_weights_by_distributed``
         (flattened bucket broadcast over the trainer<->sampler NCCL group)."""
         config = self._make_config("test_math_rl_disaggregated", "sglang")
         assert config.placement_type == "disaggregated"
@@ -228,7 +228,7 @@ class UpdateWeightTest(unittest.IsolatedAsyncioTestCase):
 
     @requires_vllm
     async def test_disaggregated_vllm(self):
-        """Disaggregated + vllm -> ``_update_weights_by_distributed_vllm``
+        """Disaggregated + vllm -> ``VllmUpdateWeightFactory.update_weights_by_distributed``
         (two-pass bucketed NCCL broadcast + single
         ``gcore_finalize_weights_update`` RPC)."""
         config = self._make_config("test_math_rl_disaggregated", "vllm")

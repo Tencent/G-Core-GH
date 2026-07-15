@@ -57,7 +57,7 @@ try:
     from megatron.bridge.training.checkpointing import (
         apply_peft_adapter_filter_to_state_dict,
     )
-    
+
 except ImportError:
     lora_merged = None
     gather_lora_state_dict = None
@@ -70,7 +70,6 @@ except ImportError:
     LoRALinearSplitFC1UpGate = None
     LoRALinearSplitQKV = None
     apply_peft_adapter_filter_to_state_dict = None
-
 
 from gpatch_v4.configs.checkpoint_config import CheckpointConfig
 from gpatch_v4.core.parallel_state import cpu_barrier
@@ -86,6 +85,15 @@ from gpatch_v4.utils.common_utils import (
     save_args_json,
     sync_cuda_and_get_time,
 )
+
+
+def get_dataloader_save_path(checkpoint_config, iteration, dp_rank):
+    save_ckpt_path = checkpoint_config.save_ckpt_path
+    if not save_ckpt_path:
+        return None, None
+    out_dir = os.path.join(save_ckpt_path, f"dataloader/iter_{iteration:07d}")
+    state_path = os.path.join(out_dir, f"dp_rank_{dp_rank:03d}.pt")
+    return out_dir, state_path
 
 
 @contextlib.contextmanager
@@ -1063,6 +1071,12 @@ def save_checkpoint(
         adapter_hf_checkpoint_name = _get_hf_save_path(
             checkpoint_config, f"{iteration_to_delete}_adapter"
         )
+        merge_hf_checkpoint_name = _get_hf_save_path(
+            checkpoint_config, f"{iteration_to_delete}_merge"
+        )
+        dataloader_save_path, _ = get_dataloader_save_path(
+            checkpoint_config, iteration_to_delete, 0
+        )
         try:
             shutil.rmtree(checkpoint_name)
             log(
@@ -1085,12 +1099,28 @@ def save_checkpoint(
                 log(
                     f"successfully deleted adapter adapter_only hf checkpoint from iteration {iteration_to_delete:7d} at {checkpoint_config.save_ckpt_path}"
                 )
+                if checkpoint_config.save_merged_lora_weights:
+                    shutil.rmtree(merge_hf_checkpoint_name)
+                    log(
+                        f"successfully deleted merge hf checkpoint from iteration {iteration_to_delete:7d} at {checkpoint_config.save_ckpt_path}"
+                    )
         except Exception as e:
             log(
                 f'encountered exception "{e}" when trying to delete hf checkpoint from iteration {iteration_to_delete:7d} at {checkpoint_config.save_ckpt_path}'
             )
             # Any exception encountered in checkpoint deletion can be ignored and is not fatal.
             pass
+        if dataloader_save_path is not None and os.path.exists(dataloader_save_path):
+            try:
+                shutil.rmtree(dataloader_save_path)
+                log(
+                    f"successfully deleted dataloader state from iteration {iteration_to_delete:7d} at {checkpoint_config.save_ckpt_path}"
+                )
+            except Exception as e:
+                log(
+                    f'encountered exception "{e}" when trying to delete dataloader state from iteration {iteration_to_delete:7d} at {checkpoint_config.save_ckpt_path}'
+                )
+                pass
 
     def sorted_checkpoints(output_dir=None, checkpoint_prefix="iter_", use_mtime=True):
         ordering_and_checkpoint_path = []
@@ -1124,7 +1154,8 @@ def save_checkpoint(
         save_total_limit = checkpoint_config.save_total_limit
         if save_total_limit is None or save_total_limit <= 0:
             return
-        # Check if we should delete older checkpoint(s)
+        # Decide which iterations to drop from mcore ``iter_*`` dirs, then delete
+        # all related artifacts (mcore / hf / peft / dataloader) via delete_checkpoint.
         checkpoints_sorted = sorted_checkpoints(
             output_dir=output_dir, checkpoint_prefix="iter_", use_mtime=True
         )
@@ -1134,25 +1165,15 @@ def save_checkpoint(
         num_of_ckpt_to_delete = max(0, len(checkpoints_sorted) - save_total_limit)
         checkpoints_to_be_deleted = checkpoints_sorted[:num_of_ckpt_to_delete]
         for checkpoint in checkpoints_to_be_deleted:
+            regex_match = re.match(r".*iter_([0-9]+)", checkpoint)
+            if regex_match is None:
+                log(f"skipping unexpected checkpoint path [{checkpoint}] during rotate")
+                continue
+            iteration_to_delete = int(regex_match.group(1))
             log(
                 f"deleting older checkpoint [{checkpoint}] due to --gcore-save-total-limit={save_total_limit}."
             )
-            shutil.rmtree(checkpoint, ignore_errors=True)
-
-        # delete hf ckpts
-        hf_ckpt_sorted = sorted_checkpoints(
-            output_dir=os.path.join(output_dir, "hf"), checkpoint_prefix="", use_mtime=True
-        )
-        if len(hf_ckpt_sorted) <= save_total_limit:
-            return
-
-        num_of_ckpt_to_delete = max(0, len(hf_ckpt_sorted) - save_total_limit)
-        hf_ckpt_to_be_deleted = hf_ckpt_sorted[:num_of_ckpt_to_delete]
-        for ckpt in hf_ckpt_to_be_deleted:
-            log(
-                f"deleting older hf checkpoint [{ckpt}] due to --gcore-save-total-limit={save_total_limit}."
-            )
-            shutil.rmtree(ckpt, ignore_errors=True)
+            delete_checkpoint(iteration_to_delete)
 
     def async_cleanup(prev_iteration):
         delete_checkpoint(prev_iteration)

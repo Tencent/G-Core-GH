@@ -3,11 +3,21 @@ import torch
 
 try:
     import pybase64
-    from sglang.srt.layers.moe.routed_experts_capturer import (
+except ImportError:
+    pybase64 = None
+
+try:
+    # sglang moved this out of layers.moe (e.g. dsv4 / recent main)
+    from sglang.srt.state_capturer.routed_experts import (
         extract_routed_experts_from_meta_info,
     )
-except:
-    extract_routed_experts_from_meta_info = None
+except ImportError:
+    try:
+        from sglang.srt.layers.moe.routed_experts_capturer import (
+            extract_routed_experts_from_meta_info,
+        )
+    except ImportError:
+        extract_routed_experts_from_meta_info = None
 
 
 def extract_routed_experts(res):
@@ -59,13 +69,24 @@ def process_routed_experts(res, num_layers, moe_router_topk, return_dtype=torch.
         routed_experts = torch.tensor(routed_experts, dtype=return_dtype)
         return routed_experts
 
+    if isinstance(routed_experts, dict):
+        assert extract_routed_experts_from_meta_info is not None
+        routed_experts = extract_routed_experts_from_meta_info(
+            {"meta_info": {
+                "routed_experts": routed_experts
+            }}
+        )
+
     if isinstance(routed_experts, np.ndarray):
         routed_experts = torch.from_numpy(routed_experts)
     elif isinstance(routed_experts, torch.Tensor):
         pass
     else:
         # sglang >=0.5.7 base64 encoded string
-        assert extract_routed_experts_from_meta_info is not None
+        assert extract_routed_experts_from_meta_info is not None and pybase64 is not None, (
+            "routed_experts is base64-encoded but sglang extract helper / pybase64 "
+            "is unavailable; check sglang install and PYTHONPATH"
+        )
         routed_experts = np.frombuffer(
             pybase64.b64decode(routed_experts.encode("utf-8")), dtype=np.int32
         ).reshape(-1, num_layers, moe_router_topk)

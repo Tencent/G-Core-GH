@@ -406,6 +406,35 @@ def masked_mean(values: Tensor, mask: Tensor) -> Tensor:
     return values.sum() / torch.clamp_min(mask.sum(), 1)
 
 
+def masked_sum_per_seq(
+    values: Tensor,
+    mask: Tensor,
+    sample_mask: Optional[Tensor] = None,
+) -> Tensor:
+    """Sum over sequences of each sequence's token-mean.
+
+    Computes the per-row token-mean (over ``mask > 0`` positions), then sums
+    those means across rows. Dead rows (``sample_mask == 0``) are dropped from
+    the sum. The result is the numerator of seq-mean-token-mean; the caller
+    divides by the global active-sequence count.
+
+    Parameters
+    ----------
+    values : Tensor
+        Shape ``[B, S]`` per-token values.
+    mask : Tensor
+        Shape ``[B, S]``; ``1`` marks tokens that count toward the per-row mean.
+    sample_mask : Tensor, optional
+        Shape ``[B]``; ``1`` keeps the row, ``0`` drops it from the sum.
+    """
+    per_seq_sum = (values * mask).sum(dim=-1)
+    per_seq_count = mask.sum(dim=-1).clamp(min=1)
+    per_seq_mean = per_seq_sum / per_seq_count
+    if sample_mask is not None:
+        per_seq_mean = per_seq_mean * sample_mask
+    return per_seq_mean.sum()
+
+
 def masked_mean_list(values: List[Tensor], mask: List[Tensor], dim=None) -> Tensor:
     """Per-sample masked mean over a list of (values, mask) pairs."""
     res = []
@@ -573,19 +602,51 @@ def masked_global_topk_threshold(
 
 
 def pad_or_truncate_last_dim(
-    t: torch.Tensor, len: int, value, pad_with_random_token: bool = False, vocab_size: int = 0
+    t: torch.Tensor,
+    len: int,
+    value,
+    pad_with_random_token: bool = False,
+    vocab_size: int = 0,
+    truncate_left: bool = True,
+    valid_len: Optional[Union[int, torch.Tensor]] = None,
+    forbidden_token_ids: Optional[list] = None,
 ):
-    if pad_with_random_token:
-        if vocab_size == 0:
-            t = pad_by_repeating_tokens(t, len)
+    """Normalize the last dimension to ``len``.
+
+    ``valid_len`` identifies the real prefix before any existing right
+    padding.  Strip that padding first, then truncate the real sequence from
+    the left or right.  This prevents suffix truncation from retaining stale
+    smart-padding instead of real tokens.
+    """
+    if valid_len is not None:
+        if torch.is_tensor(valid_len):
+            assert valid_len.numel() == 1, f"valid_len must be scalar, got {valid_len.shape}"
+            valid_len = int(valid_len.item())
         else:
-            t = pad_by_random_tokens(t, len, vocab_size=vocab_size)
-    else:
-        if t.shape[-1] < len:
+            valid_len = int(valid_len)
+        assert 0 <= valid_len <= t.shape[-1], (
+            f"invalid valid_len {valid_len} for tensor shape {t.shape}"
+        )
+        t = t[..., :valid_len]
+
+    # Truncate before padding so truncate_left applies to real content even
+    # when random/repeated token padding is enabled.
+    if t.shape[-1] > len:
+        if truncate_left:
+            t = t[..., -len:]
+        else:
+            t = t[..., :len]
+    elif t.shape[-1] < len:
+        if pad_with_random_token:
+            if vocab_size == 0:
+                t = pad_by_repeating_tokens(t, len)
+            else:
+                t = pad_by_random_tokens(
+                    t, len, vocab_size=vocab_size, forbidden_token_ids=forbidden_token_ids
+                )
+        else:
             padded_len = len - t.shape[-1]
             t = torch.nn.functional.pad(t, (0, padded_len), value=value)
-        if t.shape[-1] > len:
-            t = t[..., :len]
     assert t.shape[-1] == len, f"len mismatch {t.shape} {len=}"
     return t
 
@@ -610,21 +671,42 @@ def pad_by_repeating_tokens(t: torch.Tensor, seq_len: int):
     return token
 
 
-def pad_by_random_tokens(t: torch.Tensor, seq_len: int, vocab_size: int = 0):
+def pad_by_random_tokens(
+    t: torch.Tensor, seq_len: int, vocab_size: int = 0, forbidden_token_ids=None
+):
     assert vocab_size > 0, f"vocab_size must be positive for random token padding, got {vocab_size}"
     old_len = t.shape[-1]
     padded_len = seq_len - old_len
     if padded_len > 0:
         gen = torch.Generator(device=t.device)
         gen.manual_seed(old_len)
-        random_tokens = torch.randint(
-            low=0,
-            high=vocab_size,
-            size=(*t.shape[:-1], padded_len),
-            dtype=t.dtype,
-            device=t.device,
-            generator=gen
-        )
+        # Drop forbidden ids that fall outside the valid vocab range.
+        forbidden = sorted(f for f in (forbidden_token_ids or []) if 0 <= f < vocab_size)
+        if forbidden:
+            # Sample from the reduced vocab so forbidden ids are never produced.
+            eff_vocab = vocab_size - len(forbidden)
+            assert eff_vocab > 0, f"forbidden_token_ids consume the whole vocab: {forbidden_token_ids}"
+            random_tokens = torch.randint(
+                low=0,
+                high=eff_vocab,
+                size=(*t.shape[:-1], padded_len),
+                dtype=t.dtype,
+                device=t.device,
+                generator=gen,
+            )
+            # Remap: for each forbidden id, shift values >= it up by one
+            # (processed in increasing order) so the result skips forbidden ids.
+            for f in forbidden:
+                random_tokens = random_tokens + (random_tokens >= f).to(t.dtype)
+        else:
+            random_tokens = torch.randint(
+                low=0,
+                high=vocab_size,
+                size=(*t.shape[:-1], padded_len),
+                dtype=t.dtype,
+                device=t.device,
+                generator=gen,
+            )
         token = torch.cat([t, random_tokens], dim=-1)
     else:
         token = t[..., :seq_len]
@@ -1343,6 +1425,126 @@ def from_parallel_logits_to_opd_topk_logprobs(
         global_target_logp = all_gather_from_context_parallel_region(global_target_logp)
 
     return global_target_logp  # [B, S, K]
+
+
+def opd_topk_logprobs_from_linear_ce(
+    linear_ce_backend,
+    linear_ce_output: Dict[str, Any],
+    target_ids: torch.Tensor,
+    ignore_cp: bool = False,
+) -> torch.Tensor:
+    """在指定 token ids 上 gather log-probs（linear_ce 融合版，不物化完整 logits）。
+
+    :func:`from_parallel_logits_to_opd_topk_logprobs` 的融合等价实现：前者需要外部先
+    物化 ``[B, S, V_p]`` 的完整 logits，本函数直接从 ``hidden @ weight`` 计算，显存与
+    ``logprobs_from_linear_ce`` 一致。数学恒等式
+
+    ``logp(id_k) = logp(id_0) + (logit(id_k) - logit(id_0))``
+
+    其中 ``logp(id_0)`` 由 linear_cross_entropy kernel 在线求出全局 log-sum-exp
+    （TP-global，无完整 logits），``logit(id_k) - logit(id_0)`` 只需 K 次 ``[T, H]``
+    权重行 gather 点积，故全局归一化项在差分里解析约掉、又通过 ``logp(id_0)`` 重新锚定。
+    autograd 下三项梯度合成后等于 ``weight[id_k] - E_p[weight]``，与非融合版一致。
+
+    Parameters
+    ----------
+    linear_ce_output : dict
+        Model output dict，键含 ``hidden_states`` ``[local_S, B, H]``、``weight``
+        ``[V_p, H]``、``output_layer``。
+    target_ids : torch.Tensor
+        全局 vocab ids ``[B, S, K]``，调用方需自行对齐 predict-next 位移与 response
+        截取（约定同 :func:`from_parallel_logits_to_opd_topk_logprobs`）。``K >= 1``。
+    ignore_cp : bool
+        跳过 CP 切分（如 ``ppo_pack_seq`` 已拼接序列时设 True）。
+
+    Returns
+    -------
+    torch.Tensor
+        ``[B, S, K]`` log-probs，所有 TP rank 一致，连接 autograd。
+    """
+    set_linear_ce_backend(linear_ce_backend)
+
+    cp_rank = mpu.get_context_parallel_rank() if not ignore_cp else 0
+    cp_size = mpu.get_context_parallel_world_size() if not ignore_cp else 1
+    b, s, k = target_ids.shape
+    assert k >= 1, f'{k=} must be >= 1'
+    assert s % cp_size == 0, f'{s=} {cp_size=}'
+    local_s = s // cp_size
+
+    if cp_size > 1 and not ignore_cp:
+        target_ids = reorder_target_for_cp(target_ids, seq_dim=1)
+    local_ids = target_ids[:, cp_rank * local_s:(cp_rank + 1) * local_s, :]  # [B, local_s, K]
+
+    hidden_states = linear_ce_output["hidden_states"]  # [local_s, B, H]
+    output_layer = linear_ce_output["output_layer"]
+    tp_group = output_layer.tp_group
+    if output_layer.sequence_parallel:
+        hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+            hidden_states,
+            tensor_parallel_output_grad=True,
+        )
+    elif tp_group is not None and dist.get_world_size(tp_group) > 1:
+        assert not hidden_states.requires_grad, (
+            "linear_cross_entropy backward does not all-reduce d_hidden across TP ranks. "
+            "With TP > 1, sequence_parallel=False, and hidden requiring grad, "
+            "d_hidden would be incorrect. Enable sequence_parallel or use vocab_parallel_cross_entropy."
+        )
+
+    weight = linear_ce_output["weight"]
+    if weight is None:
+        weight = output_layer.weight  # [V_p, H]
+
+    local_ids = local_ids.to(hidden_states.device, dtype=torch.long)
+
+    # logp(id_0)：以第 0 列作 label 走融合 kernel 拿到全局归一化后的锚点（含 log-sum-exp）。
+    # label 选取不影响 log-sum-exp（在差分里约掉），第 0 列复用现成 id 即可。
+    label0 = local_ids[..., 0].transpose(0, 1).contiguous()  # [local_s, B]
+    logp_id0 = -1 * linear_cross_entropy(
+        hidden_states,
+        weight,
+        label0,
+        1.0,
+        "none",
+        tp_group,
+    )  # [local_s, B]
+
+    # 相对 logit：logit(id_k) - logit(id_0)。TP 下只在拥有该 id 的 rank 上算，其余置零，
+    # 再 TP SUM all-reduce（保留梯度）。fp32 点积累加与非融合版 logits.float() 对齐。
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    tp_world_size = mpu.get_tensor_model_parallel_world_size()
+    tp_reduce_group = mpu.get_tensor_model_parallel_group()
+    partition_vocab_size = weight.shape[0]
+    vocab_start_index, vocab_end_index = (
+        tensor_parallel.utils.VocabUtility.vocab_range_from_per_partition_vocab_size(
+            partition_vocab_size, tp_rank, tp_world_size
+        )
+    )
+
+    h = hidden_states.shape[-1]
+    hidden_flat = hidden_states.reshape(-1, h).float()  # [T, H], T = local_s * B
+    ids_flat = local_ids.transpose(0, 1).reshape(-1, k).contiguous()  # [T, K]
+    in_range = (ids_flat >= vocab_start_index) & (ids_flat < vocab_end_index)  # [T, K]
+    local_indices = (ids_flat - vocab_start_index).clamp(0, partition_vocab_size - 1)  # [T, K]
+
+    # 逐列 gather 权重行做点积，避免物化 [T, K, H] 的中间张量。
+    logit_cols = []
+    for kk in range(k):
+        w_kk = weight.index_select(0, local_indices[:, kk]).float()  # [T, H]
+        logit_cols.append((hidden_flat * w_kk).sum(dim=-1))  # [T]
+    local_topk_logit = torch.stack(logit_cols, dim=-1)  # [T, K]
+    local_topk_logit = torch.where(in_range, local_topk_logit, torch.zeros_like(local_topk_logit))
+    global_topk_logit = all_reduce_autograd(local_topk_logit, group=tp_reduce_group)  # [T, K]
+    global_topk_logit = global_topk_logit.view(local_s, b, k)  # [local_s, B, K]
+
+    logp = (
+        logp_id0.unsqueeze(-1) + global_topk_logit - global_topk_logit[..., 0:1]
+    )  # [local_s, B, K]
+    logp = logp.transpose(0, 1).contiguous()  # [B, local_s, K]
+
+    if cp_size > 1 and not ignore_cp:
+        logp = all_gather_from_context_parallel_region(logp)  # [B, S, K]
+
+    return logp
 
 
 def get_dump_moe_metrics(is_full_recompute=False, num_samples=None):

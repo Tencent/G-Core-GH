@@ -27,6 +27,11 @@ training:
   metrics_report:
     - "acc_reward"
     - "fmt_reward"
+  # For FSDP2 DeepSeek-V4 TopKRouter
+  freeze_router_weight: False
+  freeze_router_correction_bias: True
+  router_correction_bias_update_speed: 1e-3
+  router_correction_bias_use_abs_update: True
 
 checkpoint:
   load_ckpt_path: ckpt_math_dsv4_grpo_vllm_colocate
@@ -63,9 +68,9 @@ policy:
   model_arch: "deepseek_v4"
   attn_implementation: "eager"
   without_ref: True
-  hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_small"
-  hf_tokenizer_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_small"
-  ref_hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_small"
+  hf_model_path: "hf-hub/sgl-project/DeepSeek-V4-Flash-FP8_small"
+  hf_tokenizer_path: "hf-hub/sgl-project/DeepSeek-V4-Flash-FP8_small"
+  ref_hf_model_path: "hf-hub/sgl-project/DeepSeek-V4-Flash-FP8_small"
   sampler_client:
     rpc_type: ray
     update_weight_max_size_mb: 256
@@ -74,12 +79,12 @@ policy:
     rpc_type: ray
 
 sampler:
-  backend: vllm
+  backend: sglang
   dist_config:
     nnodes: -1
   model_info:
     - model_arch: "deepseek_v4"
-      hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_small"
+      hf_model_path: "hf-hub/sgl-project/dsv4_flash_fp8_small_zero_weight"
   infer_engine_configs:
     - dist_config:
         tensor_model_parallel_size: 8
@@ -92,10 +97,8 @@ sampler:
       override_infer_engine_config:
         tokenizer_mode: deepseek_v4
         reasoning_parser: deepseek_v4
-        block_size: 256
-        kv_cache_dtype: fp8
-        enable_expert_parallel: True
-        async_scheduling: False
+        swa_full_tokens_ratio: 0.3
+        prefill_max_requests: 32
 
 bt_rm:
   dist_config:
@@ -103,7 +106,7 @@ bt_rm:
   reward_type: "rule_only"
   reward_model_info:
     - model_arch: "deepseek_v4"
-      hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash_small"
+      hf_model_path: "hf-hub/sgl-project/DeepSeek-V4-Flash-FP8_small"
       reward_py_path: tasks/math_rl_v4/bt_reward_dapo.py
       parse_reward_fn_name: dapo_math_rule_reward
       reward_weight: 1.0

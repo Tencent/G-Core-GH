@@ -333,3 +333,8 @@ class RayTrainGroup:
         futs = [actor.save_checkpoint.remote(step) for actor in self._actor_handlers]
         for fut in futs:
             await fut
+
+    async def prepare_for_final_save(self):
+        futs = [actor.prepare_for_final_save.remote() for actor in self._actor_handlers]
+        for fut in futs:
+            await fut

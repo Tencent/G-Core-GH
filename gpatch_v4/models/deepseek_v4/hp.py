@@ -20,6 +20,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from .checkpoint import _load_checkpoint_hp, _save_checkpoint_hp
+from .fp8 import MyGroupedLinearFp8
 from .mtp import DeepseekV4MTPBlock
 
 # pyright: reportAttributeAccessIssue=false, reportArgumentType=false, reportCallIssue=false, reportOperatorIssue=false, reportGeneralTypeIssues=false
@@ -127,6 +128,8 @@ def apply_hp(
     *,
     amp_fp32: bool = True,
     fp8_qat: bool = False,
+    fp4_qat: bool = False,
+    fp8: bool = False,
 ) -> nn.Module:
     """Shard experts for EP, apply FSDP2, and bind ``clip_grad_norm_`` / ``load_checkpoint_hp`` / ``save_checkpoint_hp``.
 
@@ -185,6 +188,15 @@ def apply_hp(
         on KV nope dims, compressor compressed KV nope dims, and
         indexer query/key nope dims. Simulates inference-time FP8
         quantization noise so the model learns to be robust.
+    fp4_qat : bool, keyword-only, default False
+        Enable E2M1 1×32 fake-quantization of routed MoE expert weights.
+        When both QAT flags are enabled, this takes priority over
+        ``fp8_qat`` for these weights.
+    fp8 : bool, keyword-only, default False
+        When True, MoE expert ``gate_up`` / ``down`` grouped GEMMs use
+        TE Float8BlockScaling via :class:`MyGroupedLinearFp8` (stacked
+        ``[E,N,K]`` weights; auto-pads per-expert M to 16). Orthogonal
+        to ``fp8_qat`` (fake-quant STE). Requires Transformer Engine.
 
     Returns
     -------
@@ -217,6 +229,8 @@ def apply_hp(
     model.config.deepep_num_sms = deepep_num_sms
     model.config.amp_fp32 = amp_fp32
     model.config.fp8_qat = fp8_qat
+    model.config.fp4_qat = fp4_qat
+    model.config.fp8 = fp8
     # Sync backend knobs to every DeepseekV4Attention / DeepseekV4Experts
     # (including MTP blocks), because MTP blocks are constructed before
     # apply_hp runs, and their self.self_attn.config is a deepcopy that
@@ -230,6 +244,8 @@ def apply_hp(
             layer.config.deepep_num_sms = deepep_num_sms
             layer.config.amp_fp32 = amp_fp32
             layer.config.fp8_qat = fp8_qat
+            layer.config.fp4_qat = fp4_qat
+            layer.config.fp8 = fp8
             assert layer.self_attn.config.attn_backend == attn_backend
 
     if mp_policy is None:
@@ -256,6 +272,11 @@ def apply_hp(
     with torch.no_grad():
         for layer in layers:
             _shard_experts_dtensor(layer.mlp.experts, ep_2d_mesh)
+
+    if fp8:
+        for layer in layers:
+            experts = layer.mlp.experts
+            experts.fp8_grouped_linear = MyGroupedLinearFp8(num_gemms=experts.num_local_experts, )
 
     # Effective number of independent samples = world_size / cp_size.
     # Inside a cp-pair, all ranks see the same input (sequence partitioned

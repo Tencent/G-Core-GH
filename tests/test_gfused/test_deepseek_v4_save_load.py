@@ -12,6 +12,12 @@
 
 任何非零 diff 都表示 bug（EP gather 顺序 / weight_map / quantization_config 未剥离等）。
 
+另外新增 e_score_correction_bias 专项 round-trip（``test_e_score_bias_roundtrip_*``）：
+  1. 加载真实权重后，把所有 router 的 ``e_score_correction_bias`` 覆写成
+     distinct dummy values（不同层 router / 同 router 不同 expert 位置数值都不同）；
+  2. ``save_checkpoint_hp`` → 重新 ``load_checkpoint_hp`` → 逐 buffer bit-equal 比较。
+分别覆盖 quantized / bf16 两条保存路径（该 buffer 均走 f32_passthrough，保 fp32）。
+
 Usage::
 
     cd /work/wepsdl/gcore-dev
@@ -181,6 +187,74 @@ def _stream_full_state_dict(model: torch.nn.Module, on_rank0=None) -> int:
         torch.cuda.empty_cache()
         n += 1
     return n
+
+
+# ---------------------------------------------------------------------------
+# e_score_correction_bias round-trip helpers
+# ---------------------------------------------------------------------------
+#
+# ``e_score_correction_bias`` 是 DeepseekV4TopKRouter 上的 persistent buffer
+# （replicated 普通 fp32 tensor，非 DTensor）。save 时映射到 disk key
+# ``layers.{i}.ffn.gate.bias`` 走 f32_passthrough（quantized / bf16 两条路径
+# 都保 fp32），因此 dummy 值可 bit-equal round-trip。
+#
+
+def _iter_e_score_bias_names(model: torch.nn.Module) -> list[str]:
+    """按确定性（排序后）顺序返回所有 TopKRouter e_score_correction_bias buffer 名。
+
+    排序保证跨 rank 的枚举顺序一致（dummy 值与 buffer 的绑定对每个 rank 相同）。
+    """
+    names = [
+        name for name, _ in model.named_buffers()
+        if name.endswith("e_score_correction_bias")
+    ]
+    return sorted(names)
+
+
+def _make_dummy_e_score_bias(idx: int, num_experts: int) -> torch.Tensor:
+    """为第 ``idx`` 个 router 生成一批 distinct fp32 dummy。
+
+    * ``base = 100 * (idx + 1)`` —— 区分不同层  router；
+    * ``ramp = arange(E) * 0.01`` —— 区分同一 router 内不同 expert 位置。
+
+    不同 router 的取值区间互不相交（间隔 100 ≫ ramp 最大值），且每个元素的
+    间距（0.01）远大于该量级下的 fp32 ULP，任何"层错配 / expert 错序"都会被
+    bit-equal 比较捕获。
+    """
+    base = 100.0 * (idx + 1)
+    ramp = torch.arange(num_experts, dtype=torch.float32) * 0.01
+    return base + ramp
+
+
+def _set_dummy_e_score_bias(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """把 model 内所有 e_score_correction_bias 覆写成 distinct dummy。
+
+    返回 ``{name: cpu fp32 tensor}`` 作为期望值。buffer 是 replicated，每个
+    rank 写入相同的确定性值。
+    """
+    buffers = dict(model.named_buffers())
+    expected: dict[str, torch.Tensor] = {}
+    for idx, name in enumerate(_iter_e_score_bias_names(model)):
+        buf = buffers[name]
+        assert not isinstance(buf, DTensor), (
+            f"{name}: expected replicated plain-tensor buffer, got DTensor"
+        )
+        assert buf.dtype == torch.float32, f"{name}: expected fp32 buffer, got {buf.dtype}"
+        dummy = _make_dummy_e_score_bias(idx, buf.shape[-1])
+        with torch.no_grad():
+            buf.copy_(dummy.to(device=buf.device))
+        # 存实际写进 buffer 的值（fp32 cpu 快照），避免任何隐性 dtype 偏差。
+        expected[name] = buf.detach().float().cpu().clone()
+    return expected
+
+
+def _collect_e_score_bias(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """收集 model 内所有 e_score_correction_bias 的 fp32 cpu 快照。"""
+    buffers = dict(model.named_buffers())
+    return {
+        name: buffers[name].detach().float().cpu().clone()
+        for name in _iter_e_score_bias_names(model)
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +551,155 @@ def _save_load_worker(
     return {"rank": rank, "ok": True, "n_keys": len(sd_ref) if rank == 0 else None}
 
 
+@ray.remote(num_gpus=1)
+def _bias_roundtrip_worker(
+    hf_model_path: str,
+    save_dir: str,
+    rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
+    ep_size: int,
+    cp_size: int,
+    dtype_format: str,
+):
+    """e_score_correction_bias 专项 round-trip：set dummy → save → reload → compare。
+
+    流程
+    ----
+    1. meta 构造 DeepseekV4ForCausalLM + apply_hp（绑定 EP/CP/FSDP2），再
+       ``load_checkpoint_hp(hf_model_path)`` 加载真实权重（save 需要非 meta 权重）。
+    2. 把所有 ``e_score_correction_bias`` 覆写成 distinct dummy（不同层 router /
+       同 router 不同 expert 位置都用不同数值）。
+    3. ``save_checkpoint_hp`` 落盘。
+    4. 重新 meta 构造 + apply_hp + ``load_checkpoint_hp(save_dir)``。
+    5. 逐 buffer 比较 reload 后的值是否与 dummy bit-equal。
+    """
+    from datetime import timedelta
+
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
+    torch.cuda.set_device(0)
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(hours=2),
+    )
+
+    assert world_size % ep_size == 0
+    assert world_size % cp_size == 0
+    ep_2d_mesh = init_device_mesh(
+        "cuda",
+        mesh_shape=(world_size // ep_size, ep_size),
+        mesh_dim_names=("ep_fsdp", "ep"),
+    )
+    cp_full_mesh = init_device_mesh(
+        "cuda",
+        mesh_shape=(world_size // cp_size, cp_size),
+        mesh_dim_names=("dp", "cp"),
+    )
+    cp_mesh = cp_full_mesh["cp"]
+
+    # NCCL warmup 前置 handshake，避免 rank 0 长时间 load 期间其他 rank 超时。
+    dist.barrier()
+
+    config = DeepseekV4Config.from_pretrained(hf_model_path)
+    _truncate_config(config)
+    assert not config.tie_word_embeddings, (
+        "meta-device init may hang with tie_word_embeddings=True"
+    )
+
+    prev_dtype = torch.get_default_dtype()
+
+    # ------------------------------------------------------------------
+    # Phase 1: 构造 model1 + apply_hp + load 真实权重
+    # ------------------------------------------------------------------
+    print(f"[rank {rank}] bias phase 1: build meta model1 + load_checkpoint_hp(orig) ...", flush=True)
+    torch.set_default_dtype(torch.float32)
+    try:
+        with torch.device("meta"):
+            model1 = DeepseekV4ForCausalLM(config)
+    finally:
+        torch.set_default_dtype(prev_dtype)
+    model1 = apply_hp(model1, ep_2d_mesh, cp_mesh=cp_mesh, amp_fp32=False)
+    model1.load_checkpoint_hp(hf_model_path)
+
+    # ------------------------------------------------------------------
+    # Phase 2: 覆写所有 e_score_correction_bias 为 distinct dummy
+    # ------------------------------------------------------------------
+    expected = _set_dummy_e_score_bias(model1)
+    assert len(expected) > 0, (
+        f"no e_score_correction_bias buffers found; bump NUM_LAYERS "
+        f"(={NUM_LAYERS}) so at least one TopK-MoE layer is included"
+    )
+    if rank == 0:
+        preview = sorted(expected)[:4]
+        print(
+            f"[rank 0] bias phase 2: set dummy on {len(expected)} "
+            f"e_score_correction_bias buffers, e.g. {preview}",
+            flush=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 3: save
+    # ------------------------------------------------------------------
+    print(f"[rank {rank}] bias phase 3: save_checkpoint_hp(dtype_format={dtype_format!r}) ...", flush=True)
+    model1.save_checkpoint_hp(save_dir, orig_ckpt_dir=hf_model_path, dtype_format=dtype_format)
+    dist.barrier()
+    del model1
+    torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Phase 4: 重新构造 model2 + load from save_dir
+    # ------------------------------------------------------------------
+    print(f"[rank {rank}] bias phase 4: build meta model2 + load_checkpoint_hp(save_dir) ...", flush=True)
+    torch.set_default_dtype(torch.float32)
+    try:
+        with torch.device("meta"):
+            model2 = DeepseekV4ForCausalLM(config)
+    finally:
+        torch.set_default_dtype(prev_dtype)
+    model2 = apply_hp(model2, ep_2d_mesh, cp_mesh=cp_mesh, amp_fp32=False)
+    model2.load_checkpoint_hp(save_dir)
+
+    # ------------------------------------------------------------------
+    # Phase 5: 比对（buffer 是 replicated，每个 rank 独立验证自己的副本）
+    # ------------------------------------------------------------------
+    got = _collect_e_score_bias(model2)
+    assert set(got) == set(expected), (
+        f"bias buffer name set changed after round-trip:\n"
+        f"  only in expected: {sorted(set(expected) - set(got))[:8]}\n"
+        f"  only in got:      {sorted(set(got) - set(expected))[:8]}"
+    )
+    mismatches = []
+    for name in sorted(expected):
+        e, g = expected[name], got[name]
+        if e.shape != g.shape or not torch.equal(e, g):
+            diff = (e - g).abs().max().item() if e.shape == g.shape else float("nan")
+            mismatches.append((name, diff, e[:4].tolist(), g[:4].tolist()))
+    assert not mismatches, (
+        f"[rank {rank}] e_score_correction_bias round-trip mismatch on "
+        f"{len(mismatches)}/{len(expected)} buffers (dtype_format={dtype_format!r}); "
+        f"first few:\n" + "\n".join(
+            f"  {n}: max_abs_diff={d:.3e} expected[:4]={ev} got[:4]={gv}"
+            for n, d, ev, gv in mismatches[:8]
+        )
+    )
+    if rank == 0:
+        print(
+            f"[rank 0] bias phase 5 PASS: {len(expected)} e_score_correction_bias "
+            f"buffers bit-equal after {dtype_format!r} round-trip",
+            flush=True,
+        )
+
+    del model2
+    torch.cuda.empty_cache()
+    dist.barrier()
+    dist.destroy_process_group()
+    return {"rank": rank, "ok": True, "n_bias": len(expected)}
+
+
 # ---------------------------------------------------------------------------
 # Test class
 # ---------------------------------------------------------------------------
@@ -513,6 +736,14 @@ class TestDeepseekV4SaveLoad(unittest.TestCase):
         """BF16 路径：与原 §9/§10 实现行为一致（回归保护）。"""
         # NOTE: it saves bf16 (mostly) and fp32
         self._run_with_dtype_format("bf16")
+
+    def test_e_score_bias_roundtrip_quantized(self):
+        """e_score_correction_bias dummy → save/load(quantized) → bit-equal。"""
+        self._run_bias_roundtrip("quantized", master_port_base=12800)
+
+    def test_e_score_bias_roundtrip_bf16(self):
+        """e_score_correction_bias dummy → save/load(bf16) → bit-equal。"""
+        self._run_bias_roundtrip("bf16", master_port_base=12810)
 
     def _run_with_dtype_format(
         self,
@@ -575,3 +806,63 @@ class TestDeepseekV4SaveLoad(unittest.TestCase):
         self.assertGreater(len(shards), 0, "no safetensors shards were written")
         print(f"\nSAVE_DIR layout: {len(shards)} shard(s), index.json + config.json present")
         print(f"PASSED (dtype_format={dtype_format!r})")
+
+    def _run_bias_roundtrip(
+        self,
+        dtype_format: str,
+        world_size: int = NUM_GPUS,
+        ep_size: int = EP_SIZE,
+        cp_size: int = CP_SIZE,
+        master_port_base: int = 12800,
+    ):
+        """set dummy e_score_correction_bias → save → reload → 逐 buffer bit-equal。"""
+        assert os.path.isdir(HF_MODEL_PATH), (
+            f"model dir not found: {HF_MODEL_PATH}; "
+            f"download DeepSeek-V4-Flash into hf-hub/ first"
+        )
+
+        pg = placement_group(
+            [{"GPU": 1, "CPU": 1}] * world_size, strategy="PACK",
+        )
+        ray.get(pg.ready())
+
+        master_addr = ray.get(
+            _get_node_ip.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg, placement_group_bundle_index=0,
+                )
+            ).remote()
+        )
+
+        futures = [
+            _bias_roundtrip_worker.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg, placement_group_bundle_index=r,
+                )
+            ).remote(
+                HF_MODEL_PATH,
+                SAVE_DIR,
+                rank=r,
+                world_size=world_size,
+                master_addr=master_addr,
+                master_port=master_port_base,
+                ep_size=ep_size,
+                cp_size=cp_size,
+                dtype_format=dtype_format,
+            )
+            for r in range(world_size)
+        ]
+        results = ray.get(futures)
+        remove_placement_group(pg)
+
+        for r, res in enumerate(results):
+            self.assertTrue(res["ok"], f"rank {r} returned {res}")
+
+        n_bias = results[0]["n_bias"]
+        self.assertGreater(
+            n_bias, 0, "no e_score_correction_bias buffers were exercised"
+        )
+        print(
+            f"\nPASSED e_score_correction_bias round-trip "
+            f"(dtype_format={dtype_format!r}): {n_bias} buffers bit-equal"
+        )

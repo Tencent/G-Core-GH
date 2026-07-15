@@ -158,21 +158,20 @@ def get_lr_scheduler(config, optimizer: torch.optim.Optimizer) -> FSDPLRSchedule
     lr_decay_steps = optimizer_config.lr_decay_steps
     lr_warmup_steps = optimizer_config.lr_warmup_steps
 
-    if config.training.get("total_ppo_step", None) is not None:
+    if config.training.get("total_ppo_step") is not None:
         wd_incr_steps = config.training.total_ppo_step
     else:
         wd_incr_steps = config.training.total_training_step
 
-    if optimizer_config.get("lr_decay_steps", None) is None:
+    if optimizer_config.get("lr_decay_steps") is None:
         lr_decay_steps = wd_incr_steps
 
     wsd_decay_steps = None
-    if optimizer_config.get("lr_wsd_decay_steps", None) is not None:
+    if optimizer_config.get("lr_wsd_decay_steps") is not None:
         wsd_decay_steps = optimizer_config.lr_wsd_decay_steps
 
-    if optimizer_config.get("lr_warmup_step_frac", None) is not None and (
-        optimizer_config.get("lr_warmup_steps", None) is None or
-        optimizer_config.lr_warmup_steps <= 0
+    if optimizer_config.get("lr_warmup_step_frac") is not None and (
+        optimizer_config.get("lr_warmup_steps") is None or optimizer_config.lr_warmup_steps <= 0
     ):
         lr_warmup_steps = int(optimizer_config.lr_warmup_step_frac * lr_decay_steps)
 

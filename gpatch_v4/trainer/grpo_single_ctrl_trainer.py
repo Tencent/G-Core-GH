@@ -309,6 +309,7 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
 
         # final save checkpoint, 避免 train_step % training_cfg.save_interval 保存两次
         if train_step % training_cfg.save_interval != 0:
+            await tg.prepare_for_final_save()
             await tg.save_checkpoint(train_step)
 
         return ret_metrics

@@ -27,6 +27,11 @@ training:
   exit_step: 5                     # smoke
   recompute: True
   enable_mtp: False
+  # For FSDP2 DeepSeek-V4 TopKRouter
+  freeze_router_weight: False
+  freeze_router_correction_bias: True
+  router_correction_bias_update_speed: 1e-3
+  router_correction_bias_use_abs_update: True
 
 policy:
   dist_config:
@@ -38,6 +43,7 @@ policy:
   ppo_pack_seq: True
   attn_implementation: "fused"
   indexer_backend: "fused"
+  fp8: false                      # TE FP8 block-scaling MoE grouped GEMM
   without_ref: True
   hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
   hf_tokenizer_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
@@ -70,4 +76,3 @@ data:
 
 debug:
   save_first_rollout_data: True
-  debug_truncate_num_hidden_layers: 4

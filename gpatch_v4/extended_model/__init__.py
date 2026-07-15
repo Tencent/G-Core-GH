@@ -52,6 +52,26 @@ try:
 except ImportError:
     WelmOmniV45PrepareDataForward = None
 
+from gpatch_v4.extended_model.base import (
+    PostInitModel,
+    CheckpointContextFn,
+    ResetRouterCorrectionBiasAccum,
+    UpdateRouterCorrectionBias,
+)
+
+try:
+    from gpatch_v4.extended_model.deepseek_v4 import (
+        DeepseekV4PostInitModel,
+        DeepseekV4CheckpointContextFn,
+        DeepseekV4ResetRouterCorrectionBiasAccum,
+        DeepseekV4UpdateRouterCorrectionBias,
+    )
+except ImportError:
+    DeepseekV4PostInitModel = None
+    DeepseekV4CheckpointContextFn = None
+    DeepseekV4ResetRouterCorrectionBiasAccum = None
+    DeepseekV4UpdateRouterCorrectionBias = None
+
 DEFAULT = "default"
 
 REGISTER_APPLY_SAMPLING_ROLLOUT_ATTR = {
@@ -184,6 +204,46 @@ REGISTER_DPO_PREPARE_DATA_FORWARD = {
         Qwen3VLDpoPrepareDataForward,
 }
 
+REGISTER_POST_INIT_MODEL = {
+    DEFAULT:
+        PostInitModel,
+    **(
+        {
+            MODEL_ARCH.DEEPSEEK_V4: DeepseekV4PostInitModel,
+        } if DeepseekV4PostInitModel else {}
+    )
+}
+
+REGISTER_CHECKPOINT_CONTEXT_FN = {
+    DEFAULT:
+        CheckpointContextFn,
+    **(
+        {
+            MODEL_ARCH.DEEPSEEK_V4: DeepseekV4CheckpointContextFn,
+        } if DeepseekV4CheckpointContextFn else {}
+    )
+}
+
+REGISTER_RESET_ROUTER_CORRECTION_BIAS_ACCUM = {
+    DEFAULT:
+        ResetRouterCorrectionBiasAccum,
+    **(
+        {
+            MODEL_ARCH.DEEPSEEK_V4: DeepseekV4ResetRouterCorrectionBiasAccum,
+        } if DeepseekV4ResetRouterCorrectionBiasAccum else {}
+    )
+}
+
+REGISTER_UPDATE_ROUTER_CORRECTION_BIAS = {
+    DEFAULT:
+        UpdateRouterCorrectionBias,
+    **(
+        {
+            MODEL_ARCH.DEEPSEEK_V4: DeepseekV4UpdateRouterCorrectionBias,
+        } if DeepseekV4UpdateRouterCorrectionBias else {}
+    )
+}
+
 
 class ApplySamplingRolloutAttrFactory:
     """Factory for rollout attribute handlers."""
@@ -263,3 +323,83 @@ class PrepareDataForwardFactory:
             return register_clss[config.policy.model_arch](config)
 
         return register_clss[DEFAULT](config)
+
+
+class PostInitModelFactory:
+    """Factory for post-init model handlers."""
+    @staticmethod
+    def get_post_init_model(config):
+        """Return the appropriate post-initialization model handler.
+
+        Parameters
+        ----------
+        config : object
+
+        Returns
+        -------
+        PostInitModel
+        """
+        if config.policy.model_arch in REGISTER_POST_INIT_MODEL:
+            return REGISTER_POST_INIT_MODEL[config.policy.model_arch](config)
+
+        return REGISTER_POST_INIT_MODEL[DEFAULT](config)
+
+
+class CheckpointContextFnFactory:
+    """Factory for torch.utils.checkpoint.checkpoint context_fn."""
+    @staticmethod
+    def get_checkpoint_context_fn(config):
+        """Return the appropriate torch.utils.checkpoint.checkpoint context_fn.
+
+        Parameters
+        ----------
+        config : object
+
+        Returns
+        -------
+        CheckpointContextFn
+        """
+        if config.policy.model_arch in REGISTER_CHECKPOINT_CONTEXT_FN:
+            return REGISTER_CHECKPOINT_CONTEXT_FN[config.policy.model_arch](config)
+
+        return REGISTER_CHECKPOINT_CONTEXT_FN[DEFAULT](config)
+
+
+class ResetRouterCorrectionBiasAccumFactory:
+    """Factory for reset router correction bias accum handlers."""
+    @staticmethod
+    def get_reset_router_correction_bias_accum(config):
+        """Return the appropriate reset_router_correction_bias_accum handler.
+
+        Parameters
+        ----------
+        config : object
+
+        Returns
+        -------
+        ResetRouterCorrectionBiasAccum
+        """
+        if config.policy.model_arch in REGISTER_RESET_ROUTER_CORRECTION_BIAS_ACCUM:
+            return REGISTER_RESET_ROUTER_CORRECTION_BIAS_ACCUM[config.policy.model_arch](config)
+
+        return REGISTER_RESET_ROUTER_CORRECTION_BIAS_ACCUM[DEFAULT](config)
+
+
+class UpdateRouterCorrectionBiasFactory:
+    """Factory for update router correction bias handlers."""
+    @staticmethod
+    def get_update_router_correction_bias(config):
+        """Return the appropriate update_router_correction_bias handler.
+
+        Parameters
+        ----------
+        config : object
+
+        Returns
+        -------
+        UpdateRouterCorrectionBias
+        """
+        if config.policy.model_arch in REGISTER_UPDATE_ROUTER_CORRECTION_BIAS:
+            return REGISTER_UPDATE_ROUTER_CORRECTION_BIAS[config.policy.model_arch](config)
+
+        return REGISTER_UPDATE_ROUTER_CORRECTION_BIAS[DEFAULT](config)

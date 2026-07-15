@@ -46,8 +46,8 @@ TODO:
 - [x] 特殊处理 fp32 mhc
 - [x] Add FA
 - [x] DeepEP
-- [ ] 优化 CSA 与 HCA 的 op
 - [ ] THD 的 CP 改成 zz
+- [ ] 优化 CSA 与 HCA 的 op
 - [ ] better use real data to test it
 """
 
@@ -583,6 +583,7 @@ def _pack_thd_worker(
     ep_backend: str = "eager",
     fake_seq_lens: list[int] | None = None,
     padded_seq_lens: list[int] | None = None,
+    fp8: bool = False,
 ):
     """THD [1, T=512] packed，cp_size=4 切 [1, 128]/rank。
 
@@ -628,6 +629,8 @@ def _pack_thd_worker(
         tag += "_replay"
     if ep_backend != "eager":
         tag += f"_{ep_backend}"
+    if fp8:
+        tag += "_fp8"
     print(f"[{tag}] rank {rank}: loading {hf_model_path} via meta-device ...", flush=True)
     _t_start = time.time()
     model = _build_fork_model(hf_model_path, tokenizer)
@@ -639,6 +642,7 @@ def _pack_thd_worker(
         attn_backend=attn_backend,
         indexer_backend=indexer_backend,
         ep_backend=ep_backend,
+        fp8=fp8,
     )
     model.gradient_checkpointing_enable()
     model.load_checkpoint_hp(hf_model_path)
@@ -921,6 +925,7 @@ def _bench_thd_worker(
     attn_backend: str = "fused",
     indexer_backend: str = "fused",
     ep_backend: str = "eager",
+    fp8: bool = False,
     fake_seq_lens: list[int] | None = None,
     padded_seq_lens: list[int] | None = None,
     ep_size: int = 8,
@@ -961,6 +966,8 @@ def _bench_thd_worker(
     assert packed_labels is not None
 
     tag = f"bench_thd_ep{ep_size}_cp{cp_size}_{attn_backend}"
+    if fp8:
+        tag += "_fp8"
     print(f"[{tag}] rank {rank}: loading {hf_model_path} via meta-device ...")
     _t_start = time.time()
     model = _build_fork_model(hf_model_path, tokenizer)
@@ -972,6 +979,7 @@ def _bench_thd_worker(
         attn_backend=attn_backend,
         indexer_backend=indexer_backend,
         ep_backend=ep_backend,
+        fp8=fp8,
     )
     model.gradient_checkpointing_enable()
     model.load_checkpoint_hp(hf_model_path)
@@ -1005,6 +1013,10 @@ def _bench_thd_worker(
     layer_perf = _LayerPerfTimer(model)
 
     step_times = []
+    last_loss = None
+    last_grad_norm = None
+    last_logits_finite = None
+    last_num_grads = None
     for step in range(n_steps):
         torch.cuda.synchronize()
         layer_perf.start_step()
@@ -1028,6 +1040,10 @@ def _bench_thd_worker(
         loss.backward()
 
         total_grad_norm = model.clip_grad_norm_(2.0)
+        last_loss = reported_loss.item()
+        last_grad_norm = float(total_grad_norm)
+        last_logits_finite = bool(torch.isfinite(logits).all())
+        last_num_grads = sum(p.grad is not None for p in model.parameters())
         model.zero_grad()
         torch.cuda.synchronize()
         layer_step_perf = layer_perf.finish_step()
@@ -1082,6 +1098,10 @@ def _bench_thd_worker(
         "step_times": step_times,
         "mem_peak_gib": mem_peak,
         "layer_perf_ms": layer_perf_summary,
+        "loss": last_loss,
+        "total_grad_norm": last_grad_norm,
+        "logits_finite": last_logits_finite,
+        "num_grads": last_num_grads,
     }
 
 
@@ -1114,6 +1134,7 @@ class TestEpCpThd(unittest.TestCase):
         fake_seq_lens: "list[int] | None" = None,
         padded_seq_lens: "list[int] | None" = None,
         cp_size_override: "int | None" = None,
+        fp8: "bool | None" = None,
     ):
         pg_obj, bundle_indices = pg
         master_addr = ray.get(
@@ -1139,6 +1160,8 @@ class TestEpCpThd(unittest.TestCase):
                 kw["padded_seq_lens"] = padded_seq_lens
             if cp_size_override is not None:
                 kw["cp_size_override"] = cp_size_override
+            if fp8 is not None:
+                kw["fp8"] = fp8
             futures.append(
                 worker_fn.options(
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
@@ -1164,6 +1187,7 @@ class TestEpCpThd(unittest.TestCase):
         master_port_base: int = 12500,
         fake_seq_lens: list[int] | None = None,
         padded_seq_lens: list[int] | None = None,
+        fp8: bool = False,
     ):
         assert os.path.isdir(HF_MODEL_PATH), (
             f"model dir not found: {HF_MODEL_PATH}; "
@@ -1203,7 +1227,7 @@ class TestEpCpThd(unittest.TestCase):
         print("=" * 60)
         print(
             f"Running THD pack (ep={EP_SIZE} cp={CP_SIZE} N={NUM_GPUS} "
-            f"attn={attn_backend}) + router replay ..."
+            f"attn={attn_backend} fp8={fp8}) + router replay ..."
         )
         pack_results = self._run_workers(
             _pack_thd_worker, NUM_GPUS, pg, master_port=master_port_base + 1,
@@ -1213,6 +1237,7 @@ class TestEpCpThd(unittest.TestCase):
             ep_backend=ep_backend,
             fake_seq_lens=fake_seq_lens,
             padded_seq_lens=padded_seq_lens,
+            fp8=fp8,
         )
 
         remove_placement_group(pg[0])
@@ -1238,13 +1263,21 @@ class TestEpCpThd(unittest.TestCase):
                 )
 
         # --- 数值等价 assert ---
-        # rtol 基于 sibling test_deepseek_v4_ep_cp.py 的 6.8e-5 / 5.3e-4 量级
-        # 与本测试 E5 实测 (6.5e-5 / 1.1e-4 / per-param 最差 4.1%) 取 2-50× 余量。
-        rtol_loss = 0.005
-        rtol_grad_norm = 0.01
-        rtol_logits = 0.02
-        rtol_per_param_places = 1  # |ratio-1| < 0.05
-        atol_per_param = 1e-3
+        # bf16 pack vs baseline：sibling ep_cp 6.8e-5 / 5.3e-4 量级，本测
+        # E5 实测 + 2-50× 余量。
+        # fp8 MoE：对齐 test_te_gemm_fp8 单 op ~5% 量级，整模多层专家累加后放宽。
+        if fp8:
+            rtol_loss = 0.05
+            rtol_grad_norm = 0.05
+            rtol_logits = 0.10
+            per_param_rel = 0.15
+            atol_per_param = 1e-2
+        else:
+            rtol_loss = 0.005
+            rtol_grad_norm = 0.01
+            rtol_logits = 0.02
+            per_param_rel = 0.05
+            atol_per_param = 1e-3
 
         bl0 = baseline_results[0]
         pk0 = pack_results[0]
@@ -1292,7 +1325,7 @@ class TestEpCpThd(unittest.TestCase):
             f"total_grad_norm rel_diff={gnorm_rel:.6f} > rtol={rtol_grad_norm}",
         )
 
-        # 逐参数 grad norm（places=1 即 |ratio-1| < 0.05）
+        # 逐参数 grad norm
         print("\n--- per-param grad norm ratio ---")
         bl_norms = bl0["per_param_grad_norm"]
         pk_norms = pk0["per_param_grad_norm"]
@@ -1335,7 +1368,7 @@ class TestEpCpThd(unittest.TestCase):
             ratio = pk_n / bl_n if bl_n > 1e-12 else float("nan")
             print(f"  {name:<75s} {bl_n:12.6f} {pk_n:12.6f} {ratio:8.4f}")
             if bl_n > 1e-10:
-                rel_ok = abs(ratio - 1.0) < 0.05
+                rel_ok = abs(ratio - 1.0) < per_param_rel
                 abs_ok = abs(pk_n - bl_n) < atol_per_param
                 self.assertTrue(
                     rel_ok or abs_ok,
@@ -1344,11 +1377,21 @@ class TestEpCpThd(unittest.TestCase):
                         f"abs_diff={abs(pk_n - bl_n):.2e}",
                 )
 
-        print(f"\nPASSED (attn={attn_backend})")
+        print(f"\nPASSED (attn={attn_backend} fp8={fp8})")
 
     def test_pack_runs_fused(self):
         """THD pack fused attn vs vanilla baseline, short segs [100, 200, 100]."""
         self._pack_runs_impl(attn_backend="fused", indexer_backend="fused", ep_backend="deepep")
+
+    def test_pack_runs_fused_fp8(self):
+        """THD pack fused + MoE FP8 grouped GEMM vs bf16 vanilla baseline."""
+        self._pack_runs_impl(
+            attn_backend="fused",
+            indexer_backend="fused",
+            ep_backend="deepep",
+            fp8=True,
+            master_port_base=12800,
+        )
 
     def test_pack_runs_eager(self):
         """THD pack eager attn + fused indexer vs vanilla baseline."""
@@ -1458,6 +1501,7 @@ class TestEpCpThd(unittest.TestCase):
         attn_backend: str = "fused",
         indexer_backend: str = "fused",
         ep_backend: str = "eager",
+        fp8: bool = False,
         master_port_base: int = 12800,
         fake_seq_lens: list[int] | None = None,
         padded_seq_lens: list[int] | None = None,
@@ -1493,6 +1537,7 @@ class TestEpCpThd(unittest.TestCase):
                     attn_backend=attn_backend,
                     indexer_backend=indexer_backend,
                     ep_backend=ep_backend,
+                    fp8=fp8,
                     fake_seq_lens=fake_seq_lens,
                     padded_seq_lens=padded_seq_lens,
                 )
@@ -1528,6 +1573,27 @@ class TestEpCpThd(unittest.TestCase):
                     f"{kind}=max {max(vals):.2f} / avg {sum(vals) / len(vals):.2f}"
                 )
             print(f"  layer {layer_idx}:  " + "  ".join(parts), flush=True)
+        return results
+
+    def test_hp_fused_smoke(self):
+        """Run one HP THD fwd/bwd with fused attention, indexer, EP, and FP8 MoE."""
+        results = self._bench_impl(
+            n_steps=1,
+            attn_backend="fused",
+            indexer_backend="fused",
+            ep_backend="deepep",
+            fp8=True,
+            master_port_base=13100,
+        )
+        for result in results:
+            rank = result["rank"]
+            self.assertTrue(result["logits_finite"], f"rank {rank}: logits contain NaN/Inf")
+            self.assertTrue(math.isfinite(result["loss"]), f"rank {rank}: loss is not finite")
+            self.assertTrue(
+                math.isfinite(result["total_grad_norm"]),
+                f"rank {rank}: total_grad_norm is not finite",
+            )
+            self.assertGreater(result["num_grads"], 0, f"rank {rank}: no parameter gradients")
 
     def test_bench_long(self):
         """Perf bench: 16k single seq, 5 fwd+bwd steps, no baseline comparison."""

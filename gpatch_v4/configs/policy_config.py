@@ -23,10 +23,20 @@ class BasePolicyConfig(MappingProtocol):
         Reference model checkpoint (for KL computation).
     attn_implementation : str
         FSDP2 backend: ``"flash_attention_2"`` / ``"sdpa"`` / ``"eager"``.
+        For DeepSeek-V4 HpModule this is passed to ``apply_hp(..., attn_backend=)``.
+    indexer_backend : str
+        DeepSeek-V4 indexer backend: ``"eager"`` / ``"fused"``.
     ep_backend : str
         DeepSeek-V4 expert dispatch backend: ``"eager"`` / ``"deepep"``.
     deepep_num_sms : int
         Number of SMs assigned to DeepEP kernels.
+    fp8_qat : bool
+        Enable FP8 activation/weight fake-quant (QAT) via ``apply_hp``.
+    fp4_qat : bool
+        Enable FP4 fake-quant for routed DeepSeek-V4 MoE expert weights.
+    fp8 : bool
+        Enable TE FP8 block-scaling grouped GEMM for DeepSeek-V4 MoE
+        experts (``apply_hp(..., fp8=True)``). Orthogonal to QAT.
     rollout_gen_type : str or None
         ``"base"`` / ``"replay"`` / ``"dynamic_sampling"``.
     forward_only_mbs : int
@@ -80,6 +90,13 @@ class BasePolicyConfig(MappingProtocol):
     )
     fp8_qat: bool = field(
         default=False, metadata={"help": "Enable FP8 activation/weight fake-quant (QAT)"}
+    )
+    fp4_qat: bool = field(
+        default=False, metadata={"help": "Enable FP4 fake-quant for routed DSV4 MoE experts"}
+    )
+    fp8: bool = field(
+        default=False,
+        metadata={"help": "Enable TE FP8 block-scaling grouped GEMM for DSV4 MoE experts"},
     )
 
     rollout_gen_type: Optional[str] = field(

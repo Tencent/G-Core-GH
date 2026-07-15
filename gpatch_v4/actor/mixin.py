@@ -50,6 +50,7 @@ from gpatch_v4.utils import (
 from gpatch_v4.utils.flops_counter import FlopsCounter
 from gpatch_v4.utils.ppo_utils import (
     calculate_kl_penalty,
+    count_advantage_clip_samples,
     create_response_mask,
     get_advantage_clip_bounds,
 )
@@ -816,14 +817,17 @@ class RlTrainerMixin:
 
         Gathers ``mask``-weighted mean/std/min/max for ``advantages``,
         ``returns``, ``values``, ``per_token_rewards``, and the global
-        ``sample_mask`` mean. Does NOT recompute advantages — only reads
-        what is already stored in *rollout_batches*.
+        ``sample_mask`` mean. When ``original_advantages`` is present
+        (advantage clip enabled), also reports
+        ``advantage_clip_{lower,upper}_sample_frac``. Does NOT recompute
+        advantages — only reads what is already stored in *rollout_batches*.
 
         Parameters
         ----------
         rollout_batches : list of dict
             Must already contain ``mask``, ``advantages``, and optionally
-            ``returns``, ``values``, ``per_token_rewards``, ``sample_mask``.
+            ``returns``, ``values``, ``per_token_rewards``, ``sample_mask``,
+            ``original_advantages``.
 
         Returns
         -------
@@ -876,6 +880,32 @@ class RlTrainerMixin:
                 rb["global_retention_ratio"] = [
                     torch.tensor(retention_value, dtype=ref_dtype) for _ in range(n)
                 ]
+
+        if "original_advantages" in rollout_batches[0]:
+            orig_list = []
+            adv_list = []
+            for rb in rollout_batches:
+                orig_list.extend(rb["original_advantages"])
+                adv_list.extend(rb["advantages"])
+            n_lower, n_upper, n_samples = count_advantage_clip_samples(
+                orig_list, adv_list, mask_list
+            )
+            clip_counts = torch.tensor(
+                [n_lower, n_upper, n_samples],
+                dtype=torch.float64,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(clip_counts, group=mpu.get_data_parallel_group())
+            global_n = clip_counts[2].item()
+            if global_n > 0:
+                lower_frac = clip_counts[0].item() / global_n
+                upper_frac = clip_counts[1].item() / global_n
+            else:
+                lower_frac = 0.0
+                upper_frac = 0.0
+            metrics["ppo-metrics/advantage_clip_lower_sample_frac"] = lower_frac
+            metrics["ppo-metrics/advantage_clip_upper_sample_frac"] = upper_frac
+            metrics["ppo-metrics/advantage_clip_sample_frac"] = lower_frac + upper_frac
 
         if (
             self.config.ppo.ppo_entropy_global_cov and
@@ -1219,6 +1249,58 @@ class ProfileMixin:
             self.prof.export_chrome_trace(
                 f"{proflie_resut}/{save_name}_rank_{torch.distributed.get_rank()}_step_{train_step}.json"
             )
+            self._log_profile_summary(train_step)
+
+    def _log_profile_summary(self, train_step):
+        """Print a kernel-level CUDA-time summary and a comm-vs-compute split.
+
+        Device-side kernel durations are unaffected by profiler CPU overhead, so
+        the totals here are reliable for A/B comparison across images even when
+        wall-clock is inflated by profiling. Rank 0 only; never raises.
+        """
+        if torch.distributed.get_rank() != 0:
+            return
+        try:
+            events = self.prof.key_averages()
+            comm_markers = (
+                "nccl", "allgather", "all_gather", "reducescatter", "reduce_scatter",
+                "alltoall", "all_to_all", "allreduce", "all_reduce", "broadcast",
+                "c10d", "reduce_kernel",
+            )
+            def _dev_us(evt):
+                # torch>=2.1 renamed self_cuda_time_total -> self_device_time_total
+                for attr in ("self_device_time_total", "self_cuda_time_total"):
+                    v = getattr(evt, attr, 0.0)
+                    if v:
+                        return float(v)
+                return 0.0
+
+            comm_us = 0.0
+            compute_us = 0.0
+            for evt in events:
+                cuda_us = _dev_us(evt)
+                if cuda_us <= 0:
+                    continue
+                name = evt.key.lower()
+                if any(m in name for m in comm_markers):
+                    comm_us += cuda_us
+                else:
+                    compute_us += cuda_us
+            total_us = comm_us + compute_us
+            try:
+                table = events.table(sort_by="self_device_time_total", row_limit=30)
+            except Exception:
+                table = events.table(sort_by="self_cuda_time_total", row_limit=30)
+            pct = (comm_us / total_us * 100.0) if total_us > 0 else 0.0
+            print(
+                f"[profile_summary] step={train_step} "
+                f"total_cuda={total_us / 1e3:.2f}ms "
+                f"compute={compute_us / 1e3:.2f}ms "
+                f"comm={comm_us / 1e3:.2f}ms ({pct:.1f}% comm)\n{table}",
+                flush=True,
+            )
+        except Exception as e:  # never break training because of profiling
+            print(f"[profile_summary] failed: {e}", flush=True)
 
 
 class TrainingPltMixin:

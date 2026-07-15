@@ -33,7 +33,7 @@ class RolloutGeneratorAbc(ABC):
         self.sample_idx = 0
 
     @abstractmethod
-    async def rollout_samples(self, data_iter, num_microbatches, curr_ppo_step):
+    async def rollout_samples(self, data_iter, num_microbatches, curr_ppo_step, dp_rank=None):
         """Generate rollout samples.
 
         Parameters
@@ -41,6 +41,7 @@ class RolloutGeneratorAbc(ABC):
         data_iter : iterator
         num_microbatches : int
         curr_ppo_step : int
+        dp_rank : int, optional
         """
         ...
 

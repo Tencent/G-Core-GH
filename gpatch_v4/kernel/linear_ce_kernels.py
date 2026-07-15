@@ -17,6 +17,7 @@ try:
 
     HAVE_TRITON = True
     SUPPORT_CUDA_TMA = is_cuda(
+    ) and torch.cuda.is_available(
     ) and torch.cuda.get_device_capability(0)[0] >= 9 and hasattr(tl, "make_tensor_descriptor")
 
 except ImportError:

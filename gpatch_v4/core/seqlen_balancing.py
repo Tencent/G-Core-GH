@@ -216,6 +216,7 @@ def convert_mbs_for_pack_seq(
     n = len(samples)
     assert n > 0, "samples must be non-empty"
 
+    # todo zz: mirror pack_sequences' per-segment zigzag padding
     def _padded_len(s):
         raw = s["sequence_lengths"]
         raw = int(raw) if isinstance(raw, int) else raw.item()

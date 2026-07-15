@@ -25,6 +25,7 @@ def freeze_multimodal(
     freeze_vision_projection=False,
     freeze_audio_model=False,
     freeze_audio_qformer=False,
+    freeze_audio_projection=False,
 ):
     for model_chunk in _ensure_model_list(model):
         kwargs = {}
@@ -40,6 +41,8 @@ def freeze_multimodal(
             kwargs["freeze_audio_model"] = freeze_audio_model
         if "freeze_audio_qformer" in fn_kwargs:
             kwargs["freeze_audio_qformer"] = freeze_audio_qformer
+        if "freeze_audio_projection" in fn_kwargs:
+            kwargs["freeze_audio_projection"] = freeze_audio_projection
         model_chunk.freeze(**kwargs)
 
     return model

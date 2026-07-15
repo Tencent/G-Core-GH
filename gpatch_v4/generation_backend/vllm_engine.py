@@ -393,7 +393,7 @@ class VllmEngine(InferEngine):
 
         Called by the sampler actor when the client drives a bucketed NCCL
         broadcast via
-        :meth:`UpdateWeightDistributedMixin._broadcast_weight_bucket_vllm`.
+        :meth:`VllmUpdateWeightFactory._broadcast_vllm_bucket`.
         Each bucket is one ``uint8`` flat tensor that is split into per-param
         views on the worker side and handed to ``model.load_weights``.
         Finalization (``process_weights_after_loading``) is done once, in

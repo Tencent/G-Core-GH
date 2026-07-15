@@ -89,7 +89,7 @@ class GCoreVllmWorkerExtension:
 
         ``update_info`` is the payload produced by
         :class:`FlatIpcBucketBuilder` + the trainer all_gather in
-        ``UpdateWeightIpcMixin._update_weights_by_bucketed_ipc_vllm``; see
+        ``VllmUpdateWeightFactory._update_bucketed_ipc``; see
         :func:`open_flat_ipc_bucket` for the exact schema.
 
         No finalize is invoked here — the trainer calls

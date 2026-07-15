@@ -63,7 +63,7 @@ class BaseRolloutGenerator(RolloutGeneratorAbc, SendRequestMixin):
         return batched_data
 
     @override
-    async def rollout_samples(self, data_iter, num_microbatches, curr_ppo_step):
+    async def rollout_samples(self, data_iter, num_microbatches, curr_ppo_step, dp_rank=None):
         num_samplers = self.sampler_client.num_samplers
         assert num_samplers == 1, f"当前只能是一个 sampler, 但保留扩展异构 sampler 的能力，如果要扩展到异构 sampler 的话，注意 tokenizer 的使用"
 
@@ -76,15 +76,15 @@ class BaseRolloutGenerator(RolloutGeneratorAbc, SendRequestMixin):
                 logging_memory_usage_details(
                     f"memory tracking after sampler {sampler_idx} wake_up", rank=0
                 )
+            if dp_rank is None:
+                dp_rank = mpu.get_data_parallel_rank()
 
             sidx = self.sample_idx
             rollout_batches: List[Dict[str, List[Any]]] = [None for _ in range(num_microbatches)]
             if self.is_mp_and_cp_head:
                 for rbi in range(num_microbatches):
                     batched_data = next(data_iter)
-                    batched_data = self.assign_unique_id_to_batches(
-                        batched_data, mpu.get_data_parallel_rank(), rbi
-                    )
+                    batched_data = self.assign_unique_id_to_batches(batched_data, dp_rank, rbi)
 
                     rollout_batches[rbi] = self.remove_rollout_attr_before_sampling(batched_data)
                 rbs = await self.sampler_gen_out(
@@ -204,13 +204,16 @@ class BaseRolloutGenerator(RolloutGeneratorAbc, SendRequestMixin):
     async def __call__(self, data_iter, num_microbatches, curr_ppo_step):
         #TODO: support timer record times per stage
         timers = TimerSingleton.get_timer()
+        dp_rank = mpu.get_data_parallel_rank()
         offload_process_group = self.config.training.offload_process_group
         if offload_process_group:
             destroy_process_groups()
             clear_memory()
 
         timers("sampler_generate", log_level=0).start(barrier=True)
-        rbs = await self.rollout_samples(data_iter, num_microbatches, curr_ppo_step)
+        rbs = await self.rollout_samples(
+            data_iter, num_microbatches, curr_ppo_step, dp_rank=dp_rank
+        )
         if self.is_mp_and_cp_head:
             rbs = self._hook_after_sampling(rbs, curr_ppo_step)
             assert check_rollout_batches(rbs), f"rbs format error, may need pop('ready'): {rbs=}"

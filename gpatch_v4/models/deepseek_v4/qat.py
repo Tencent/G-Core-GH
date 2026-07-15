@@ -1,12 +1,11 @@
 # coding=utf-8
 # Copyright (c) 2026 Tencent Inc. All rights reserved.
 # nrwu@tencent.com
-"""FP8 activation fake-quantization for QAT (Quantization-Aware Training).
+"""FP8 and FP4 fake-quantization for QAT (Quantization-Aware Training).
 
-Simulates the precision loss of FP8 E4M3 block-wise quantization on
-activations during training, so the model learns to be robust against
-quantization noise before deployment. Gradients pass through unchanged
-via Straight-Through Estimator (STE).
+Simulates precision loss from FP8 E4M3 and FP4 E2M1 block-wise
+quantization during training. Gradients pass through unchanged via
+Straight-Through Estimator (STE).
 
 Insertion points mirror DeepSeek-V4's inference KV quantization:
   - Main attention KV (nope dims only, block=64)
@@ -30,6 +29,9 @@ bit manipulation. We keep the ``act_quant`` copy because:
 
 Dequantization uses ``tile_kernels.quant.per_token_cast_back``.
 
+FP4 QAT uses the official reference's E2M1 1×32 quantize→dequantize
+kernel with power-of-two scales.
+
 ``act_quant`` vs ``per_token_cast`` differences (for reference):
   - tile size: act_quant fixed ``blk_m=32``; per_token_cast adaptive
   - vectorize: act_quant none; per_token_cast has ``annotate_layout``
@@ -44,9 +46,16 @@ from typing import Optional
 import tilelang
 import tilelang.language as T
 import torch
+import torch.nn.functional as F
 from tile_kernels.quant import per_token_cast_back
+from torch import nn
 
-__all__ = ["fp8_simulate_qat"]
+__all__ = [
+    "fp4_qat_linear",
+    "fp4_simulate_qat",
+    "fp8_qat_linear",
+    "fp8_simulate_qat",
+]
 
 # ---------------------------------------------------------------------------
 # act_quant — ported from deepseek-ai/DeepSeek-V4-Pro/inference/kernel.py
@@ -59,6 +68,8 @@ pass_configs = {
 }
 
 FP8 = "float8_e4m3"
+FP4 = "float4_e2m1fn"
+E8M0 = "float8_e8m0fnu"
 BF16 = "bfloat16"
 FP32 = "float32"
 
@@ -184,6 +195,64 @@ def act_quant(
     return y, s
 
 
+@tilelang.jit(pass_configs=pass_configs)
+def _fp4_quant_kernel(
+    N,
+    block_size=32,
+    in_dtype=BF16,
+):
+    M = T.symbolic("M")
+    fp4_max = 6.0
+    fp4_max_inv = 1.0 / fp4_max
+    blk_m = 32
+
+    @T.prim_func
+    def fp4_quant_kernel_(
+        X: T.Tensor[(M, N), in_dtype],
+        Y: T.Tensor[(M, N), in_dtype],
+        S: T.Tensor[(M, T.ceildiv(N, block_size)), E8M0],
+    ):
+        with T.Kernel(T.ceildiv(M, blk_m), T.ceildiv(N, block_size), threads=128) as (
+            pid_m,
+            pid_n,
+        ):
+            x_shared = T.alloc_shared((blk_m, block_size), in_dtype)
+            x_local = T.alloc_fragment((blk_m, block_size), in_dtype)
+            amax_local = T.alloc_fragment((blk_m, ), FP32)
+            scale_local = T.alloc_fragment((blk_m, ), FP32)
+            y_local = T.alloc_fragment((blk_m, block_size), in_dtype)
+            y_shared = T.alloc_shared((blk_m, block_size), in_dtype)
+
+            for _ in T.Pipelined(1, num_stages=2):
+                T.copy(X[pid_m * blk_m, pid_n * block_size], x_shared)
+                T.copy(x_shared, x_local)
+                T.reduce_absmax(x_local, amax_local, dim=1)
+                for i in T.Parallel(blk_m):
+                    amax_local[i] = T.max(amax_local[i], 6 * (2**-126))
+                    scale_local[i] = fast_round_scale(amax_local[i], fp4_max_inv)
+                for i, j in T.Parallel(blk_m, block_size):
+                    y_local[i, j] = T.Cast(
+                        in_dtype,
+                        T.Cast(
+                            FP32,
+                            T.Cast(
+                                FP4,
+                                T.clamp(
+                                    x_local[i, j] / scale_local[i],
+                                    -fp4_max,
+                                    fp4_max,
+                                ),
+                            ),
+                        ) * scale_local[i],
+                    )
+                for i in T.Parallel(blk_m):
+                    S[pid_m * blk_m + i, pid_n] = T.Cast(E8M0, scale_local[i])
+                T.copy(y_local, y_shared)
+                T.copy(y_shared, Y[pid_m * blk_m, pid_n * block_size])
+
+    return fp4_quant_kernel_
+
+
 # ---------------------------------------------------------------------------
 # fp8_simulate — quant (act_quant) + dequant (per_token_cast_back)
 # ---------------------------------------------------------------------------
@@ -216,3 +285,77 @@ class _FP8SimulateQAT(torch.autograd.Function):
 
 
 fp8_simulate_qat = _FP8SimulateQAT.apply
+
+
+def _fp4_simulate(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    assert x.dtype == torch.bfloat16, f"FP4 QAT requires bfloat16 input, got {x.dtype}"
+    assert block_size == 32, f"FP4 QAT requires 1x32 blocks, got {block_size}"
+    N = x.size(-1)
+    assert N % block_size == 0
+
+    x_c = x.contiguous()
+    out = torch.empty_like(x_c)
+    scale = torch.empty(
+        *x_c.size()[:-1],
+        N // block_size,
+        dtype=torch.float8_e8m0fnu,
+        device=x.device,
+    )
+    kernel = _fp4_quant_kernel(N, block_size)
+    kernel(x_c.view(-1, N), out.view(-1, N), scale.view(-1, N // block_size))
+    return out
+
+
+class _FP4SimulateQAT(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+        return _fp4_simulate(x, block_size)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        return grad, None
+
+
+fp4_simulate_qat = _FP4SimulateQAT.apply
+
+# ---------------------------------------------------------------------------
+# fp8_qat_linear — nn.Linear forward with FP8 QAT fake-quant on the weight
+# ---------------------------------------------------------------------------
+
+
+def fp8_qat_linear(module: nn.Linear, x: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    """nn.Linear forward with FP8 QAT fake-quant on the weight tensor.
+
+    Equivalent to ``module(x)`` but the weight is passed through
+    ``fp8_simulate_qat(weight, block_size)`` (quant→dequant round-trip,
+    STE backward) before the GEMM.  The bias (if any) is applied unchanged.
+    """
+    weight = fp8_simulate_qat(module.weight, block_size) if fp8_simulate_qat else module.weight
+    return F.linear(x, weight, module.bias)
+
+
+def fp4_qat_linear(module: nn.Linear, x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """Run ``module`` with E2M1 FP4 fake-quantized weights.
+
+    Parameters
+    ----------
+    module : nn.Linear
+    x : torch.Tensor
+        Must be bfloat16 because the FP4 TileLang kernel operates on
+        bfloat16 inputs and weights.
+    block_size : int, default=32
+        Must be 32, the deployed FP4 block geometry.
+
+    Returns
+    -------
+    torch.Tensor
+        ``module`` output using the Q/DQ weight on this forward pass.
+
+    Raises
+    ------
+    AssertionError
+        If the weight is not bfloat16, ``block_size`` is not 32, or the input
+        dimension is not divisible by 32.
+    """
+    weight = fp4_simulate_qat(module.weight, block_size)
+    return F.linear(x, weight, module.bias)

@@ -30,6 +30,7 @@ policy:
   ppo_pack_seq: True
   attn_implementation: "fused"
   indexer_backend: "fused"
+  fp8: false
   without_ref: True
   hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
   hf_tokenizer_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"

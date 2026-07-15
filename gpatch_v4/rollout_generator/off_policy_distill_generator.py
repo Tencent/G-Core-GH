@@ -8,6 +8,8 @@ import torch.distributed
 import torch.distributed as dist
 from torch.distributed.tensor import DeviceMesh
 
+from megatron.core import mpu
+
 from gpatch_v4.configs.config import OffPolicyDistillConfig
 from gpatch_v4.core.parallel_state import (
     cpu_barrier,
@@ -105,7 +107,7 @@ class OffPolicyDistillRolloutGenerator:
             cos.append(co)
         return await asyncio.gather(*cos)
 
-    async def rollout_samples(self, data_iter, num_microbatches, curr_train_step):
+    async def rollout_samples(self, data_iter, num_microbatches, curr_train_step, dp_rank=None):
         """Generate rollout samples using the sampler.
 
         Parameters
@@ -229,13 +231,16 @@ class OffPolicyDistillRolloutGenerator:
 
     async def __call__(self, data_iter, num_microbatches, curr_train_step):
         #TODO: support timer record times per stage
+        dp_rank = mpu.get_data_parallel_rank()
         offload_process_group = self.config.training.offload_process_group
         if offload_process_group:
             destroy_process_groups()
             clear_memory()
 
         if self.config.training.enable_teacher_rollout:
-            rbs = await self.rollout_samples(data_iter, num_microbatches, curr_train_step)
+            rbs = await self.rollout_samples(
+                data_iter, num_microbatches, curr_train_step, dp_rank=dp_rank
+            )
         else:
             rbs = self.gen_data_from_data_iter(data_iter, num_microbatches, curr_train_step)
 

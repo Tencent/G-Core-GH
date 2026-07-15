@@ -1,4 +1,5 @@
 import math
+from functools import lru_cache
 
 try:
     import tilelang as tl
@@ -476,42 +477,224 @@ def _round_up(x, m):
     return ((x + m - 1) // m) * m
 
 
+@lru_cache(maxsize=None)
+def _get_varlen_fwd_kernel(
+    HQ,
+    HK,
+    D,
+    scaling,
+    is_causal,
+    window_size,
+    has_sinks,
+    dtype,
+    BLOCK_Q,
+    BLOCK_K,
+    num_stages,
+    threads,
+):
+    return myfa_varlen_sw_sinks_fwd.compile(
+        HQ=HQ,
+        HK=HK,
+        D=D,
+        scaling=scaling,
+        is_causal=is_causal,
+        window_size=window_size,
+        has_sinks=has_sinks,
+        dtype=dtype,
+        BLOCK_Q=BLOCK_Q,
+        BLOCK_K=BLOCK_K,
+        num_stages=num_stages,
+        threads=threads,
+    )
+
+
+# TODO(astrachang): 看下为什么tilelang自带的cache比这个lru cache慢的
+@lru_cache(maxsize=None)
+def _get_varlen_bwd_pre_kernel(HQ, D, BLOCK_Q, dtype):
+    return myfa_varlen_sw_sinks_bwd_pre.compile(HQ=HQ, D=D, BLOCK_Q=BLOCK_Q, dtype=dtype)
+
+
+@lru_cache(maxsize=None)
+def _get_varlen_bwd_kernel(
+    HQ,
+    HK,
+    D,
+    scaling,
+    is_causal,
+    window_size,
+    dtype,
+    BLOCK_Q,
+    BLOCK_K,
+    num_stages,
+    threads,
+):
+    return myfa_varlen_sw_sinks_bwd.compile(
+        HQ=HQ,
+        HK=HK,
+        D=D,
+        scaling=scaling,
+        is_causal=is_causal,
+        window_size=window_size,
+        BLOCK_Q=BLOCK_Q,
+        BLOCK_K=BLOCK_K,
+        num_stages=num_stages,
+        threads=threads,
+        dtype=dtype,
+    )
+
+
+@lru_cache(maxsize=None)
+def _get_varlen_dsink_kernel(HQ, dtype):
+    return myfa_varlen_sw_sinks_bwd_dsink.compile(HQ=HQ, dtype=dtype)
+
+
+def myfa_varlen_sw_sinks_forward(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen,
+    sinks=None,
+    is_causal=True,
+    window_size=None,
+    scaling=None,
+):
+    assert is_causal or window_size is None, "non-causal + sliding window is not supported"
+    _, HQ, d = q.shape
+    HK = k.shape[1]
+    if scaling is None:
+        scaling = 1.0 / math.sqrt(d)
+    has_sinks = sinks is not None
+    if not has_sinks:
+        sinks = torch.empty(HQ, dtype=q.dtype, device=q.device)
+
+    block_q, block_k, num_stages, threads = _get_fwd_block_config(d)
+    if window_size is not None:
+        block_k = min(block_k, window_size)
+    dt = q.dtype
+    fwd_kernel = _get_varlen_fwd_kernel(
+        HQ, HK, d, scaling, is_causal, window_size, has_sinks, dt, block_q, block_k, num_stages,
+        threads
+    )
+    batch_size = cu_seqlens_q.numel() - 1
+    max_l = _round_up(max_seqlen, block_q)
+    lse = torch.zeros((batch_size, HQ, max_l), device=q.device, dtype=torch.float32)
+    o = fwd_kernel(q, k, v, sinks, cu_seqlens_q, cu_seqlens_k, max_seqlen, lse)
+    return o, lse
+
+
+def myfa_varlen_sw_sinks_backward(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen,
+    output,
+    lse,
+    doutput,
+    sinks=None,
+    is_causal=True,
+    window_size=None,
+    scaling=None,
+):
+    has_sinks = sinks is not None
+    if not has_sinks:
+        sinks = torch.empty(q.shape[1], dtype=q.dtype, device=q.device)
+
+    _, HQ, d = q.shape
+    HK = k.shape[1]
+    if scaling is None:
+        scaling = 1.0 / math.sqrt(d)
+    dt = q.dtype
+
+    block_q_fwd, _, _, _ = _get_fwd_block_config(d)
+    bwd_pre_kernel = _get_varlen_bwd_pre_kernel(HQ, d, block_q_fwd, dt)
+    delta = torch.zeros_like(lse)
+    bwd_pre_kernel(output, doutput, cu_seqlens_q, max_seqlen, delta)
+
+    block_q, block_k, num_stages, threads = _get_bwd_block_config(d)
+    if window_size is not None:
+        block_k = min(block_k, window_size)
+    bwd_kernel = _get_varlen_bwd_kernel(
+        HQ,
+        HK,
+        d,
+        scaling,
+        is_causal,
+        window_size,
+        dt,
+        block_q,
+        block_k,
+        num_stages,
+        threads,
+    )
+    dQ = torch.zeros_like(q, dtype=torch.float32)
+    dK = torch.zeros_like(k, dtype=torch.float32)
+    dV = torch.zeros_like(v, dtype=torch.float32)
+    bwd_kernel(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen,
+        lse,
+        doutput,
+        delta,
+        dQ,
+        dK,
+        dV,
+    )
+    dQ = dQ.to(q.dtype)
+    dK = dK.to(k.dtype)
+    dV = dV.to(v.dtype)
+
+    dsinks = None
+    if has_sinks:
+        dsink_kernel = _get_varlen_dsink_kernel(HQ, dt)
+        dsinks = dsink_kernel(sinks, delta, lse, cu_seqlens_q, max_seqlen).sum(0).sum(1)
+
+    return dQ, dK, dV, dsinks
+
+
+
 class MyfaVarlenSwSinks(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, q, k, v, sinks, cu_seqlens_q, cu_seqlens_k, max_seqlen, is_causal, window_size
+        ctx,
+        q,
+        k,
+        v,
+        sinks,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen,
+        is_causal,
+        window_size,
+        scaling=None,
     ):
-        assert is_causal or window_size is None, "non-causal + sliding window is not supported"
         _, HQ, d = q.shape
-        HK = k.shape[1]
-        scaling = 1.0 / math.sqrt(d)
+        if scaling is None:
+            scaling = 1.0 / math.sqrt(d)
         has_sinks = sinks is not None
-        if not has_sinks:
-            sinks = torch.empty(HQ, dtype=q.dtype, device=q.device)
-
-        block_q, block_k, num_stages, threads = _get_fwd_block_config(d)
-        if window_size is not None:
-            block_k = min(block_k, window_size)
-        dt = q.dtype
-        fwd_kernel = myfa_varlen_sw_sinks_fwd.compile(
-            HQ=HQ,
-            HK=HK,
-            D=d,
-            scaling=scaling,
+        sinks_for_backward = (
+            sinks if has_sinks else torch.empty(HQ, dtype=q.dtype, device=q.device)
+        )
+        o, lse = myfa_varlen_sw_sinks_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen,
+            sinks=sinks,
             is_causal=is_causal,
             window_size=window_size,
-            has_sinks=has_sinks,
-            dtype=dt,
-            BLOCK_Q=block_q,
-            BLOCK_K=block_k,
-            num_stages=num_stages,
-            threads=threads,
+            scaling=scaling,
         )
-        batch_size = cu_seqlens_q.numel() - 1
-        max_l = _round_up(max_seqlen, block_q)
-        lse = torch.zeros((batch_size, HQ, max_l), device=q.device, dtype=torch.float32)
-        o = fwd_kernel(q, k, v, sinks, cu_seqlens_q, cu_seqlens_k, max_seqlen, lse)
-        ctx.save_for_backward(q, k, v, sinks, cu_seqlens_q, cu_seqlens_k, o, lse)
+        ctx.save_for_backward(q, k, v, sinks_for_backward, cu_seqlens_q, cu_seqlens_k, o, lse)
         ctx.scaling = scaling
         ctx.max_seqlen = max_seqlen
         ctx.is_causal = is_causal
@@ -520,62 +703,26 @@ class MyfaVarlenSwSinks(torch.autograd.Function):
         return o
 
     @staticmethod
-    def backward(ctx, dO):
+    def backward(ctx, dO, _d_lse=None):
         q, k, v, sinks, cu_seqlens_q, cu_seqlens_k, o, lse = ctx.saved_tensors
-        _, HQ, d = q.shape
-        HK = k.shape[1]
-        scaling = ctx.scaling
         max_seqlen = ctx.max_seqlen
         is_causal = ctx.is_causal
         window_size = ctx.window_size
-        dt = q.dtype
-
-        block_q_fwd, _, _, _ = _get_fwd_block_config(d)
-        bwd_pre_kernel = myfa_varlen_sw_sinks_bwd_pre.compile(
-            HQ=HQ, D=d, BLOCK_Q=block_q_fwd, dtype=dt
-        )
-        delta = torch.zeros_like(lse)
-        bwd_pre_kernel(o, dO, cu_seqlens_q, max_seqlen, delta)
-
-        block_q, block_k, num_stages, threads = _get_bwd_block_config(d)
-        if window_size is not None:
-            block_k = min(block_k, window_size)
-        bwd_kernel = myfa_varlen_sw_sinks_bwd.compile(
-            HQ=HQ,
-            HK=HK,
-            D=d,
-            scaling=scaling,
+        dQ, dK, dV, dsinks = myfa_varlen_sw_sinks_backward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen,
+            o,
+            lse,
+            dO,
+            sinks=sinks if ctx.has_sinks else None,
             is_causal=is_causal,
             window_size=window_size,
-            BLOCK_Q=block_q,
-            BLOCK_K=block_k,
-            num_stages=num_stages,
-            threads=threads,
-            dtype=dt,
+            scaling=ctx.scaling,
         )
-        dQ = torch.zeros_like(q, dtype=torch.float32)
-        dK = torch.zeros(
-            q.shape[0] if HQ == HK else k.shape[0], HK, d, dtype=torch.float32, device=q.device
-        )
-        dV = torch.zeros(
-            q.shape[0] if HQ == HK else v.shape[0], HK, d, dtype=torch.float32, device=q.device
-        )
-        bwd_kernel(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen, lse, dO, delta, dQ, dK, dV)
-        dQ = dQ.to(q.dtype)
-        dK = dK.to(k.dtype)
-        dV = dV.to(v.dtype)
 
-        dsinks = None
-        if ctx.has_sinks:
-            dsink_kernel = myfa_varlen_sw_sinks_bwd_dsink.compile(HQ=HQ, dtype=dt)
-            dsinks = dsink_kernel(sinks, delta, lse, cu_seqlens_q, max_seqlen).sum(0).sum(1)
+        return dQ, dK, dV, dsinks, None, None, None, None, None, None
 
-        return dQ, dK, dV, dsinks, None, None, None, None, None
-
-
-def myfa_varlen_sw_sinks(
-    q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen, sinks=None, is_causal=True, window_size=None
-):
-    return MyfaVarlenSwSinks.apply(
-        q, k, v, sinks, cu_seqlens_q, cu_seqlens_k, max_seqlen, is_causal, window_size
-    )

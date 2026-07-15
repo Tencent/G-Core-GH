@@ -67,7 +67,7 @@ def sparse_mqa_fwd(
     H_per_block = padded_H if REPLICATE_H == 1 else 64
 
     @T.prim_func
-    def main(
+    def sparse_mqa_fwd_kernel(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         AttnSink: T.Tensor(attn_sink_shape, accum_dtype),  # type: ignore
@@ -151,7 +151,7 @@ def sparse_mqa_fwd(
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
             T.copy(sumexp, Lse[b_i, s_i, H0:H1])
 
-    return main
+    return sparse_mqa_fwd_kernel
 
 
 def sparse_mqa_fwd_interface(

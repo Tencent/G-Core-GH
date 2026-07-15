@@ -47,7 +47,7 @@ optimizer:
 
 data:
   data_pathes:
-    - "tests/test_gpatch_v4/gsm8k_small"
+    - "./hf-hub/DaertML/gsm8k-jsonl/"
   py_path: "tests/test_gpatch_v4/custom_py/simple_dataset.py"
   fn_name: "get_dataset_and_dataloader"
   dataloader_num_workers: 1

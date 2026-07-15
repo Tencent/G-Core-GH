@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Tuple
+from contextlib import nullcontext
 
 import torch
 
@@ -233,3 +234,74 @@ class PrepareDataForward(ABC):
         **kwargs,
     ) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float, Dict[str, Any]]:
         raise NotImplementedError("rl_reroute_data_for_dynamic_cp is not implemented")
+
+
+class PostInitModel:
+    """Base for post-initialization model."""
+    def __init__(self, config):
+        self.config = config
+
+    def __call__(self, model):
+        """Post-init the model. Default to do nothing.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+        """
+        pass
+
+
+class CheckpointContextFn:
+    """Base for torch.utils.checkpoint.checkpoint context_fn."""
+    def __init__(self, config):
+        self.config = config
+
+    def __call__(self, *args, **kwargs):
+        """torch.utils.checkpoint.checkpoint context_fn. Default to take in any params and do nothing.
+
+        Parameters
+        ----------
+        *args : any
+        **kwargs : any
+
+        Returns
+        -------
+        tuple[contextlib.nullcontext, contextlib.nullcontext]
+        """
+        return nullcontext(), nullcontext()
+
+
+class ResetRouterCorrectionBiasAccum:
+    """Base for reset router load counts."""
+    def __init__(self, config):
+        self.config = config
+
+    def __call__(self, model):
+        """Reset router load counts. Default to do nothing.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+        """
+        pass
+
+
+class UpdateRouterCorrectionBias:
+    """Base for update router correction bias."""
+    def __init__(self, config):
+        self.config = config
+
+    def __call__(self, model, update_speed, use_abs_update):
+        """Update router correction bias. Default to do nothing.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+        update_speed : float
+        use_abs_update : bool
+
+        Returns
+        -------
+        tuple[None, None]
+        """
+        return None, None

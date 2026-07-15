@@ -453,6 +453,19 @@ class GrpoTrainActor(
         """
         self.policy_engine.save_checkpoint(step)
 
+    async def prepare_for_final_save(self):
+        """Sleep colocated infer engines, then onload model/optimizer for final ckpt."""
+        if self.config.placement_type != "disaggregated":
+            logging_memory_usage_details("memory tracking before infer_engine sleep", rank=0)
+            for sampler_idx in range(self.sampler_client.num_samplers):
+                await self.sampler_client.sleep(sampler_idx)
+            cpu_barrier()
+            logging_memory_usage_details("memory tracking after infer_engine sleep", rank=0)
+
+        clear_memory()
+        self.policy_engine.onload_model()
+        self.policy_engine.onload_optimizer()
+
     async def rollout_eval(self, ppo_step_i, num_rollout_micro_batches):
         timers = TimerSingleton.get_timer()
         rollout_batches = []
@@ -813,6 +826,63 @@ class GrpoTrainActor(
             return 0
         return self.config.ppo.critic_model_warmup_steps
 
+    def _debug_post_rollout_paths(self) -> tuple[str, str]:
+        debug_config = self.config.debug
+        dp_rank = mpu.get_data_parallel_rank()
+        root = debug_config.post_rollout_batch_debug_dir
+        return (
+            os.path.join(root, f"post_rollout_batches_0_{dp_rank}.pt"),
+            os.path.join(root, f"post_rollout_metrics_0_{dp_rank}.pt"),
+        )
+
+    def _debug_maybe_save_post_rollout_batches(
+        self,
+        rollout_batches: List[Dict[str, List[Any]]],
+        metrics: Dict[str, Any],
+        ppo_step_i: int,
+    ) -> None:
+        debug_config = self.config.debug
+        if not debug_config.save_first_post_rollout_batch:
+            return
+        if ppo_step_i != 0:
+            return
+        if not is_mp_and_cp_head():
+            return
+
+        rb_path, metrics_path = self._debug_post_rollout_paths()
+        os.makedirs(os.path.dirname(rb_path), exist_ok=True)
+        torch.save(rollout_batches, rb_path)
+        torch.save(metrics, metrics_path)
+        logging_rank0(f"[DEBUG] saved post-rollout data to {rb_path}, {metrics_path}")
+
+    def _debug_maybe_load_post_rollout_batches(
+        self,
+        rollout_batches: List[Dict[str, List[Any]]],
+        metrics: Dict[str, Any],
+        ppo_step_i: int,
+    ) -> tuple[List[Dict[str, List[Any]]], Dict[str, Any]]:
+        debug_config = self.config.debug
+        if not debug_config.load_first_post_rollout_batch:
+            return rollout_batches, metrics
+
+        rb_path, metrics_path = self._debug_post_rollout_paths()
+        if not os.path.exists(rb_path):
+            raise FileNotFoundError(
+                f"debug.load_first_post_rollout_batch=True but {rb_path} does not exist. "
+                "Run once with debug.save_first_post_rollout_batch=True to create it."
+            )
+        if not os.path.exists(metrics_path):
+            raise FileNotFoundError(
+                f"debug.load_first_post_rollout_batch=True but {metrics_path} does not exist. "
+                "Run once with debug.save_first_post_rollout_batch=True to create it."
+            )
+
+        logging_rank0(f"[DEBUG] load post-rollout data from {rb_path}, {metrics_path}")
+        return (
+            torch.load(rb_path, map_location="cpu", weights_only=False),
+            torch.load(metrics_path, map_location="cpu", weights_only=False),
+        )
+
     async def train_one_ppo_step(
         self,
         epoch_i,
@@ -888,6 +958,11 @@ class GrpoTrainActor(
                     metrics, "debug-tmp",
                     f"rollout_metrics_{ppo_step_i}_{torch.distributed.get_rank()}.pt"
                 )
+
+        self._debug_maybe_save_post_rollout_batches(rollout_batches, metrics, ppo_step_i)
+        rollout_batches, metrics = self._debug_maybe_load_post_rollout_batches(
+            rollout_batches, metrics, ppo_step_i
+        )
 
         assert len(rollout_batches) == rollout_nb, f'{len(rollout_batches)=} {rollout_nb=}'
         assert len(next(iter(rollout_batches[0].values()))) == rollout_mbs * keep_n
@@ -1071,15 +1146,7 @@ class GrpoTrainActor(
         # save final ckpt
         cpu_barrier()
         if ppo_step % training_config.save_interval != 0:
-            logging_memory_usage_details("memory tracking before vllm sleep", rank=0)
-            if self.config.placement_type != "disaggregated":
-                for sampler_idx in range(self.sampler_client.num_samplers):
-                    await self.sampler_client.sleep(sampler_idx)
-                cpu_barrier()
-            logging_memory_usage_details("memory tracking after vllm sleep", rank=0)
-            clear_memory()
-            self.policy_engine.onload_model()
-            self.policy_engine.onload_optimizer()
+            await self.prepare_for_final_save()
             await self.save_checkpoint(ppo_step)
 
         if is_last_rank():

@@ -43,6 +43,43 @@ def get_advantage_clip_bounds(
     return None
 
 
+def count_advantage_clip_samples(
+    original_advantages: List[torch.Tensor],
+    advantages: List[torch.Tensor],
+    masks: List[torch.Tensor],
+) -> Tuple[int, int, int]:
+    """Count samples whose advantages were raised/lowered by clip bounds.
+
+    A sample counts if any masked response token differs after clamp:
+    lower clip raises values (``original < clipped``); upper clip lowers
+    them (``original > clipped``).
+
+    Parameters
+    ----------
+    original_advantages : list of torch.Tensor
+        Pre-clamp advantages, one tensor per sample.
+    advantages : list of torch.Tensor
+        Post-clamp advantages, same layout as ``original_advantages``.
+    masks : list of torch.Tensor
+        Response masks; dead / padded tokens (0) are ignored.
+
+    Returns
+    -------
+    tuple[int, int, int]
+        ``(n_lower_clipped, n_upper_clipped, n_samples)``.
+    """
+    assert len(original_advantages) == len(advantages) == len(masks)
+    n_lower = 0
+    n_upper = 0
+    for orig, clipped, mask in zip(original_advantages, advantages, masks, strict=True):
+        valid = mask.bool()
+        if not valid.any():
+            continue
+        n_lower += int((orig[valid] < clipped[valid]).any().item())
+        n_upper += int((orig[valid] > clipped[valid]).any().item())
+    return n_lower, n_upper, len(original_advantages)
+
+
 def create_response_mask(
     values: List[torch.Tensor],
     prompt_lengths: List[torch.Tensor],

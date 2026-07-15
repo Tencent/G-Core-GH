@@ -145,3 +145,28 @@ class DebugConfig(MappingProtocol):
                 )
         },
     )
+    save_first_post_rollout_batch: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "DEBUG: save rollout_batches/metrics immediately after rollout "
+                    "and optional post-filter. Used to align loss with/without "
+                    "dynamic context parallel while avoiding sampler randomness."
+                )
+        },
+    )
+    load_first_post_rollout_batch: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "DEBUG: replace rollout_batches/metrics immediately after rollout "
+                    "and optional post-filter with saved post-rollout data."
+                )
+        },
+    )
+    post_rollout_batch_debug_dir: str = field(
+        default="debug-tmp",
+        metadata={"help": "DEBUG: directory for post-rollout batch dump/load."},
+    )

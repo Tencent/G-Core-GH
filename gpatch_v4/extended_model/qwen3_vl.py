@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Any, Dict, List, Tuple
 
 import torch
@@ -16,20 +17,26 @@ from gpatch_v4.configs.config import FinetuneConfig
 from gpatch_v4.core.constants import MODEL_ARCH
 from gpatch_v4.extended_model.base import PrepareDataForward
 from gpatch_v4.extended_model.mtp_mixin import OnlineMtpSftMixin
-from gpatch_v4.utils import (
-    get_tensor_on_this_cp_rank,
-    pad_3d_seq_dim,
-    pad_or_truncate_last_dim,
-    qwen2vl_pad_and_split,
-)
+from gpatch_v4.utils import get_tensor_on_this_cp_rank, pad_3d_seq_dim
+from gpatch_v4.utils import pad_or_truncate_last_dim as pad_or_truncate_last_dim_left
+from gpatch_v4.utils import qwen2vl_pad_and_split
 from gpatch_v4.utils.dynamic_cp_utils import (
     _round_up,
     dyn_cp_schedule_default,
     dyn_cp_schedule_smart_padding,
 )
 
+pad_or_truncate_last_dim = partial(pad_or_truncate_last_dim_left, truncate_left=False)
+
 
 class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
+    def rl_train_cp_chunk_single_data(
+        self,
+        data: torch.Tensor,
+    ):
+        local_data = get_tensor_on_this_cp_rank(data, 1, key_name="target")
+        return local_data
+
     def _padding_images(
         self,
         vision_data: List[torch.Tensor],
@@ -1369,7 +1376,11 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             batch["opd_topk_ids"] = opd_topk_ids
         if mpu.is_pipeline_last_stage():
             keys_to_cuda = [
-                "mask", "prev_log_probs", "ref_log_probs", "teacher_log_probs", "advantages",
+                "mask",
+                "prev_log_probs",
+                "ref_log_probs",
+                "teacher_log_probs",
+                "advantages",
                 "rollout_log_probs",
             ]
             if has_topk:
@@ -1543,4 +1554,5 @@ class Qwen3VLDpoPrepareDataForward(Qwen3VLPrepareDataForward):
 
         assert "ref_logprobs" not in batch, f"{batch=}"
         batch["ref_logprobs"] = ref_logprobs
+        batch["full_tokens"] = batch["tokens"]
         return batch, fwd_kwargs

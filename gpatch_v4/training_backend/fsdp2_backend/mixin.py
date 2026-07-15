@@ -92,12 +92,19 @@ class Fsdp2EngineMixin:
 
     def get_model_cls(self):
         model_arch = getattr(self.policy_config, 'model_arch', None)
+        model_cls = AutoModelForCausalLM
         if model_arch == 'gemma4':
             from transformers import AutoModelForImageTextToText
-            return AutoModelForImageTextToText
+            model_cls = AutoModelForImageTextToText
         if model_arch == 'deepseek_v4':
-            return DeepseekV4ForCausalLM
-        return AutoModelForCausalLM
+            model_cls = DeepseekV4ForCausalLM
+        if model_arch in ["qwen3_5", "qwen3_5_moe"]:
+            from transformers import (
+                Qwen3_5ForConditionalGeneration,
+                Qwen3_5MoeForConditionalGeneration,
+            )
+            model_cls = Qwen3_5MoeForConditionalGeneration if model_arch == "qwen3_5_moe" else Qwen3_5ForConditionalGeneration
+        return model_cls
 
     def _setup_device_mesh(self):
         world_size = dist.get_world_size()
@@ -320,6 +327,8 @@ class Fsdp2EngineMixin:
                 ep_backend=self.policy_config.ep_backend,
                 deepep_num_sms=self.policy_config.deepep_num_sms,
                 fp8_qat=self.policy_config.fp8_qat,
+                fp4_qat=self.policy_config.fp4_qat,
+                fp8=self.policy_config.fp8,
             )
             model.load_checkpoint_hp(hf_model_path)
             if not model_only_inference:
@@ -331,7 +340,7 @@ class Fsdp2EngineMixin:
 
 
 class CheckpointMixin:
-    def save_checkpoint(self, global_step: int):
+    def save_checkpoint(self, global_step: int, dataloader=None):
         if isinstance(self.model, HpModule):
             # HpModule path (DeepSeek-V4 / Qwen3.5-MoE EP+CP+FSDP2): write a
             # self-contained ``from_pretrained``-ready bf16 HF directory under
@@ -355,6 +364,7 @@ class CheckpointMixin:
         )
         if self.config.checkpoint.convert_mcore_to_hf_online:
             save_hf_checkpoint(self.config, self.model, self.tokenizer, global_step=global_step)
+        # TODO: Save dataloader state if provided
 
 
 class RouterReplayMixin:
@@ -412,6 +422,7 @@ class RouterReplayMixin:
             index = (full_index + (full_index // seq_batch) * 6 * dp_rank) % seq_batch
 
             if cp_size > 1:
+                # todo zz: shard replay rows with the same CP token index map
                 s_local = seq_length // cp_size
                 start = cp_rank * s_local
                 index = index[start:start + s_local]
@@ -430,6 +441,13 @@ class RouterReplayMixin:
         batches: List[Dict[str, Any]],
         seq_length: int,
     ):
+        """Scope router replay for one micro-batch forward **and** backward.
+
+        ``router_replay_ctx`` tears down replay state on exit. When gradient
+        checkpointing is enabled the backward pass re-runs forward (recompute)
+        and still needs the pinned ``expert_idx`` from rollout — callers must
+        keep this context open until ``loss.backward()`` returns.
+        """
         if not self.config.training.moe_router_replay:
             yield
             return
@@ -504,6 +522,7 @@ class ForwardStepMixin(RouterReplayMixin):
             self.prepare_data,
             (DeepseekV4PrepareDataForwardLLM, DeepseekV4DpoPrepareDataForwardLLM)
         ):
+            # todo zz: invert DSV4 zigzag order, including per-segment THD
             return all_gather_from_context_parallel_region_no_zigzag(local_tensor, gather_dim)
         else:
             return all_gather_from_context_parallel_region(local_tensor, gather_dim)
@@ -529,13 +548,14 @@ class ForwardStepMixin(RouterReplayMixin):
         # Handle batch dimension - logits should be [batch_size, seq_len, vocab_size]
         assert logits.dim() == 3
         assert input_ids.dim() == 2
+        # todo zz: thread THD boundaries into segment-aware CP reconstruction
         assert cu_seqlens is None, "cu_seqlens is not supported"
 
         if temperature is not None:
             logits = logits.div(temperature)
 
         targets = input_ids.roll(shifts=-1, dims=-1)
-        local_targets = self.prepare_data._rl_train_cp_chunk_single_data(targets)
+        local_targets = self.prepare_data.rl_train_cp_chunk_single_data(targets)
         # targets = input_ids[:, 1:].to(device=shifted_logits.device)
 
         assert logits.shape[:2] == local_targets.shape, f"{logits.shape=} {local_targets.shape=}"
@@ -613,6 +633,7 @@ class ForwardStepMixin(RouterReplayMixin):
                 "(pack-seq does its own token-budget micro-batch splitting)"
             )
             dp_group = mpu.get_data_parallel_group()
+            # todo zz: budget with the effective per-segment zigzag alignment
             data_iter = convert_mbs_for_pack_seq(
                 batch,
                 max_token_len=training_config.seq_length,
@@ -719,9 +740,13 @@ class ForwardStepMixin(RouterReplayMixin):
             labels = batch["labels"]
             if enable_balance_loss:
                 fwd_kwargs["output_router_logits"] = True
+            train_forward_context = (
+                nullcontext() if self.training_config.recompute else self.checkpoint_context_fn()[0]
+            )
+            with train_forward_context:
+                outputs = self.model(**fwd_kwargs)
             # Cast to fp32 for numerically stable cross entropy (log-sum-exp in
             # bf16/fp16 is lossy); consistent with logprob path above.
-            outputs = self.model(**fwd_kwargs)
             logits = outputs.logits.float()
             labels_2d = labels
             loss_mask_2d = loss_mask

@@ -31,6 +31,11 @@ training:
   metrics_report:
     - "acc_reward"
     - "fmt_reward"
+  # For FSDP2 DeepSeek-V4 TopKRouter
+  freeze_router_weight: False
+  freeze_router_correction_bias: True
+  router_correction_bias_update_speed: 1e-3
+  router_correction_bias_use_abs_update: True
 
 checkpoint:
   load_ckpt_path: ckpt_math_dsv4_grpo_vllm_colocate

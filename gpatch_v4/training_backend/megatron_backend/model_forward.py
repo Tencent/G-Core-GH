@@ -5,6 +5,22 @@ from gpatch.core.smart_pad_helper import postprocess_packed_seqs, preprocess_pac
 
 
 def gptmodel_pack_foward(model, batch, fwd_kwargs):
+    # If a pre-built packed_seq_params is already present (e.g. DSv4 mcore CP THD
+    # built by _sft_train_mcore_cp_thd), pass it through directly without
+    # reconstructing a new PSP from the pad-mask.  The model receives the correct
+    # qkv_format='thd' + cp_partition_mode='contiguous' PSP.
+    if fwd_kwargs.get("packed_seq_params", None) is not None:
+        return model(
+            input_ids=fwd_kwargs["input_ids"],
+            position_ids=fwd_kwargs.get("position_ids"),
+            attention_mask=None,
+            labels=None,
+            packed_seq_params=fwd_kwargs["packed_seq_params"],
+        )
+
+    #TODO(hessianiu)
+    # add support for contiguous cp_partition_mode
+
     # pack seq len
     assert not (
         model.position_embedding_type == 'mrope' and not model.config.multi_latent_attention

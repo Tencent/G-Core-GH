@@ -206,7 +206,7 @@ def open_flat_ipc_bucket(
     update_info : dict
         Per-bucket payload shipped over ``collective_rpc``. Expected
         keys (produced by :class:`FlatIpcBucketBuilder` + the trainer
-        all_gather in ``UpdateWeightIpcMixin._update_weights_by_bucketed_ipc_vllm``)::
+        all_gather in ``VllmUpdateWeightFactory._update_bucketed_ipc``)::
 
             {
                 "names":       [<str>, ...],           # weight order in flat

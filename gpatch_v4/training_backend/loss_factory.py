@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
@@ -26,7 +27,11 @@ from gpatch_v4.utils import (
 )
 from gpatch_v4.utils.common_utils import import_fn_from_path
 from gpatch_v4.utils.ppo_utils import calculate_kl_loss
-from gpatch_v4.utils.training_utils import from_parallel_logits_to_topk_logprobs
+from gpatch_v4.utils.training_utils import (
+    from_parallel_logits_to_topk_logprobs,
+    masked_sum,
+    masked_sum_per_seq,
+)
 
 try:
     from gpatch_v4.kernel import linear_cross_entropy, set_linear_ce_backend
@@ -116,6 +121,77 @@ class PolicyLossInput:
     # to eliminate the length bias inherent in token-weighted averaging.
     cu_seqlens_padded: Optional[torch.Tensor] = None
     local_cp_size: int = 1
+    calculate_per_token_loss: bool = False
+
+
+def _normalize_local_cp_size(local_cp_size: Any) -> int:
+    if isinstance(local_cp_size, torch.Tensor):
+        return int(local_cp_size.item())
+    return int(local_cp_size)
+
+
+def _thd_cu_seqlens_for_values(
+    cu_seqlens_padded: torch.Tensor,
+    values_numel: int,
+    local_cp_size: int,
+) -> torch.Tensor:
+    """Map global THD ``cu_seqlens_padded`` to boundaries that match ``values``.
+
+    Dyn-CP / TE THD CP shards token tensors into a local compact buffer of length
+    ``global_tokens / local_cp_size``.  ``cu_seqlens_padded`` on the batch stays
+    global (needed by attention ``PackedSeqParams``), but per-sample loss
+    aggregation must slice the *local* buffer.
+
+    TE ``thd_partition_indices_kernel`` lays local tokens out with
+    ``local_cu[i] = global_cu[i] / cp_size`` (each sequence length is required to
+    be divisible by ``cp_size * 2``).  When ``local_cp_size == 1``, ``values`` is
+    the full packed tensor and global boundaries apply unchanged.
+    """
+    local_cp_size = _normalize_local_cp_size(local_cp_size)
+    if local_cp_size <= 1:
+        return cu_seqlens_padded
+
+    global_tokens = int(cu_seqlens_padded[-1].item())
+    assert global_tokens % local_cp_size == 0, (
+        f"cu_seqlens_padded[-1]={global_tokens} not divisible by "
+        f"local_cp_size={local_cp_size}"
+    )
+    expected_local = global_tokens // local_cp_size
+    assert values_numel == expected_local, (
+        f"THD per-sample: local values length {values_numel} != "
+        f"cu_seqlens_padded[-1]//local_cp_size ({global_tokens}//{local_cp_size}). "
+        "After dyn-cp CP shard, slice with local boundaries (cu // cp_size)."
+    )
+    # Exact integer division: TE requires each cu boundary % (cp * 2) == 0.
+    return cu_seqlens_padded // local_cp_size
+
+
+def _thd_per_sample_sum_and_count_local(
+    values_flat: torch.Tensor,
+    mask_flat: torch.Tensor,
+    cu_seqlens_for_values: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-sample masked sum/count on a (possibly CP-local) packed tensor."""
+    num_samples = cu_seqlens_for_values.shape[0] - 1
+    n = values_flat.numel()
+    assert int(
+        cu_seqlens_for_values[0].item()
+    ) == 0, (f"cu_seqlens_for_values[0] must be 0, got {int(cu_seqlens_for_values[0].item())}")
+    assert int(cu_seqlens_for_values[-1].item()) == n, (
+        f"cu_seqlens_for_values[-1]={int(cu_seqlens_for_values[-1].item())} "
+        f"!= values length {n}; refusing silent OOB slice"
+    )
+    per_sample_sums = []
+    per_sample_counts = []
+    for i in range(num_samples):
+        s = int(cu_seqlens_for_values[i].item())
+        e = int(cu_seqlens_for_values[i + 1].item())
+        assert 0 <= s <= e <= n, (
+            f"sample {i} bounds [{s}, {e}) out of range for values length {n}"
+        )
+        per_sample_sums.append(values_flat[s:e].sum())
+        per_sample_counts.append(mask_flat[s:e].sum())
+    return torch.stack(per_sample_sums), torch.stack(per_sample_counts)
 
 
 def masked_mean_per_sample_or_token(
@@ -135,9 +211,10 @@ def masked_mean_per_sample_or_token(
     each sample equal weight regardless of response length, eliminating the
     length bias of per-token averaging.
 
-    When ``local_cp_size > 1``, samples are split across CP ranks. In that
-    case the per-sample numerator and denominator are all-reduced across the
-    local CP group before division to obtain the correct global per-sample mean.
+    When ``local_cp_size > 1``, ``values``/``mask`` are CP-local compact shards
+    while ``cu_seqlens_padded`` remains global. Boundaries are remapped via
+    ``cu // local_cp_size`` (TE local layout), then per-sample numerator and
+    denominator are all-reduced across the local CP group before division.
     """
     if cu_seqlens_padded is None or calculate_per_token_loss:
         return masked_mean(values, mask)
@@ -149,19 +226,12 @@ def masked_mean_per_sample_or_token(
     # THD packed format: per-sample
     values_flat = torch.where(mask > 0, values, 0.0).reshape(-1)
     mask_flat = mask.reshape(-1)
-    num_samples = cu_seqlens_padded.shape[0] - 1
-    per_sample_sums = []
-    per_sample_counts = []
-    for i in range(num_samples):
-        s = cu_seqlens_padded[i].item()
-        e = cu_seqlens_padded[i + 1].item()
-        per_sample_sums.append(values_flat[s:e].sum())
-        per_sample_counts.append(mask_flat[s:e].sum())
-    sums = torch.stack(per_sample_sums)
-    counts = torch.stack(per_sample_counts)
+    local_cp_size = _normalize_local_cp_size(local_cp_size)
+    cu_for_values = _thd_cu_seqlens_for_values(
+        cu_seqlens_padded, values_flat.numel(), local_cp_size
+    )
+    sums, counts = _thd_per_sample_sum_and_count_local(values_flat, mask_flat, cu_for_values)
 
-    local_cp_size = local_cp_size.item() if isinstance(local_cp_size,
-                                                       torch.Tensor) else int(local_cp_size)
     if local_cp_size > 1:
         cp_group = mpu.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
         combined = torch.stack([sums, counts])
@@ -169,6 +239,123 @@ def masked_mean_per_sample_or_token(
         sums, counts = combined[0], combined[1]
 
     return (sums / counts.clamp(min=1)).mean()
+
+
+def _masked_sample_sum_and_count(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    cu_seqlens_padded: Optional[torch.Tensor] = None,
+    local_cp_size: int = 1,
+    sample_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-sample ``(sum_of_token_means, sample_count)`` for one micro-batch."""
+    if cu_seqlens_padded is not None:
+        values_flat = torch.where(mask > 0, values, 0.0).reshape(-1)
+        mask_flat = mask.reshape(-1)
+        local_cp_size = _normalize_local_cp_size(local_cp_size)
+        cu_for_values = _thd_cu_seqlens_for_values(
+            cu_seqlens_padded, values_flat.numel(), local_cp_size
+        )
+        num_samples = cu_for_values.shape[0] - 1
+        sums, counts = _thd_per_sample_sum_and_count_local(values_flat, mask_flat, cu_for_values)
+
+        if local_cp_size > 1:
+            cp_group = mpu.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
+            combined = torch.stack([sums, counts])
+            dist.all_reduce(combined, group=cp_group, op=dist.ReduceOp.SUM)
+            sums, counts = combined[0], combined[1]
+
+        # Matches `masked_mean_per_sample_or_token`'s `.mean()`: every
+        # cu_seqlens_padded segment counts once toward the denominator (an
+        # empty/dead segment naturally contributes 0 to the numerator via
+        # `sums=0 -> 0/clamp(1)=0`, exactly like the pre-existing THD path).
+        per_sample_mean = sums / counts.clamp(min=1)
+        return per_sample_mean.sum(), sums.new_tensor(float(num_samples))
+
+    # Plain 2D per-sample (non-THD, non-dynamic-CP): each row is one sample.
+    count = sample_mask.sum() if sample_mask is not None else mask.new_tensor(float(mask.shape[0]))
+    return masked_sum_per_seq(values, mask, sample_mask), count
+
+
+def masked_sum_and_count_per_sample_or_token(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    cu_seqlens_padded: Optional[torch.Tensor] = None,
+    calculate_per_token_loss: bool = False,
+    local_cp_size: int = 1,
+    sample_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """GBS-scope token/sample sums+counts for reporting and backward.
+
+    Always computes both per-token and per-sample aggregates for the local
+    micro-batch, then returns three ``(sum, count)`` pairs:
+
+    1. Detached token-sum / token-count -- for metrics / logging.
+    2. Detached sample-sum / sample-count -- for metrics / logging.
+    3. With-grad backward pair -- token-sum/count when
+       ``calculate_per_token_loss=True``, else sample-sum/count.
+
+    The caller accumulates the chosen backward numerator across micro-batches
+    and DP (/CP) ranks and divides **once** by the matching global count --
+    same pattern as ``global_n`` in ``Fsdp2EngineMixin._finetune_step`` for
+    SFT. In dynamic-CP per-sample mode, CP-collaborator ranks each receive the
+    whole-sample mean after the subgroup all-reduce; caller-side normalizer
+    plumbing must account for that CP participation consistently.
+
+    Supports both THD/dynamic-CP packed batches (``cu_seqlens_padded`` set)
+    and plain 2D ``[B, S]`` batches (``cu_seqlens_padded=None``).
+
+    Parameters
+    ----------
+    values : Tensor
+        Per-token values, ``[B, S]``.
+    mask : Tensor
+        Per-token validity mask, ``[B, S]``; ``1`` marks tokens that count.
+    cu_seqlens_padded : Tensor, optional
+        THD packed-format sample boundaries. When ``None``, ``values``/``mask``
+        are treated as a plain 2D batch where each row is one sample.
+    calculate_per_token_loss : bool
+        Selects which aggregate keeps gradients in the third pair.
+        ``True``: token flat sum (no CP-subgroup reduce needed).
+        ``False``: sum of per-sample token-means.
+    local_cp_size : int
+        When > 1, ``values``/``mask`` are CP-local compact shards while
+        ``cu_seqlens_padded`` stays global; boundaries are remapped with
+        ``cu // local_cp_size`` (TE layout), then per-sample sum/count are
+        all-reduced over the dynamic-CP subgroup before dividing.
+    sample_mask : Tensor, optional
+        ``[B]``; drops dead rows from the plain-2D per-sample path.
+
+    Returns
+    -------
+    token_sum_det, token_count_det, sample_sum_det, sample_count_det, bwd_sum, bwd_count
+        Six scalars. The first four are detached; ``bwd_sum``/``bwd_count``
+        carry gradients for the selected aggregation mode.
+    """
+    # Always compute both aggregates (reporting needs both). Only the selected
+    # backward target keeps the autograd graph; the other runs under no_grad.
+    with nullcontext() if calculate_per_token_loss else torch.no_grad():
+        token_sum = masked_sum(values, mask)
+        token_count = mask.sum()
+
+    with torch.no_grad() if calculate_per_token_loss else nullcontext():
+        sample_sum, sample_count = _masked_sample_sum_and_count(
+            values, mask, cu_seqlens_padded, local_cp_size, sample_mask
+        )
+
+    if calculate_per_token_loss:
+        bwd_sum, bwd_count = token_sum, token_count
+    else:
+        bwd_sum, bwd_count = sample_sum, sample_count
+
+    return (
+        token_sum.detach().clone(),
+        token_count.detach().clone(),
+        sample_sum.detach().clone(),
+        sample_count.detach().clone(),
+        bwd_sum,
+        bwd_count,
+    )
 
 
 @dataclass
@@ -401,6 +588,7 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
     dumped_topk_logprobs = loss_input.dumped_topk_logprobs
     dumped_topk_token_ids = loss_input.dumped_topk_token_ids
     sample_mask = loss_input.sample_mask
+    calculate_per_token_loss = loss_input.calculate_per_token_loss
 
     if ppo_config.skip_prev_logps:
         log_ratio = curr_log_probs - curr_log_probs.detach()
@@ -459,14 +647,32 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
     if config.ppo.enable_off_policy_correction:
         actor_loss = actor_loss * correction_ratio
 
-    actor_loss = masked_mean_per_sample_or_token(
-        actor_loss,
-        response_mask,
-        loss_input.cu_seqlens_padded,
-        config.policy.override_transformer_config.get("calculate_per_token_loss", False),
-        loss_input.local_cp_size,
+    cu_seqlens_padded = loss_input.cu_seqlens_padded
+    local_cp_size = loss_input.local_cp_size
+
+    (
+        actor_token_sum,
+        actor_token_count,
+        actor_sample_sum,
+        actor_sample_count,
+        actor_bwd_sum,
+        actor_bwd_count,
+    ) = masked_sum_and_count_per_sample_or_token(
+        actor_loss, response_mask, cu_seqlens_padded, calculate_per_token_loss, local_cp_size,
+        sample_mask
     )
-    loss = actor_loss - scaled_entropy * ppo_config.ppo_entropy_bonus
+    (
+        entropy_token_sum,
+        entropy_token_count,
+        entropy_sample_sum,
+        entropy_sample_count,
+        entropy_bwd_sum,
+        entropy_bwd_count,
+    ) = masked_sum_and_count_per_sample_or_token(
+        per_token_entropy, response_mask, cu_seqlens_padded, calculate_per_token_loss,
+        local_cp_size, sample_mask
+    )
+    loss = actor_bwd_sum - entropy_bwd_sum * ppo_config.ppo_entropy_bonus
 
     with torch.no_grad():
         ppo_ratio = masked_mean(ratios.detach(), response_mask)
@@ -495,29 +701,44 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
         use_absolute_kl = True
         use_low_var_kl = False
     if ref_log_probs is not None:
-        kl_loss = masked_mean(
-            calculate_kl_loss(
-                cur_log_probs=curr_log_probs,
-                ref_log_probs=ref_log_probs,
-                use_absolute_kl=use_absolute_kl,
-                use_low_var_kl=use_low_var_kl,
-                clamp_kl_loss=ppo_config.ppo_dual_clip_ratio_c is not None,
-                clamp_kl_val=ppo_config.ppo_clamp_kl_val,
-            ), response_mask
+        per_token_kl = calculate_kl_loss(
+            cur_log_probs=curr_log_probs,
+            ref_log_probs=ref_log_probs,
+            use_absolute_kl=use_absolute_kl,
+            use_low_var_kl=use_low_var_kl,
+            clamp_kl_loss=ppo_config.ppo_dual_clip_ratio_c is not None,
+            clamp_kl_val=ppo_config.ppo_clamp_kl_val,
         )
-        loss = loss + kl_loss * ppo_config.grpo_kl_loss_beta
+        (
+            kl_token_sum,
+            kl_token_count,
+            kl_sample_sum,
+            kl_sample_count,
+            kl_bwd_sum,
+            kl_bwd_count,
+        ) = masked_sum_and_count_per_sample_or_token(
+            per_token_kl, response_mask, cu_seqlens_padded, calculate_per_token_loss, local_cp_size,
+            sample_mask
+        )
+        loss = loss + kl_bwd_sum * ppo_config.grpo_kl_loss_beta
     else:
-        kl_loss = torch.zeros_like(loss)
+        per_token_kl = None
+        zero = torch.zeros_like(actor_token_sum)
+        kl_token_sum = kl_sample_sum = kl_bwd_sum = zero
+        kl_token_count = actor_token_count
+        kl_sample_count = actor_sample_count
+        kl_bwd_count = actor_bwd_count
 
     bwd_loss = loss.clone()
 
+    # Dead-sample retention is applied by the training backend's global
+    # normalizer (per-sample: N = retention * gbs; per-token: mask.sum()
+    # already ignores dead rows). Do NOT divide bwd_loss by retention here
+    # or the compensation is applied twice. Keep the ratio only for
+    # logging-only ``*_dead_aware`` metrics below.
     global_retention_ratio = loss_input.global_retention_ratio
     if hasattr(config, "debug") and getattr(config.debug, "ignore_global_retention_ratio", False):
-        # DEBUG: skip the 1/global_retention_ratio compensation for grad-scaling experiments.
         global_retention_ratio = None
-    if global_retention_ratio is not None:
-        global_retention_ratio_scalar = global_retention_ratio.flatten()[0].clamp(min=1e-6)
-        bwd_loss = bwd_loss / global_retention_ratio_scalar
 
     with torch.no_grad():
         numel = response_mask.sum()
@@ -536,12 +757,23 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
         )
 
         metrics = {
-            "loss": torch.stack([loss.detach() * numel, numel]),
-            "policy_loss": torch.stack([actor_loss.detach() * numel, numel]),
+            # Main loss metrics: same GBS-scope numerators as backward.
+            "loss": torch.stack([loss.detach(), actor_bwd_count.detach()]),
+            "policy_loss": torch.stack([actor_bwd_sum.detach(),
+                                        actor_bwd_count.detach()]),
+            "scaled_entropy": torch.stack([entropy_bwd_sum.detach(),
+                                           entropy_bwd_count.detach()]),
+            "grpo_kl_loss": torch.stack([kl_bwd_sum.detach(),
+                                         kl_bwd_count.detach()]),
             "ppo_ratio": torch.stack([ppo_ratio * numel, numel]),
             "ppo_ratio_clamped": torch.stack([ppo_ratio_clamped * numel, numel]),
-            "scaled_entropy": torch.stack([scaled_entropy * numel, numel]),
-            "grpo_kl_loss": torch.stack([kl_loss.detach() * numel, numel]),
+            # Extra token / sample pairs for reporting (detached).
+            "policy_loss_token": torch.stack([actor_token_sum, actor_token_count]),
+            "policy_loss_sample": torch.stack([actor_sample_sum, actor_sample_count]),
+            "entropy_token": torch.stack([entropy_token_sum, entropy_token_count]),
+            "entropy_sample": torch.stack([entropy_sample_sum, entropy_sample_count]),
+            "grpo_kl_token": torch.stack([kl_token_sum, kl_token_count]),
+            "grpo_kl_sample": torch.stack([kl_sample_sum, kl_sample_count]),
             **clip_metrics,
         }
 
@@ -556,9 +788,10 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
 
     if global_retention_ratio is not None:
         grr_scalar = global_retention_ratio.flatten()[0].clamp(min=1e-6)
-        metrics["loss_dead_aware"] = torch.stack([loss.detach() / grr_scalar * numel, numel])
+        bwd_count = actor_bwd_count.detach()
+        metrics["loss_dead_aware"] = torch.stack([loss.detach() / grr_scalar, bwd_count])
         metrics["policy_loss_dead_aware"] = torch.stack(
-            [actor_loss.detach() / grr_scalar * numel, numel]
+            [actor_bwd_sum.detach() / grr_scalar, bwd_count]
         )
 
     reduce_metrics_across_data_parallel_group(metrics)
@@ -2112,7 +2345,7 @@ def dpo_loss_func(
     batch = loss_input.batch
     labels = batch["labels"]
     loss_mask = batch["full_loss_mask"][:, :-1]
-    target = batch["tokens"]
+    target = batch["full_tokens"]
 
     assert logits.shape[0] % 2 == 0, "mbs must be 2*n"
     rbs = logits.shape[0] // 2
@@ -2496,3 +2729,15 @@ def load_balancing_loss_func(
 
     overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
     return overall_loss * num_experts
+
+
+# RL loss functions whose backward value is a sum of per-sequence token-means
+# (seq-mean-token-mean numerator) rather than a micro-batch token-mean. The
+# training backend divides this by the global active-sequence count. Loss funcs
+# not listed here keep the legacy micro-batch-mean backward semantics.
+SEQ_MEAN_RL_LOSS_FNS = {grpo_loss_func}
+
+
+def is_seq_mean_rl_loss_fn(fn: Callable) -> bool:
+    """Whether ``fn`` returns the seq-mean-token-mean sum as its backward loss."""
+    return fn in SEQ_MEAN_RL_LOSS_FNS

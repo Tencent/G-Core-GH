@@ -250,6 +250,54 @@ def test_router_replay_ctx_survives_double_forward(_):
 
 
 @_PATCH_ITER
+def test_router_replay_ctx_must_cover_backward_recompute(_):
+    """FSDP2 GRPO 场景：ctx 在 backward 前退出则 recompute 拿不到 expert_idx。"""
+    from torch.utils.checkpoint import checkpoint
+
+    model = _TwoLayerModel()
+    x = torch.randn(4, 8, requires_grad=True)
+    num_experts = model.gate0.weight.shape[0]
+    target_0 = torch.randint(0, num_experts, (4, 2))
+    target_1 = torch.randint(0, num_experts, (4, 2))
+
+    def _run_with_hook(backward_inside_ctx: bool) -> list[torch.Tensor]:
+        captured: list[torch.Tensor] = []
+
+        def _gate0_hook(mod, inp, out):
+            captured.append(out[2].detach().clone())
+
+        handle = model.gate0.register_forward_hook(_gate0_hook)
+        try:
+            with router_replay_ctx(model, [target_0, target_1]):
+                weights0 = checkpoint(model.gate0, x, use_reentrant=False)[1]
+                weights1 = checkpoint(model.gate1, x, use_reentrant=False)[1]
+                loss = weights0.sum() + weights1.sum()
+                if backward_inside_ctx:
+                    loss.backward()
+                else:
+                    pass
+            if not backward_inside_ctx:
+                loss.backward()
+        finally:
+            handle.remove()
+        return captured
+
+    outside = _run_with_hook(backward_inside_ctx=False)
+    assert len(outside) == 2
+    assert torch.equal(outside[0], target_0)
+    assert not torch.equal(outside[1], target_0), (
+        "recompute must not fall back to natural topk when replay indices are pinned"
+    )
+
+    model.zero_grad(set_to_none=True)
+    x.grad = None
+    inside = _run_with_hook(backward_inside_ctx=True)
+    assert len(inside) == 2
+    assert torch.equal(inside[0], target_0)
+    assert torch.equal(inside[1], target_0)
+
+
+@_PATCH_ITER
 def test_router_replay_ctx_grad_flows(_):
     """replay 路径下 scores 仍然收到梯度。"""
     model = _TwoLayerModel()

@@ -12,11 +12,7 @@ from typing_extensions import override
 from megatron.core import mpu
 
 from gpatch_v4.client.base_client import BaseClientAbc, SamplerClientMixin
-from gpatch_v4.client.mixin import (
-    TestFuncMixin,
-    UpdateWeightDistributedMixin,
-    UpdateWeightIpcMixin,
-)
+from gpatch_v4.client.mixin import TestFuncMixin, UpdateWeightMixin
 from gpatch_v4.configs.config import RlConfig
 from gpatch_v4.core.parallel_state import cpu_barrier
 from gpatch_v4.utils import log, logging_rank0, perf_time
@@ -25,8 +21,7 @@ from gpatch_v4.utils import log, logging_rank0, perf_time
 class SamplerClient(
     BaseClientAbc,
     SamplerClientMixin,
-    UpdateWeightIpcMixin,
-    UpdateWeightDistributedMixin,
+    UpdateWeightMixin,
     TestFuncMixin,
 ):
     """Client for communicating with sampler inference engines.
@@ -279,9 +274,9 @@ class SamplerClient(
         """Wake up the sampler (if colocated) and push updated model weights.
 
         * colocated (``placement_type != "disaggregated"``) →
-          :meth:`UpdateWeightIpcMixin.update_weights_by_ipc_handle`
+          :meth:`UpdateWeightMixin.update_weights_by_ipc_handle`
         * disaggregated →
-          :meth:`UpdateWeightDistributedMixin.update_weights_by_distributed`
+          :meth:`UpdateWeightMixin.update_weights_by_distributed`
 
         Parameters
         ----------

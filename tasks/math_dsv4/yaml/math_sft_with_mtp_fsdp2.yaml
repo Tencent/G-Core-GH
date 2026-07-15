@@ -32,6 +32,11 @@ training:
   recompute: True
   enable_mtp: True               # enable DeepSeek-V4 MTP training path
   mtp_loss_scaling_factor: 0.1
+  # For FSDP2 DeepSeek-V4 TopKRouter
+  freeze_router_weight: False
+  freeze_router_correction_bias: True
+  router_correction_bias_update_speed: 1e-3
+  router_correction_bias_use_abs_update: True
 
 policy:
   dist_config:
@@ -42,6 +47,7 @@ policy:
   model_arch: "deepseek_v4"
   attn_implementation: "fused"
   indexer_backend: "fused"
+  fp8: false                      # TE FP8 block-scaling MoE grouped GEMM
   without_ref: True
   hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
   hf_tokenizer_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"

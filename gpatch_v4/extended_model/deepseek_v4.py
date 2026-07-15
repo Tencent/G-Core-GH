@@ -6,26 +6,49 @@ import torch
 import torch.distributed as dist
 from transformers import DeepseekV4Config
 from typing_extensions import override
+from contextlib import nullcontext
 
 from megatron.core import mpu
 
+from gpatch_v4.extended_model.base import (
+    PostInitModel,
+    CheckpointContextFn,
+    ResetRouterCorrectionBiasAccum,
+    UpdateRouterCorrectionBias,
+)
 from gpatch_v4.extended_model.llm import DpoPrepareDataForwardLLM, PrepareDataForwardLLM
 from gpatch_v4.models.deepseek_v4.cp import cp_chunk_data
 from gpatch_v4.models.deepseek_v4.thd import pack_sequences
+from gpatch_v4.models.deepseek_v4.freeze_update_router import (
+    freeze_router_weights,
+    init_router_correction_bias_accumulators,
+    register_router_correction_bias_accum_tracking_hook,
+    checkpoint_context_fn,
+    reset_router_correction_bias_accum,
+    update_router_correction_bias,
+)
+from gpatch_v4.configs.config import FinetuneConfig, RlConfig
 
 
 class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
-    """DeepSeek-V4 SFT data preparation (HpModule, EP + CP).
+    """DeepSeek-V4 SFT data preparation (HpModule / mcore, EP + CP).
 
-    Two modes selected by ``config.training.pack_seq``:
+    Three modes, selected by training backend and ``ppo_pack_seq``:
 
-    **BSHD** (``pack_seq=False``, default): pads + stacks into ``[B, S]``
-    via the parent class, then overrides CP slicing to use contiguous
-    ``cp_chunk_data`` instead of Megatron-style zigzag.
+    **mcore CP THD** (mcore backend + CP > 1, ``ppo_pack_seq=False``):
+    packs samples into a single ``[1, T]`` sequence and builds a mcore
+    :class:`megatron.core.packed_seq_params.PackedSeqParams` with
+    ``qkv_format='thd'`` and ``cp_partition_mode='contiguous'``.
+    Required by :class:`DSv4HybridSelfAttention` which raises when
+    ``cp_size > 1`` but no THD PSP is provided.
 
-    **THD** (``pack_seq=True``): packs variable-length samples into a
-    single ``[1, T]`` sequence via :func:`pack_sequences`, builds
-    :class:`PackedSeqParams`, and CP-slices the layout.
+    **BSHD** (``ppo_pack_seq=False``, non-mcore-CP): pads + stacks into
+    ``[B, S]`` via the parent class, then overrides CP slicing to use
+    contiguous ``cp_chunk_data`` instead of Megatron-style zigzag.
+
+    **THD** (``ppo_pack_seq=True``): packs variable-length samples into a
+    single ``[1, T]`` sequence via :func:`pack_sequences`, builds the
+    HpModule :class:`PackedSeqParams`, and CP-slices the layout.
     """
     def __init__(self, config):
         super().__init__(config)
@@ -50,6 +73,13 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
         pad_with_random_token: bool = False,
         **kwargs,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        # contiguous CP requires THD format; choose PSP type by training backend.
+        cp_size = mpu.get_context_parallel_world_size()
+        is_mcore = getattr(self.config.training, "training_backend", "") == "mcore"
+
+        if is_mcore and cp_size > 1:
+            assert self.config.policy.ppo_pack_seq, "dsv4 mcore cp require thd format"
+
         if not self.config.policy.ppo_pack_seq:
             return super().sft_train(
                 batches,
@@ -59,7 +89,113 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
                 pad_with_random_token=pad_with_random_token,
                 **kwargs,
             )
+        if is_mcore:
+            return self._sft_train_mcore_thd(batches, seq_len, pad_token_id)
         return self._sft_train_thd(batches, seq_len, pad_token_id)
+
+    def _sft_train_mcore_thd(
+        self,
+        batches: List[Dict[str, Any]],
+        seq_len: int,
+        pad_token_id: int,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """Pack sequences into THD + mcore PackedSeqParams for DSv4 mcore CP.
+
+        Creates a ``megatron.core.packed_seq_params.PackedSeqParams`` with
+        ``qkv_format='thd'`` and ``cp_partition_mode='contiguous'``.  Each
+        sample is padded to the next multiple of ``cp_size`` so that the
+        total packed length ``T`` is exactly divisible by ``cp_size``; each
+        CP rank then receives a contiguous ``T // cp_size`` token slice.
+
+        The caller (``_sft_train_func`` in mixin.py) detects the non-None
+        ``packed_seq_params`` in ``fwd_kwargs`` and calls the model directly
+        instead of routing through ``gptmodel_pack_foward``.
+        """
+        from megatron.core.packed_seq_params import (
+            PackedSeqParams as McorePackedSeqParams,
+        )
+
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
+
+        ids_list: List[torch.Tensor] = []
+        labels_list: List[torch.Tensor] = []
+        for b in batches:
+            tok = b["tokens"]
+            # labels has not be shifted yet
+            lab = b["labels"]
+            if not isinstance(tok, torch.Tensor):
+                tok = torch.tensor(tok, dtype=torch.long)
+            if not isinstance(lab, torch.Tensor):
+                lab = torch.tensor(lab, dtype=torch.long)
+            assert tok.shape == lab.shape
+            if tok.shape[-1] > seq_len + 1:
+                tok = tok[-(seq_len + 1):]
+                lab = lab[-(seq_len + 1):]
+            # Next-token shift
+            tok = tok[:-1]
+            lab = lab[1:]
+            ids_list.append(tok.cuda(non_blocking=True))
+            labels_list.append(lab.cuda(non_blocking=True))
+
+        device = ids_list[0].device
+        seqlens = [t.shape[0] for t in ids_list]
+        # Pad each sample to the next cp_size multiple so that T % cp_size == 0.
+        padded_seqlens = [((s + cp_size - 1) // cp_size) * cp_size for s in seqlens]
+        T = sum(padded_seqlens)
+
+        # at least sliding window * cp
+        sliding_window = self._model_config.sliding_window
+        T = max(T, sliding_window * cp_size)
+
+        packed_ids = torch.full((1, T), pad_token_id, dtype=torch.long, device=device)
+        packed_labels = torch.full((1, T), -100, dtype=torch.long, device=device)
+
+        # Build cu_seqlens on CPU first to avoid per-element CPU→GPU sync, then transfer once.
+        cu_seqlens_cpu = torch.zeros(len(ids_list) + 1, dtype=torch.int32)
+        offset = 0
+        for i, (s, s_pad) in enumerate(zip(seqlens, padded_seqlens)):
+            packed_ids[0, offset:offset + s] = ids_list[i]
+            packed_labels[0, offset:offset + s] = labels_list[i]
+            offset += s_pad
+            cu_seqlens_cpu[i + 1] = offset
+        cu_seqlens = cu_seqlens_cpu.to(device)
+
+        psp = McorePackedSeqParams(
+            qkv_format="thd",
+            cp_partition_mode="contiguous",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max(padded_seqlens),
+            max_seqlen_kv=max(padded_seqlens),
+        )
+
+        # Contiguous CP slice: each rank owns T // cp_size tokens.
+        chunk = T // cp_size
+        start, end = cp_rank * chunk, (cp_rank + 1) * chunk
+        local_ids = packed_ids[:, start:end].contiguous()
+        local_labels = packed_labels[:, start:end].contiguous()
+        local_loss_mask = (local_labels != -100).float()
+        full_loss_mask = (packed_labels != -100).float()
+
+        batch_out: Dict[str, Any] = {
+            "labels": local_labels,
+            "loss_mask": local_loss_mask,
+            "full_labels": packed_labels,
+            "full_loss_mask": full_loss_mask,
+            "full_packed_seq_params": psp,
+        }
+        fwd_kwargs: Dict[str, Any] = {
+            "input_ids": local_ids,
+            # position_ids: THD CP mode computes RoPE positions internally from
+            # cu_seqlens via _thd_cp_position_ids; no external position_ids needed.
+            "position_ids": None,
+            "attention_mask": None,
+            "labels": None,
+            # Non-None PSP signals mixin.py to skip gptmodel_pack_foward.
+            "packed_seq_params": psp,
+        }
+        return batch_out, fwd_kwargs
 
     def _sft_train_thd(
         self,
@@ -189,7 +325,7 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
         return tokens, position_ids, attention_mask
 
     @override
-    def _rl_train_cp_chunk_single_data(
+    def rl_train_cp_chunk_single_data(
         self,
         data: torch.Tensor,
     ):
@@ -213,3 +349,85 @@ class DeepseekV4DpoPrepareDataForwardLLM(DpoPrepareDataForwardLLM, DeepseekV4Pre
     def __init__(self, config):
         super().__init__(config)
         assert not config.policy.ppo_pack_seq, ("DPO + THD pack_seq not supported for DSV4")
+
+
+class DeepseekV4PostInitModel(PostInitModel):
+    """Post-init model handler for DeepSeek-V4."""
+    def __init__(self, config):
+        super().__init__(config)
+
+    def __call__(self, model):
+        """Post-init the model.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+        """
+        # freeze MoE TopKRouter weight
+        if self.config.training.freeze_router_weight:
+            freeze_router_weights(model)
+        # init buffers for per-step router correction bias updates
+        # register forward hook to track router correction bias accum
+        if not self.config.training.freeze_router_correction_bias:
+            init_router_correction_bias_accumulators(model)
+            register_router_correction_bias_accum_tracking_hook(model)
+
+
+class DeepseekV4CheckpointContextFn(CheckpointContextFn):
+    """torch.utils.checkpoint.checkpoint context_fn for DeepSeek-V4."""
+    def __init__(self, config):
+        super().__init__(config)
+
+    def __call__(self, *args, **kwargs):
+        """torch.utils.checkpoint.checkpoint context_fn.
+
+        Parameters
+        ----------
+        *args : any
+        **kwargs : any
+
+        Returns
+        -------
+        union[tuple[nullcontext, nullcontext], tuple[contextmanager, contextmanager]]
+        """
+        if self.config.training.freeze_router_correction_bias or not isinstance(
+            self.config, (FinetuneConfig, RlConfig)
+        ):
+            return nullcontext(), nullcontext()
+        return checkpoint_context_fn()
+
+
+class DeepseekV4ResetRouterCorrectionBiasAccum(ResetRouterCorrectionBiasAccum):
+    """Reset router correction bias accum for DeepSeek-V4."""
+    def __init__(self, config):
+        super().__init__(config)
+
+    def __call__(self, model):
+        """Reset router correction bias accum.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+        """
+        reset_router_correction_bias_accum(model)
+
+
+class DeepseekV4UpdateRouterCorrectionBias(UpdateRouterCorrectionBias):
+    """Update router correction bias for DeepSeek-V4."""
+    def __init__(self, config):
+        super().__init__(config)
+
+    def __call__(self, model, update_speed, use_abs_update):
+        """Update router correction bias.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+        update_speed : float
+        use_abs_update : bool
+
+        Returns
+        -------
+        tuple[Optional[float], Optional[float]]
+        """
+        return update_router_correction_bias(model, update_speed, use_abs_update)

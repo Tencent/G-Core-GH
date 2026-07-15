@@ -21,6 +21,7 @@ from copy import deepcopy
 from typing import Literal, Optional
 
 import safetensors
+from safetensors import safe_open
 import safetensors.torch as st_torch
 import torch
 import torch.nn as nn
@@ -31,7 +32,7 @@ from gpatch_v4.utils import log_debug
 
 from .weight_export import _classify_for_save  # re-export for tests
 from .weight_export import _model_key_to_disk_key  # re-export for tests
-from .weight_export import iter_disk_checkpoint_tensors
+from .weight_export import iter_disk_checkpoint_tensors, resolve_dsv4_export_dtypes
 
 # ---------------------------------------------------------------------------
 # Meta-buffer materialization (RoPE only; other persistent buffers come from ckpt)
@@ -106,6 +107,39 @@ _ROPE_INIT_FUNCTIONS = None  # populated by _lazy_init_rope_table on first need
 # ---------------------------------------------------------------------------
 # Checkpoint loader: per-rank streaming dequant via HF's conversion machinery
 # ---------------------------------------------------------------------------
+
+# Strict patterns for the ``attn.wo_a`` weight/scale keys (base layers + MTP).
+_WO_A_WEIGHT_RE = re.compile(r"^(?:layers\.\d+|mtp\.\d+)\.attn\.wo_a\.weight$")
+_WO_A_SCALE_RE = re.compile(r"^(?:layers\.\d+|mtp\.\d+)\.attn\.wo_a\.scale$")
+# safetensors on-disk dtype strings that count as FP8 (i.e. genuinely quantized).
+_FP8_DISK_DTYPES = ("F8_E4M3", "F8_E4M3FN", "F8_E5M2")
+
+
+def is_wo_a_bf16_on_disk(
+    hf_path: str,
+    weight_map: dict[str, str],
+) -> tuple[bool, Optional[str]]:
+    """Classify a DSV4 ckpt by the on-disk dtype of a sentinel ``attn.wo_a.weight``.
+
+    Official DSV4-Flash stores ``attn.wo_a`` as FP8 (e4m3) with a real per-block
+    ``.scale``. The SGLang fp4->fp8 dequantized mirror stores ``wo_a`` as bf16
+    with NO scale tensor, yet ``model.safetensors.index.json`` still lists a
+    phantom ``*.attn.wo_a.scale`` entry. Blindly trusting the index makes the
+    lazy reader raise ``SafetensorError`` at materialize time (the tensor is not
+    physically in the shard). Reading one sentinel weight's dtype lets the caller
+    strictly skip those phantom scales for the dequantized variant only; official
+    ckpts (``wo_a`` is fp8) return ``False`` and load the scale as usual.
+
+    Returns ``(is_sgl_ckpt_fmt, wo_a_dtype)``. ``wo_a_dtype`` is ``None`` when the
+    index has no ``wo_a.weight`` key (nothing to classify).
+    """
+    wo_a_weight_keys = sorted(k for k in weight_map if _WO_A_WEIGHT_RE.match(k))
+    if not wo_a_weight_keys:
+        return False, None
+    sentinel = wo_a_weight_keys[0]
+    with safe_open(os.path.join(hf_path, weight_map[sentinel]), framework="pt") as f:
+        wo_a_dtype = f.get_slice(sentinel).get_dtype()  # 'BF16' / 'F8_E4M3'
+    return wo_a_dtype not in _FP8_DISK_DTYPES, wo_a_dtype
 
 
 def _load_checkpoint_hp(
@@ -245,9 +279,27 @@ def _load_checkpoint_hp(
     # and the OS dedupes shared pages across reads).
     fqn_to_mapping: dict[str, WeightConverter | WeightRenaming] = {}
     skipped_keys: list[str] = []
+    phantom_keys: list[str] = []
     sharded_sd: dict[str, object] = {}
     num_base_layers = int(self.config.num_hidden_layers)
     num_mtp_layers = int(self.config.num_nextn_predict_layers)
+
+    # Classify ckpt variant once (see _is_wo_a_bf16_on_disk). ONLY the SGLang
+    # fp4->fp8 dequantized mirror (wo_a stored bf16, phantom wo_a.scale in index)
+    # triggers the strict wo_a.scale skip in the routing loop below; official
+    # ckpts (wo_a is fp8) are unaffected.
+    is_sgl_ckpt_fmt, _wo_a_dtype = is_wo_a_bf16_on_disk(hf_path, weight_map)
+    # Stash the load-time signal on the config so the save / weight-update path
+    # can decide the wo_a on-disk dtype (bf16 vs fp8) — and fall back for
+    # expert_dtype when config.json omits it — without re-reading the source
+    # ckpt. See resolve_dsv4_export_dtypes.
+    self.config.is_sgl_ckpt_fmt = is_sgl_ckpt_fmt
+    if _wo_a_dtype is not None and rank == 0:
+        print(
+            f"[load_checkpoint_hp] ckpt variant: wo_a dtype={_wo_a_dtype} → "
+            f"{'dequantized (skip phantom wo_a.scale)' if is_sgl_ckpt_fmt else 'official (keep wo_a.scale)'}",
+            flush=True,
+        )
 
     def _make_reader(shard_path: str, disk_key: str):
         def _read() -> torch.Tensor:
@@ -262,6 +314,10 @@ def _load_checkpoint_hp(
     for shard_file in sorted(by_shard):
         shard_path = os.path.join(hf_path, shard_file)
         for disk_key in by_shard[shard_file]:
+            # Dequantized-variant only: strictly skip the phantom wo_a.scale keys
+            if is_sgl_ckpt_fmt and _WO_A_SCALE_RE.match(disk_key):
+                phantom_keys.append(disk_key)
+                continue
             logical_disk_key = disk_key
             _is_mtp_key = (num_mtp_layers > 0 and disk_key.startswith("mtp."))
             if _is_mtp_key:
@@ -353,6 +409,13 @@ def _load_checkpoint_hp(
             f"{len(skipped_keys)} skipped)",
             flush=True,
         )
+        if phantom_keys:
+            print(
+                f"[load_checkpoint_hp] dropped {len(phantom_keys)} phantom "
+                f"wo_a.scale index entries (dequantized ckpt): "
+                f"{', '.join(sorted(phantom_keys))}",
+                flush=True,
+            )
 
     # --- MTP routing audit (phase 2-3) -----------------------------------
     # When ``num_mtp_layers > 0`` the model has an active MTP submodule
@@ -785,6 +848,7 @@ def _rank0_finalize(
     *,
     dtype_format: Literal["quantized", "bf16"],
     preserve_mtp: bool = True,
+    is_sgl_ckpt_fmt: bool = False,
 ) -> None:
     """Finalize the parallel save on rank 0: global rename + index + aux.
 
@@ -855,10 +919,25 @@ def _rank0_finalize(
                     mtp_pending = {}
                     mtp_pending_size = 0
 
+                _SGL_PHANTOM_KEYS = {"mtp.0.attn.wo_a.scale"}
+
                 for src_shard, keys in sorted(mtp_by_shard.items()):
                     src_path = os.path.join(orig_ckpt_dir, src_shard)
                     with safetensors.safe_open(src_path, framework="pt", device="cpu") as sf:
+                        shard_keys = set(sf.keys())
                         for key in keys:
+                            if key not in shard_keys:
+                                if is_sgl_ckpt_fmt and key in _SGL_PHANTOM_KEYS:
+                                    print(
+                                        f"[save_checkpoint_hp] WARN: SGL ckpt index "
+                                        f"lists {key!r} in {src_shard} but tensor "
+                                        f"missing in file; skipping (known SGL issue)",
+                                        flush=True,
+                                    )
+                                    continue
+                                raise safetensors.SafetensorError(
+                                    f"File does not contain tensor {key}"
+                                )
                             t = sf.get_tensor(key)
                             t_bytes = t.element_size() * t.nelement()
                             mtp_pending[key] = t
@@ -1208,11 +1287,7 @@ def _save_checkpoint_hp(
     local_shard_idx = 0
     local_tensor_to_filename: dict[str, str] = {}
     local_total_size_bytes = 0
-    assert hasattr(self.config, "expert_dtype"
-                  ), ("DeepSeek-V4 config must define expert_dtype for checkpoint export.")
-    expert_dtype = self.config.expert_dtype
-    assert expert_dtype in ("fp4",
-                            "fp8"), (f"Unsupported DeepSeek-V4 expert_dtype={expert_dtype!r}")
+    expert_dtype, is_sgl_ckpt_fmt = resolve_dsv4_export_dtypes(self.config)
 
     def _flush() -> None:
         """Write current ``pending`` to a per-rank numbered shard file."""
@@ -1360,6 +1435,7 @@ def _save_checkpoint_hp(
                         t_cpu,
                         dtype_format=dtype_format,
                         expert_dtype=expert_dtype,
+                        is_sgl_ckpt_fmt=is_sgl_ckpt_fmt,
                         include_mtp=preserve_mtp,
                     ):
                         _add(disk_key, out_tensor)
@@ -1438,6 +1514,7 @@ def _save_checkpoint_hp(
                 max_shard_size=max_shard_size,
                 dtype_format=dtype_format,
                 preserve_mtp=preserve_mtp,
+                is_sgl_ckpt_fmt=is_sgl_ckpt_fmt,
             )
         except BaseException as e:  # noqa: BLE001
             finalize_err = e

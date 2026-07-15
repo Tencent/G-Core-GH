@@ -341,8 +341,11 @@ def prepare_and_compute_opd_advantages(ctx: AdvantageContext) -> AdvantageResult
     if log_prob_top_k > 0:
         # Top-K path: 3D ``[S-1, K]`` advantages replace the 2D label-based KL advantages.
         # The loss layer detects this via ``advantages.dim() == 3``.
+        #
+        # NOTE: rewards set to None for the top-K path.
+        # Mixing GRPO outcome rewards into 3D topk advantages causes KL divergence
         advantages, distill_metrics = _compute_topk_advantages(
-            ctx, teacher_name, has_base=False, rewards=ctx.rewards
+            ctx, teacher_name, has_base=False, rewards=None
         )
         returns = None
     else:

@@ -77,6 +77,19 @@ class TrainingConfig(MappingProtocol):
         ``"none"`` disables load balancing.
     moe_balance_loss_coef : float
         FSDP2 switch-style MoE load-balancing loss coefficient; ``0`` disables.
+    freeze_router_weight : bool
+        freeze MoE router weight (``requires_grad=False``).
+    freeze_router_correction_bias : bool
+        ``True`` (default) freezes ``e_score_correction_bias``;
+        ``False`` enables the per-step loss-free load-balancing update.
+    router_correction_bias_update_speed : float
+        per-step magnitude of the ``e_score_correction_bias``
+        update (see https://arxiv.org/abs/2408.15664); active only when
+        ``freeze_router_correction_bias=False``; default ``1e-3``.
+    router_correction_bias_use_abs_update : bool
+        use absolute update for ``e_score_correction_bias``
+        as the paper does; otherwise, use the log-based update.
+        default ``True``.
     offload_process_group : bool
     use_dynamic_mbs : bool
         Requires ``train_mbs == 1``.
@@ -242,6 +255,36 @@ class TrainingConfig(MappingProtocol):
     moe_balance_loss_coef: float = field(
         default=0.0,
         metadata={"help": "FSDP2 switch-style MoE load-balancing loss coefficient; 0 disables."},
+    )
+    freeze_router_weight: bool = field(
+        default=False,
+        metadata={
+            "help": "freeze MoE router weight (requires_grad=False)."
+        },
+    )
+    freeze_router_correction_bias: bool = field(
+        default=True,
+        metadata={
+            "help":
+                "True (default) freezes e_score_correction_bias; "
+                "False enables the per-step loss-free load-balancing bias update."
+        },
+    )
+    router_correction_bias_update_speed: float = field(
+        default=1e-3,
+        metadata={
+            "help":
+                "per-step e_score_correction_bias update magnitude "
+                "(see https://arxiv.org/abs/2408.15664); active only when freeze_router_correction_bias=False."
+        },
+    )
+    router_correction_bias_use_abs_update: bool = field(
+        default=True,
+        metadata={
+            "help":
+                "use absolute update for ``e_score_correction_bias`` "
+                "as the paper does; otherwise, use the log-based update."
+        },
     )
 
     offload_process_group: bool = field(

@@ -483,7 +483,7 @@ def calculate_reverse_kl_advantages(
 
     #TODO：和 thinker 有点不一样的事算reward 的 advantage 没有除以方差
     # https://github.com/thinking-machines-lab/tinker-cookbook/blob/c1b3b6fe48dd9105f063e8e1cf0eb1ae036a7ad8/tinker_cookbook/rl/data_processing.py#L27
-    if rewards is not None:
+    if rewards is not None and sampling_repeat_n > 1:
         advantages, returns = calculate_grpo_advantages(
             rewards=rewards,
             mask=mask_lst,
@@ -686,7 +686,7 @@ def calculate_g_opd_advantages(
     advantages = [(-kl) for kl in reverse_kl]
 
     # Optionally mix in GRPO reward-based advantages
-    if rewards is not None:
+    if rewards is not None and sampling_repeat_n > 1:
         reward_advantages, _ = calculate_grpo_advantages(
             rewards=rewards,
             mask=mask_lst,
@@ -779,6 +779,7 @@ def calculate_topk_advantages(
         all_teachers.update(multi_teacher_topk_logprobs)
 
     advantages_3d: List[torch.Tensor] = []
+    # softmax_weights: List[torch.Tensor] = []
     reverse_kl_token_sum = 0.0
     reverse_kl_per_sample_sum = 0.0
     mask_token_sum = 0.0
@@ -820,6 +821,7 @@ def calculate_topk_advantages(
         adv = (-rkl) * w * mask_2d
 
         advantages_3d.append(adv)
+        # softmax_weights.append(w)
 
         # weighted-sum KL on the K dim → 1D per-token KL for metric stability
         masked_rkl_per_token = (rkl * w).sum(dim=-1) * mask_1d  # [S-1]
@@ -829,19 +831,18 @@ def calculate_topk_advantages(
         reverse_kl_per_sample_sum += token_sum / (mask_sum + 1e-12)
         mask_token_sum += mask_sum
 
-    if rewards is not None:
+    if rewards is not None and sampling_repeat_n > 1:
+        # (rionawang)TODO: 暂时先关掉topk path混合reward advantage，因为收敛可能不稳定
+        assert False, "not support topk path mix reward advantage"
         reward_advantages, _ = calculate_grpo_advantages(
             rewards=rewards,
             mask=mask_lst,
             grpo_sampling_times=sampling_repeat_n,
             grpo_advantage_epsilon=advantage_epsilon,
         )
-        # (rionawang)TODO: grpo_outcome_weight是否需要参数化, 类似OPD
-        topk = stu_topk_logprobs[0].shape[-1]
-        grpo_outcome_weight = 1.0 / topk
         advantages_3d = [
-            adv + grpo_outcome_weight * r_adv.to(torch.float32).unsqueeze(-1)
-            for adv, r_adv in safezip(advantages_3d, reward_advantages)
+            adv + r_adv.to(torch.float32).unsqueeze(-1) * w
+            for adv, r_adv, w in safezip(advantages_3d, reward_advantages, softmax_weights)
         ]
 
     metrics = {

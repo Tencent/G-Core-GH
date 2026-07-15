@@ -21,6 +21,71 @@ from gpatch_v4.utils.logging_utils import (
     redirect_stdio_fds_to_file,
 )
 
+# ---------------------------------------------------------------------------
+# SGLang noisy-logger suppression
+# ---------------------------------------------------------------------------
+# sglang's DeepseekV4ForCausalLM.load_weights() logs a WARNING listing every
+# "unloaded" param at the end of each call. During RL partial weight updates
+# (NCCL broadcast, one bucket at a time), this produces a ~66KB WARNING per
+# bucket × per TP rank — gigabytes of log per training run.
+#
+# sglang spawns scheduler subprocesses via mp.set_start_method("spawn"), so
+# parent-process setLevel() is NOT inherited. We use SGLANG_LOGGING_CONFIG_PATH
+# to inject a dictConfig that raises the noisy logger to ERROR.
+#
+# CRITICAL design decisions:
+# 1. The file is created once and NEVER deleted — sglang spawn subprocesses
+#    may call configure_logger() after sgl.Engine() returns; deleting the file
+#    causes sglang to raise an exception.
+# 2. We do NOT configure root logger handlers in the dictConfig. Doing so
+#    replaces gcore's handler chain (TeeStream / AtomicRecordHandler) with a
+#    plain StreamHandler, breaking gcore's log routing and causing hangs.
+#    By leaving root untouched, sglang's basicConfig(force=True) is skipped
+#    (early return), and gcore's existing root handlers remain intact.
+# 3. Only the specific noisy loggers get their level raised to ERROR.
+_sglang_log_config_path = None
+
+
+def _ensure_sglang_log_config():
+    """Set SGLANG_LOGGING_CONFIG_PATH to suppress noisy sglang model loggers.
+
+    Idempotent and safe to call before every sgl.Engine() creation.
+    """
+    global _sglang_log_config_path
+    if _sglang_log_config_path is not None:
+        return
+    # Respect a user-provided config path.
+    existing = os.environ.get("SGLANG_LOGGING_CONFIG_PATH")
+    if existing:
+        _sglang_log_config_path = existing
+        return
+
+    import json as _json
+    import tempfile as _tempfile
+
+    # dictConfig that ONLY sets specific logger levels.
+    # No "root" key → root logger handlers/level are left untouched.
+    # No "handlers" key → no new handlers are created.
+    # sglang's configure_logger() will still early-return (skipping
+    # basicConfig), but since we didn't touch root, gcore's handlers survive.
+    config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "loggers": {
+            "sglang.srt.models.deepseek_v4": {"level": "ERROR"},
+            "sglang.srt.models.deepseek_v2": {"level": "ERROR"},
+            "httpx": {"level": "WARNING"},
+            "httpcore": {"level": "WARNING"},
+        },
+    }
+
+    fd, path = _tempfile.mkstemp(suffix=".json", prefix="sglang_log_cfg_")
+    with os.fdopen(fd, "w") as f:
+        f.write(_json.dumps(config))
+
+    os.environ["SGLANG_LOGGING_CONFIG_PATH"] = path
+    _sglang_log_config_path = path
+
 
 class FakeSignal:
     # 路子还得是 hess 野，有点牛逼。
@@ -30,6 +95,7 @@ class FakeSignal:
     @staticmethod
     def signal(*args):
         pass
+
 
 
 def patch_import_processors():
@@ -505,6 +571,7 @@ class InferEngine:
             import sglang.srt.entrypoints.engine
 
             from gpatch_v4.generation_backend.sglang_engine import SglangEngine
+            from gpatch_v4.generation_backend.sglang_engine import cuda_graph_max_bs_args as get_cuda_graph_max_bs_args
 
             # Must be called AFTER import sglang, in case sglang's module-level
             # logging setup clears existing handlers.
@@ -601,7 +668,7 @@ class InferEngine:
                 enable_weights_cpu_backup=enable_weights_cpu_backup,
                 skip_tokenizer_init=True,
                 max_running_requests=max_running_requests,
-                cuda_graph_max_bs=max_running_requests,
+                **(get_cuda_graph_max_bs_args(max_running_requests)),
                 disable_cuda_graph=enforce_eager,
                 load_format=load_format,
                 log_level=log_level,
@@ -620,6 +687,9 @@ class InferEngine:
                 engine_context = redirect_stdio_fds_to_file(infer_engine_log_file)
             else:
                 engine_context = nullcontext()
+
+            _ensure_sglang_log_config()
+
             with engine_context:
                 infer_engine = sgl.Engine(server_args=server_args)
 

@@ -160,6 +160,7 @@ class PackedSeqParams:
 # ---------------------------------------------------------------------------
 
 
+# todo zz: track owned and prefixed global window indices
 @dataclass(frozen=True)
 class _PerMLayout:
     """Derived per-``m`` fields shared by HCA / CSA / Indexer / topk_idxs builders.
@@ -230,6 +231,7 @@ class _PerMLayout:
     first_of_seg_window_mask_with_prefix: torch.Tensor  # used: CSA/Indexer first-of-seg Ca slot zero+gate
 
 
+# todo zz: track folded token and SWA-KV index maps
 @dataclass(frozen=True)
 class _PackedSeqLayout:
     """Top-level THD-derived fields produced by :func:`make_packed_seq_layout`.
@@ -501,6 +503,7 @@ def cp_slice_layout(
         carry per-rank views (without and with CP prefix, respectively).
     """
 
+    # todo zz: gather per-segment folded layout and prefix views
     assert total_seqlen % cp_size == 0, (
         f"total_seqlen ({total_seqlen}) must be divisible by cp_size ({cp_size})"
     )
@@ -607,6 +610,7 @@ def pack_sequences(
     if device is None:
         device = input_ids[0].device
 
+    # todo zz: align every segment for 2P folded chunks
     total_align = cp_size * pad_to_multiple_of
 
     seqlens: list[int] = []

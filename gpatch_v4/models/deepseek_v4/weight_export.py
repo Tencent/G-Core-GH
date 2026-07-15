@@ -68,17 +68,47 @@ _F32_DISK_KEY_PATTERNS: tuple[str, ...] = (
 )
 _F32_DISK_KEY_RE = re.compile("|".join(_F32_DISK_KEY_PATTERNS))
 
+# ``attn.wo_a`` weight disk keys (base layers + MTP). ``wo_a`` is normally FP8
+# (it is covered by _FP8_DISK_KEY_RE above), but the SGLang fp4->fp8 dequantized
+# mirror stores it as BF16 (no ``.scale``). 
+_WO_A_DISK_KEY_RE = re.compile(
+    r"^(?:.*\.)?layers\.\d+\.attn\.wo_a\.weight$|^mtp\.\d+\.attn\.wo_a\.weight$"
+)
 
-def _classify_for_save(name: str, t: torch.Tensor) -> str:
+
+def _classify_for_save(
+    name: str,
+    t: torch.Tensor,
+    *,
+    is_sgl_ckpt_fmt: bool = False,
+) -> str:
     if not t.dtype.is_floating_point:
         return "int_passthrough"
     if re.search(r"\.experts\.\d+\.w[123]\.weight$", name) is not None:
         return "fp4_expert"
+    # wo_a bf16 branch: only when the source ckpt stored wo_a dequantized. Must
+    # run BEFORE the FP8 whitelist below, which also matches wo_a.
+    if is_sgl_ckpt_fmt and _WO_A_DISK_KEY_RE.search(name) is not None:
+        return "bf16_passthrough"
     if _FP8_DISK_KEY_RE.search(name) is not None:
         return "fp8_e4m3"
     if _F32_DISK_KEY_RE.search(name) is not None:
         return "f32_passthrough"
     return "bf16_passthrough"
+
+
+def resolve_dsv4_export_dtypes(config) -> tuple[str, bool]:
+    """
+    Resolve ``(expert_dtype, is_sgl_ckpt_fmt)`` for DSV4 checkpoint export.
+    """
+    is_sgl_ckpt_fmt = bool(getattr(config, "is_sgl_ckpt_fmt", False))
+    expert_dtype = getattr(config, "expert_dtype", None)
+    if expert_dtype is None:
+        expert_dtype = "fp8" if is_sgl_ckpt_fmt else "fp4"
+    assert expert_dtype in ("fp4", "fp8"), (
+        f"Unsupported DeepSeek-V4 expert_dtype={expert_dtype!r}"
+    )
+    return expert_dtype, is_sgl_ckpt_fmt
 
 
 def _scale_key(weight_disk_key: str) -> str:
@@ -227,6 +257,7 @@ def iter_disk_checkpoint_tensors(
     *,
     dtype_format: Literal["quantized", "bf16"] = "quantized",
     expert_dtype: Literal["fp4", "fp8"] = "fp4",
+    is_sgl_ckpt_fmt: bool = False,
     include_mtp: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Convert one model tensor into one-or-more disk-form checkpoint tensors."""
@@ -234,7 +265,7 @@ def iter_disk_checkpoint_tensors(
         if not include_mtp and mk.startswith("mtp."):
             continue
         disk_key = _model_to_disk_key(mk)
-        cls = _classify_for_save(disk_key, mv)
+        cls = _classify_for_save(disk_key, mv, is_sgl_ckpt_fmt=is_sgl_ckpt_fmt)
         if cls == "fp4_expert" and expert_dtype == "fp8":
             cls = "fp8_e4m3"
 
@@ -256,7 +287,9 @@ def iter_disk_checkpoint_tensors(
             else:
                 raise RuntimeError(f"unhandled save class {cls!r} for {disk_key}")
         else:
-            if cls in ("fp4_expert", "fp8_e4m3", "bf16_passthrough"):
+            if cls in ("fp4_expert", "fp8_e4m3"):
+                yield disk_key, mv
+            elif cls == "bf16_passthrough":
                 yield disk_key, mv.to(torch.bfloat16)
             elif cls == "f32_passthrough":
                 yield disk_key, mv.to(torch.float32)
@@ -341,12 +374,7 @@ def export_deepseek_v4_weights_for_vllm(
     ``dtype_format="quantized"`` preserves the older trainer-side quantized
     export path.
     """
-    config = model.config
-    assert hasattr(config, "expert_dtype"
-                  ), ("DeepSeek-V4 config must define expert_dtype for vLLM weight export.")
-    expert_dtype = config.expert_dtype
-    assert expert_dtype in ("fp4",
-                            "fp8"), (f"Unsupported DeepSeek-V4 expert_dtype={expert_dtype!r}")
+    expert_dtype, is_sgl_ckpt_fmt = resolve_dsv4_export_dtypes(model.config)
 
     for model_key, full_tensor in _iter_deepseek_v4_gathered_state_dict(model):
         for disk_key, disk_tensor in iter_disk_checkpoint_tensors(
@@ -354,6 +382,7 @@ def export_deepseek_v4_weights_for_vllm(
             full_tensor,
             dtype_format=dtype_format,
             expert_dtype=expert_dtype,
+            is_sgl_ckpt_fmt=is_sgl_ckpt_fmt,
             include_mtp=False,
         ):
             if not disk_tensor.is_cuda:

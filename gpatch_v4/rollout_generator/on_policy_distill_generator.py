@@ -6,6 +6,8 @@ import torch
 import torch.distributed
 from typing_extensions import override
 
+from megatron.core import mpu
+
 from gpatch_v4.configs.config import OnPolicyDistillConfig
 from gpatch_v4.core.parallel_state import cpu_barrier, is_mp_and_cp_head
 from gpatch_v4.rollout_generator.base_generator import BaseRolloutGenerator
@@ -56,7 +58,7 @@ class OnPolicyDistillRolloutGenerator(BaseRolloutGenerator):
         single ``cpu_barrier`` between phases for deterministic ordering.
 
         ``sample_idx_base`` overrides ``self.sample_idx`` when log_prob_top_k>0.
-        当log_prob_top_k>0时， compute_teacher_logps需要student logits topk-ids, 
+        当log_prob_top_k>0时， compute_teacher_logps需要student logits topk-ids,
         所以需要在 __call__ 之外，compute_student_logps之后再调用这个函数，但这时，
         self.sample_idx 已经被加过了，不能直接用，所以需要传一个 sample_idx_base 来覆盖它.
         """
@@ -77,17 +79,23 @@ class OnPolicyDistillRolloutGenerator(BaseRolloutGenerator):
         if self.is_mp_and_cp_head:
             s_idx = self.sample_idx if sample_idx_base is None else sample_idx_base
             teacher_keys = {
-                "tokens", "sequence_lengths", "stu_topk_ids",
-                "position_ids", "image_input_mask",
-                "vision_data", "vision_grid_thw",
-                "input_features", "feature_attention_mask",
+                "tokens",
+                "sequence_lengths",
+                "stu_topk_ids",
+                "position_ids",
+                "image_input_mask",
+                "vision_data",
+                "vision_grid_thw",
+                "input_features",
+                "feature_attention_mask",
                 "audio_feature",
             }
             all_issue_cos = []
             for _, t_client in teacher_items:
                 for rbi, rollout_batch in enumerate(rbs):
                     lightweight_batch = {
-                        k: rollout_batch[k] for k in teacher_keys if k in rollout_batch
+                        k: rollout_batch[k]
+                        for k in teacher_keys if k in rollout_batch
                     }
                     # Truncate stu_topk_ids to response length for transfer efficiency.
                     if "stu_topk_ids" in lightweight_batch:
@@ -155,13 +163,16 @@ class OnPolicyDistillRolloutGenerator(BaseRolloutGenerator):
     @override
     async def __call__(self, data_iter, num_microbatches, curr_ppo_step):
         timers = TimerSingleton.get_timer()
+        dp_rank = mpu.get_data_parallel_rank()
         offload_process_group = self.config.training.offload_process_group
         if offload_process_group:
             destroy_process_groups()
             clear_memory()
 
         timers("sampler_generate", log_level=0).start(barrier=True)
-        rbs = await self.rollout_samples(data_iter, num_microbatches, curr_ppo_step)
+        rbs = await self.rollout_samples(
+            data_iter, num_microbatches, curr_ppo_step, dp_rank=dp_rank
+        )
         if self.is_mp_and_cp_head:
             rbs = self._hook_after_sampling(rbs, curr_ppo_step)
             assert check_rollout_batches(rbs), f"rbs format error, may need pop('ready'): {rbs=}"

@@ -41,6 +41,7 @@ policy:
   model_arch: "deepseek_v4"
   attn_implementation: "fused"
   indexer_backend: "fused"
+  fp8: false                      # TE FP8 block-scaling MoE grouped GEMM
   without_ref: True
   hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
   hf_tokenizer_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
