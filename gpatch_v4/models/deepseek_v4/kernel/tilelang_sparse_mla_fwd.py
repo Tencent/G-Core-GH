@@ -25,14 +25,12 @@ except ImportError:
 def sparse_mqa_fwd(
     heads,
     dim,
-    topk,
     sm_scale=None,
     block_I=64,
     num_stages=2,
     threads=256,
 ):
     assert dim == tilelang.math.next_power_of_2(dim), f"dim must be power of 2, got {dim}"
-    assert topk % block_I == 0, f"topk ({topk}) must be divisible by block_I ({block_I})"
     if sm_scale is None:
         sm_scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e)
     else:
@@ -41,6 +39,7 @@ def sparse_mqa_fwd(
     batch = T.dynamic("batch")
     seq_len = T.dynamic("seq_len")
     seq_len_kv = T.dynamic("seq_len_kv")
+    topk = T.dynamic("topk", torch.int32)
 
     q_shape = [batch, seq_len, heads, dim]
     kv_shape = [batch, seq_len_kv, dim]
@@ -187,12 +186,10 @@ def sparse_mqa_fwd_interface(
             dtype=topk_idxs.dtype
         )
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
-        topk = padded_topk
 
     kernel = sparse_mqa_fwd(
         heads,
         dim,
-        topk,
         sm_scale,
         block_I=block_I,
         num_stages=num_stages,

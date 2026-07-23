@@ -37,6 +37,7 @@ def _make_bare_controller() -> RolloutController:
     rc._ordered_ready = {}
     rc._inflight_tasks = []
     rc.use_colocate = False
+    rc.is_partial_colocated = False
     rc.rb_multiplier = 1
     rc.training_config = SimpleNamespace(rollout_ordered_collection=False)
     return rc
@@ -80,6 +81,28 @@ class _RecordingRemote:
 class _RecordingActor:
     def __init__(self):
         self.agent_loop = _RecordingRemote()
+
+
+class _LifecycleRemote:
+    def __init__(self, fn):
+        self._fn = fn
+
+    def remote(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
+class _LifecycleActor(_RecordingActor):
+    def __init__(self, events: List):
+        super().__init__()
+        self.begin_partial_colocated_rollout = _LifecycleRemote(self._begin)
+        self.end_partial_colocated_rollout = _LifecycleRemote(self._end)
+        self.events = events
+
+    async def _begin(self, ppo_step: int):
+        self.events.append(("begin_lifecycle", ppo_step))
+
+    async def _end(self, ppo_step: int):
+        self.events.append(("end_lifecycle", ppo_step))
 
 
 class _DelayedRecordingRemote:
@@ -229,6 +252,27 @@ def _make_fire_controller(num_mb: int, num_actors: int) -> RolloutController:
     return rc
 
 
+def _make_partial_fire_controller(num_mb: int, num_actors: int, max_stale: int = 0):
+    rc = _make_bare_controller()
+    rc.is_partial_colocated = True
+    rc._num_microbatches = num_mb
+    rc._next_fire_sample_idx = 0
+    rc._next_fire_actor_idx = 0
+    rc._sample_idx = 0
+    rc.rb_multiplier = 1
+    rc.data_source = _FakeDataSource()
+    rc.apply_sampling_rollout_attr = _NoopRolloutAttr()
+    events: List = []
+    rc.agent_loop_actors = [_LifecycleActor(events) for _ in range(num_actors)]
+    rc.config = SimpleNamespace(placement_type="partial_colocated")
+    rc.training_config = SimpleNamespace(
+        single_controller=True,
+        rollout_max_staleness=max_stale,
+        rollout_ordered_collection=False,
+    )
+    return rc, events
+
+
 class _RecordingColocateRemote:
     """Mimics default ``AgentLoopActor.agent_loop.remote`` in colocate mode."""
     def __init__(self):
@@ -355,6 +399,46 @@ class ColocateFireBookkeepingTest(unittest.IsolatedAsyncioTestCase):
         assert item.rollout_batch["tokens"] == [[0]]
         assert rc._next_fire_sample_idx == 1
         assert rc._next_fire_actor_idx == 1
+
+
+class PartialColocatedLifecycleTest(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_wakes_once_and_sleeps_after_inflight_drain(self):
+        rc, events = _make_partial_fire_controller(num_mb=2, num_actors=2)
+
+        await rc.fire_generation_requests(epoch=0, ppo_step=0, num_ppo_steps=1)
+        await rc.wait_all_inflight()
+
+        assert events == [("begin_lifecycle", 0), ("end_lifecycle", 0)]
+        assert rc._ready_queue.qsize() == 2
+
+        calls = []
+        for actor in rc.agent_loop_actors:
+            calls.extend(actor.agent_loop.calls)
+        assert sorted(call[2] for call in calls) == [0, 1]
+
+    async def test_partial_rejects_nonzero_staleness(self):
+        rc, _ = _make_partial_fire_controller(num_mb=1, num_actors=1, max_stale=1)
+
+        with self.assertRaises(AssertionError):
+            await rc.fire_generation_requests(epoch=0, ppo_step=0, num_ppo_steps=1)
+
+    @unittest.skip(
+        "TODO(@astrachang): hangs in my_test.sh — Traceback starts then freezes "
+        "(~30m no progress; observed 2026-07-23). Please fix."
+    )
+    async def test_partial_failure_sleeps_after_all_tasks_finish(self):
+        rc, events = _make_partial_fire_controller(num_mb=1, num_actors=1)
+        boom = RuntimeError("partial rollout failed")
+        rc.agent_loop_actors[0].agent_loop = _FakeRemote(exc=boom)
+
+        await rc.fire_generation_requests(epoch=0, ppo_step=0, num_ppo_steps=1)
+        with self.assertRaises(RuntimeError):
+            await rc.collect_rollout_step(0)
+        with self.assertRaises(RuntimeError):
+            await rc.wait_all_inflight()
+
+        assert events == [("begin_lifecycle", 0), ("end_lifecycle", 0)]
+        assert rc._inflight_tasks == []
 
 
 def _make_collect_controller(

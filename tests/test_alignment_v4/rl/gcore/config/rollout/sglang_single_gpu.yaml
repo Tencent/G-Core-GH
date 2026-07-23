@@ -1,0 +1,47 @@
+# @package _global_
+# Rollout backend = sglang (the rollout/ group selects the inference engine;
+# add rollout/vllm.yaml for the vllm backend later). Holds the sampler + bt_rm
+# engine: backend, sampling params, and the per-engine dist_config.
+#
+# dist_config here is the single-GPU default. It lives in this file (not the
+# parallelism group) because the params and the parallelism-specific dist_config
+# share one hydra LIST element (infer_engine_configs[i]) and hydra replaces lists
+# wholesale. For a multi-GPU sampler (hybrid), override sampler/bt_rm dist on the
+# CLI until the hybrid alignment is wired up.
+sampler:
+  backend: sglang
+  dist_config:
+    nnodes: 1
+    num_gpus_per_node: 1
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 1
+        num_gpus_per_node: 1
+        tensor_model_parallel_size: 1
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.7
+      max_running_requests: 128
+      temperature: 1.0
+      top_p: 1.0
+      generate_max_tokens: 8192
+      # 与 verl sglang 显式对齐：注意力后端 flashinfer、开启 cuda graph。
+      attention_backend: flashinfer
+      disable_cuda_graph: False
+
+bt_rm:
+  reward_type: "rule_only"
+  reward_model_info:
+    - model_arch: "qwen2.5-math-rm-72b"
+      hf_model_path: "hf-hub/Qwen/Qwen2.5-Math-RM-72B/"
+      reward_py_path: tasks/math_rl_v4/bt_reward_dapo.py
+      parse_reward_fn_name: dapo_math_rule_reward
+      # reward_py_path: tasks/math_rl_v4/bt_reward.py
+      # parse_reward_fn_name: math_rl_rule_reward
+      reward_weight: 1.0
+  dist_config:
+    nnodes: 1
+    num_gpus_per_node: 1
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 1
+        num_gpus_per_node: 1

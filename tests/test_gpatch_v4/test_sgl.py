@@ -2,7 +2,6 @@ import asyncio
 import shutil
 import unittest
 
-import lipsum
 import numpy as np
 import pynvml
 import pytest
@@ -15,6 +14,7 @@ sgl = pytest.importorskip("sglang")
 from sglang.utils import async_stream_and_merge, stream_and_merge
 
 from gpatch_v4_test_helper import kill_all_actors_and_shutdown_ray
+from random_text import generate_words
 
 try:
     from sglang.srt.patch_torch import monkey_patch_torch_reductions
@@ -200,8 +200,8 @@ class SglTestActor:
         llm.release_memory_occupation()
         llm.resume_memory_occupation()
 
-        # 对于 qwen3 的 tokenizer，lorem ipsum 大约是 1 word == 2 tokens 。
-        prompt = lipsum.generate_words(4 * 1024)
+        # 对于 qwen3 的 tokenizer，filler word 大约是 1 word == 2 tokens 。
+        prompt = generate_words(4 * 1024)
         prompt_input_ids = tokenizer(prompt)['input_ids']
 
         repeat = 16

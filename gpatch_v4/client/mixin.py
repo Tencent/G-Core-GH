@@ -25,11 +25,10 @@ class UpdateWeightMixin:
         sampler_configs = self.config.sampler.infer_engine_configs
         engine_gpu_counts = [
             min(
-                config.dist_config.tensor_model_parallel_size
-                * config.dist_config.pipeline_model_parallel_size,
+                config.dist_config.tensor_model_parallel_size *
+                config.dist_config.pipeline_model_parallel_size,
                 config.dist_config.num_gpus_per_node,
-            )
-            for config in sampler_configs
+            ) for config in sampler_configs
         ]
         return UpdateWeightContext(
             infer_backend=self.infer_backend,
@@ -43,9 +42,8 @@ class UpdateWeightMixin:
             dist_weight_group=self._dist_weight_group,
             dist_weight_group_name=self._dist_weight_group_name,
             sampler_engine_gpu_counts=engine_gpu_counts,
-            moe_deepgemm=bool(
-                getattr(sampler_configs[0], "enable_deepep_moe", False)
-            ) if sampler_configs else False,
+            moe_deepgemm=bool(getattr(sampler_configs[0], "enable_deepep_moe", False))
+            if sampler_configs else False,
             placement_type=self.config.placement_type,
             wake_up=self.wake_up,
             sleep=self.sleep,
@@ -107,7 +105,9 @@ class TestFuncMixin:
             "What is the future of AI?",
         ]
         if self._is_rpc_leader():
-            response = await self._batch_rpc_call(sampler_idx, "test_generate", {"prompts": prompts})
+            response = await self._batch_rpc_call(
+                sampler_idx, "test_generate", {"prompts": prompts}
+            )
             logging_rank0(f"test_generate resp: {response}")
 
     async def test_save_engine_ckpt(self, sampler_idx, save_path):

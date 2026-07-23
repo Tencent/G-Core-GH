@@ -188,40 +188,4 @@ class BtRmClient(BaseBtRmClient):
         }
         rpc_co = self.rpc_client_lst[rm_idx].call(target_ep, 'get_bt_rm_result', req_dict)
         resp = await rpc_co
-        resp = self.post_process_resp(resp)
-        return resp
-
-    def post_process_resp(self, resp: Dict[str, Any]) -> Dict[str, Any]:
-        """Post-process BT-RM response (truncate values and per-token rewards).
-
-        Parameters
-        ----------
-        resp : dict
-
-        Returns
-        -------
-        dict
-            Post-processed response.
-        """
-        if resp.get("values", None) is not None and resp["values"][0] is not None:
-            values = resp["values"]
-            assert values[0].ndim == 1, f"ndim {values[0].ndim}"
-            if self.config.ppo.ppo_value_truncate_head:
-                values = [v[1:].contiguous() for v in values]
-            else:
-                values = [v[:-1].contiguous() for v in values]
-            resp["values"] = values
-        if resp.get("per_token_rewards",
-                    None) is not None and resp["per_token_rewards"][0] is not None:
-            per_token_rewards = resp["per_token_rewards"]
-            assert per_token_rewards[0].ndim == 1, f"ndim {per_token_rewards[0].ndim}"
-            if self.config.ppo.ppo_value_truncate_head:
-                per_token_rewards = [ptr[1:].contiguous() for ptr in per_token_rewards]
-            else:
-                per_token_rewards = [ptr[:-1].contiguous() for ptr in per_token_rewards]
-            resp["per_token_rewards"] = per_token_rewards
-
-        if resp.get('rewards', None) is not None and resp["rewards"][0] is not None:
-            report_data = {"rm_infer_results": len(resp['rewards'])}
-            #TODO: report_ppo_metrics(report_data)
         return resp

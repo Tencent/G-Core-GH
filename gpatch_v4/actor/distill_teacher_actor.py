@@ -21,6 +21,7 @@ from gpatch_v4.core.parallel_state import (
     initlize_parallel_state,
     is_mp_and_cp_head,
 )
+from gpatch_v4.extended_model import PrepareDataForwardFactory
 from gpatch_v4.orches.train_actor import BaseActor
 from gpatch_v4.training_backend import TrainingEngineFactory
 from gpatch_v4.utils import (
@@ -62,6 +63,13 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
         self.batching_reqs: List[Dict[str, Union[int, List[Any]]]] = []
         self.compute_logps_results: Dict[int, Dict[int, Dict]] = {}
         self.load_hf_config()
+        self.teacher_engine.prepare_data = PrepareDataForwardFactory.get_prepare_data_fwd(
+            config, config.teacher.model_arch
+        )
+        logging_rank0(
+            f"prepare_data={type(self.teacher_engine.prepare_data).__name__}, "
+            f"teacher.model_arch={self.config.teacher.model_arch}"
+        )
 
     def validated_config(self):
         teacher_config = self.config.teacher

@@ -16,6 +16,10 @@ from gpatch_v4.orches.placement_group import (
 from gpatch_v4.trainer.grpo_trainer import GrpoTrainer
 from gpatch_v4.trainer.helper import set_nnodes_default
 from gpatch_v4.utils import log
+from gpatch_v4.utils.placement import (
+    is_partial_colocated,
+    validate_partial_colocated_config,
+)
 
 
 class GrpoSingleCtrlTrainer(GrpoTrainer):
@@ -111,7 +115,8 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
         training_cfg = config.training
         is_colocate = config.placement_type == "colocate"
         is_disaggregated = config.placement_type == "disaggregated"
-        assert is_colocate or is_disaggregated, (
+        is_partial = is_partial_colocated(config)
+        assert is_colocate or is_disaggregated or is_partial, (
             f"unsupported placement_type={config.placement_type}"
         )
         assert training_cfg.single_controller, (
@@ -124,6 +129,8 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
             assert training_cfg.rollout_max_staleness == 0, (
                 "colocate requires rollout_max_staleness == 0"
             )
+        elif is_partial:
+            validate_partial_colocated_config(config)
         else:
             assert training_cfg.async_rollout, (
                 "disaggregated requires training.async_rollout=True"
@@ -229,6 +236,8 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
             else:
                 t_collect_start = time.monotonic()
                 gen_result = await rc.collect_rollout_step.remote(train_step)
+                if is_partial:
+                    await rc.wait_all_inflight.remote()
                 dp_refs = gen_result.dp_refs
                 t_collect_done = time.monotonic()
                 fire_time = self._pipeline_ts[train_step]["fire"]

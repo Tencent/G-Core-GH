@@ -147,6 +147,8 @@ class Muon(torch.optim.Optimizer):
                     else:
                         g = buf
                     u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                    if u.shape != p.shape:
+                        u = u.view(p.shape)
 
                     # scale update
                     adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)

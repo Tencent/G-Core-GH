@@ -52,6 +52,21 @@ class TestExpectedNnodes(unittest.TestCase):
 
         assert self._get_expected_nnodes(cfg) == 7
 
+    def test_partial_colocated_returns_policy_nodes(self):
+        """partial_colocated 下 sampler/gen_rm 覆盖 policy 池，expected_nnodes = policy_nnodes。"""
+        cfg = RlConfig(placement_type="partial_colocated")
+        cfg.training.single_controller = True
+        cfg.training.async_rollout = True
+        cfg.training.rollout_max_staleness = 0
+        cfg.training.use_gen_rm_reward = True
+        cfg.training.use_bt_rm_reward = False
+        cfg.policy.dist_config = _dist_config(nnodes=8, gpus_per_node=8)
+        cfg.sampler.dist_config = _dist_config(nnodes=4, gpus_per_node=8)
+        cfg.gen_rm.dist_config = _dist_config(nnodes=4, gpus_per_node=8)
+        cfg.bt_rm.dist_config = _dist_config(nnodes=0, gpus_per_node=8)
+
+        assert self._get_expected_nnodes(cfg) == 8
+
     def test_excludes_training_plt(self):
         """training_plt 共享 policy 前缀（nnodes=1），不应影响总节点数。"""
         cfg = RlConfig(placement_type="disaggregated")

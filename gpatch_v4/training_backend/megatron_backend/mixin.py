@@ -58,6 +58,9 @@ from gpatch_v4.core.parallel_state import (
 )
 from gpatch_v4.core.smart_pad_helper import CatedSmartPadInferHelper, _sample_idx_key
 from gpatch_v4.training_backend.base_engine import BaseEngine
+from gpatch_v4.training_backend.loss import PolicyLossInput as PolicyLossInputV2
+from gpatch_v4.training_backend.loss import get_loss_fn
+from gpatch_v4.training_backend.loss.registry import finalize_histogram_metrics
 from gpatch_v4.training_backend.loss_factory import (
     FinetuneLossInput,
     PolicyLossInput,
@@ -81,6 +84,9 @@ from gpatch_v4.training_backend.megatron_backend.megatron_utils import (
 )
 from gpatch_v4.training_backend.megatron_backend.model_forward import (
     gptmodel_pack_foward,
+)
+from gpatch_v4.training_backend.megatron_backend.optimizer import (
+    should_use_distributed_optimizer,
 )
 from gpatch_v4.training_backend.megatron_backend.router_replay_manager import (
     RouterReplay,
@@ -218,9 +224,10 @@ class BridgeUtilsMixin:
         )
 
         config = get_model_config(model[0])
+        use_dist_opt = should_use_distributed_optimizer(self.config.optimizer)
         ddp_config = DistributedDataParallelConfig(
             grad_reduce_in_fp32=True,
-            use_distributed_optimizer=True,
+            use_distributed_optimizer=use_dist_opt,
         )
 
         if ddp_config.bucket_size is None:
@@ -414,7 +421,8 @@ class BridgeUtilsMixin:
         ddp_config = None
         if wrap_with_ddp:
             from megatron.bridge.training.config import DistributedDataParallelConfig
-            ddp_config_dict = {"use_distributed_optimizer": True}
+            use_dist_opt = should_use_distributed_optimizer(self.config.optimizer)
+            ddp_config_dict = {"use_distributed_optimizer": use_dist_opt}
             ddp_config = DistributedDataParallelConfig(**ddp_config_dict)
             ddp_config.finalize()
 
@@ -586,6 +594,10 @@ class BridgeUtilsMixin:
                 self.policy_config.freeze_patterns or self.policy_config.unfreeze_patterns
             )
             post_wrap_with_ddp = post_wrap_with_ddp or (wrap_with_ddp and has_freeze_patterns)
+            # mbridge DDP defaults to use_distributed_optimizer=True; defer wrap so we can
+            # set it False for layer-wise emerging optimizers (needs all-reduce).
+            if wrap_with_ddp and not should_use_distributed_optimizer(self.config.optimizer):
+                post_wrap_with_ddp = True
             model = bridge.get_model(
                 bf16=True,
                 wrap_with_ddp=wrap_with_ddp and not post_wrap_with_ddp,
@@ -895,6 +907,7 @@ class ForwardStepMixin(RouterReplayMixin):
         inference_only=True,
         compute_topk: bool = False,
         gather_target_ids_key: str = None,
+        return_per_token_entropy: bool = False,
     ):
         """
         Args:
@@ -925,18 +938,35 @@ class ForwardStepMixin(RouterReplayMixin):
                     log(f"{self.batch_log_str} {self.batch_iters:8d}/{self.total_iters:8d}", rank=0)
                 # for r3
                 self.maybe_prepare_for_router_replay(batches, seq_len)
+                use_thd_pack = (
+                    self.policy_config.ppo_pack_seq and
+                    not self.dist_config.dynamic_context_parallel and
+                    not self.policy_config.smart_pad_infer
+                )
                 model_fwd_args = self.prepare_data.model_forward_only(
                     batches,
                     seq_len,
                     self.tokenizer.pad_token_id,
                     pad_with_random_token=self.config.training.moe_pad_with_random_tokens,
                     vocab_size=self.vocab_size,
+                    ppo_pack_seq=use_thd_pack,
                 )
                 target = model_fwd_args.pop("target")
 
                 use_linear_ce = self.training_config.use_linear_ce
                 fp32_output = not use_linear_ce
-                model_output = model(**model_fwd_args, fp32_output=fp32_output)
+                if use_thd_pack:
+                    # Static ppo_pack_seq path unpacks to BSHD logits; linear_ce
+                    # (hidden + fused CE) is not wired here yet (same as grpo_train).
+                    assert not use_linear_ce, "暂不支持"
+                    seq_lens = torch.stack([b["sequence_lengths"]
+                                            for b in batches]).cuda(non_blocking=True)
+                    pack_batch = {"sequence_lengths": seq_lens}
+                    model_output = gptmodel_pack_foward(
+                        unwrap_model(model), pack_batch, model_fwd_args, self.config
+                    )
+                else:
+                    model_output = model(**model_fwd_args, fp32_output=fp32_output)
 
                 if self.config.training.forward_clear_memory and \
                    self.batch_iters % self.config.training.forward_clear_memory_interval == 0:
@@ -955,13 +985,18 @@ class ForwardStepMixin(RouterReplayMixin):
 
                 def id_func(model_output, non_loss_data=True):
                     if use_linear_ce:
-                        logprobs = logprobs_from_linear_ce(
+                        linear_ce_result = logprobs_from_linear_ce(
                             linear_ce_backend=self.training_config.linear_ce_backend,
                             linear_ce_output=linear_ce_output,
                             target=target,
                             ignore_cp=False,
                             pre_shifted=False,
+                            return_entropy=return_per_token_entropy,
                         )
+                        if return_per_token_entropy:
+                            logprobs, _, per_token_entropy = linear_ce_result
+                        else:
+                            logprobs = linear_ce_result
                     else:
                         # TODO(@nrwu): 检查 sp 情况下，此处 output tensor shape 是否应该是 [b, s, v//tp] ？
                         if compute_topk or gather_target_ids_key is not None:
@@ -969,16 +1004,25 @@ class ForwardStepMixin(RouterReplayMixin):
                         logprobs = from_parallel_logits_to_logprobs(
                             vocab_parallel_logits=model_output,
                             target=target,
-                            inference_only=inference_only
+                            inference_only=inference_only,
+                            # thd pack already gathers logits across CP back to full
+                            # [b, s, v//tp]; skip the per-CP slice/gather here (mirrors
+                            # the training forward at grpo_train).
+                            ignore_cp=use_thd_pack,
                         )
-                    if not compute_topk and gather_target_ids_key is None:
+                        if return_per_token_entropy:
+                            _, per_token_entropy = vocab_parallel_entropy(model_output.float())
+                    if not compute_topk and gather_target_ids_key is None and not return_per_token_entropy:
                         return logprobs
 
                     result = {"logprobs": logprobs}
+                    if return_per_token_entropy:
+                        result["prev_per_token_entropy"] = per_token_entropy
                     if compute_topk:
                         topk_logprobs, topk_token_ids = from_parallel_logits_to_topk_logprobs(
                             vocab_parallel_logits=output_tensor_for_topk,
                             topk=getattr(self.ppo_config, "log_prob_top_k", 0),
+                            ignore_cp=use_thd_pack,
                         )
                         result["topk_logprobs"] = topk_logprobs[:, :-1].contiguous()
                         result["topk_ids"] = topk_token_ids[:, :-1].to(torch.int32).contiguous()
@@ -1007,6 +1051,7 @@ class ForwardStepMixin(RouterReplayMixin):
                             gather_lp = from_parallel_logits_to_opd_topk_logprobs(
                                 vocab_parallel_logits=output_tensor_for_topk,
                                 target_ids=padded_ids,
+                                ignore_cp=use_thd_pack,
                             )
                         result["gather_logprobs"] = gather_lp[:, :-1].contiguous()
                     return result
@@ -1106,6 +1151,17 @@ class ForwardStepMixin(RouterReplayMixin):
 
         return partial(log_prob_output_only_func_dynamic_cp, seqlen)
 
+    def _get_dpo_forward_seq_length(self, batches: List[Dict[str, Any]]) -> int:
+        """Return the shared padded sequence length for DPO ref and train forwards."""
+        if self.config.debug.experimental_pad_to_max_length:
+            return self.training_config.seq_length
+
+        seq_length = get_batches_max_seqlen(batches, self.training_config.pad_to_mulitiple_of)
+        # Keep reference and policy training forwards in the same DP-reduced
+        # padded shape so their deterministic padding tokens also stay aligned.
+        seq_length = get_max_seqlen_within_dp(seq_length)
+        return min(seq_length, self.training_config.seq_length)
+
     @torch.no_grad()
     def compute_logprobs(
         self,
@@ -1114,19 +1170,32 @@ class ForwardStepMixin(RouterReplayMixin):
         batch_log_str: str,
         compute_topk: bool = False,
         gather_target_ids_key: str = None,
+        return_per_token_entropy: bool = False,
     ):
         """Run a forward-only pass and gather per-sample log-probs.
 
         设置 top-K 相关参数时，每个 sample 返回 dict（含 3D 字段）；否则返回 2D tensor。
         """
+        # DPO expands every preference pair to [chosen, rejected]. Keep the
+        # reference forward microbatch shape aligned with policy training.
+        forward_only_mbs = (
+            self.training_config.train_mbs *
+            2 if isinstance(self.config, DpoConfig) else self.forward_only_mbs
+        )
+        assert forward_only_mbs > 0, f"{forward_only_mbs=}"
         self.batch_iters = 0
-        self.total_iters = len(batches_list) // self.forward_only_mbs
+        self.total_iters = divide(len(batches_list), forward_only_mbs)
         self.batch_log_str = batch_log_str
 
         total_samples = len(batches_list)
-        seq_length = get_batches_max_seqlen(batches_list, self.training_config.pad_to_mulitiple_of)
-        seq_length = get_max_seqlen_within_ep(seq_length)
-        num_microbatches = divide(total_samples, self.forward_only_mbs)
+        if isinstance(self.config, DpoConfig):
+            seq_length = self._get_dpo_forward_seq_length(batches_list)
+        else:
+            seq_length = get_batches_max_seqlen(
+                batches_list, self.training_config.pad_to_mulitiple_of
+            )
+            seq_length = get_max_seqlen_within_ep(seq_length)
+        num_microbatches = divide(total_samples, forward_only_mbs)
         batch_iter = get_iterator_k_split_list(batches_list, num_microbatches)
 
         fwd_bwd_function = get_forward_backward_func()
@@ -1136,18 +1205,19 @@ class ForwardStepMixin(RouterReplayMixin):
                 inference_only=True,
                 compute_topk=compute_topk,
                 gather_target_ids_key=gather_target_ids_key,
+                return_per_token_entropy=return_per_token_entropy,
             ),
             data_iterator=batch_iter,
             model=model,
             num_microbatches=num_microbatches,
             forward_only=True,
             seq_length=seq_length,
-            micro_batch_size=self.forward_only_mbs,
+            micro_batch_size=forward_only_mbs,
             collect_non_loss_data=True,
             decoder_seq_length=seq_length,
         )
 
-        if not compute_topk and gather_target_ids_key is None:
+        if not compute_topk and gather_target_ids_key is None and not return_per_token_entropy:
             # Label-based logps path: tensor-cat → 2D PP broadcast → per-sample chunk.
             logprobs = torch.cat(fwd_results) if len(fwd_results) > 0 else None
 
@@ -1160,7 +1230,7 @@ class ForwardStepMixin(RouterReplayMixin):
             clear_memory()
             return logprobs
 
-        # Topk path: 在 PP last stage 组装 per-sample dict，broadcast 到其他 stage。
+        # 上一个条件不通过，那么在 PP last stage 组装 per-sample dict，broadcast 到其他 stage。
         if mpu.is_pipeline_last_stage() and len(fwd_results) > 0:
             per_sample_list = []
             for mb_dict in fwd_results:
@@ -1183,7 +1253,14 @@ class ForwardStepMixin(RouterReplayMixin):
         clear_memory()
         return per_sample_list
 
-    def _smart_pad_forward_step(self, batch_iter, num_microbatches, micro_batch_size, seq_length):
+    def _smart_pad_forward_step(
+        self,
+        batch_iter,
+        num_microbatches,
+        micro_batch_size,
+        seq_length,
+        return_per_token_entropy: bool = False,
+    ):
         """Wrapped forward step for smart pad helper callback.
 
         Parameters
@@ -1195,15 +1272,21 @@ class ForwardStepMixin(RouterReplayMixin):
             Forward-only mbs.
         seq_length : int
             Padded sequence length for this group.
+        return_per_token_entropy : bool
+            Return per-sample dicts so smart-pad can preserve entropy alongside logprobs.
 
         Returns
         -------
         list
-            Forward results (logprobs) per micro-batch.
+            Per-micro-batch tensors, or lists of per-sample dicts when entropy is requested.
         """
         fwd_bwd_function = get_forward_backward_func()
         output_tensor = fwd_bwd_function(
-            forward_step_func=self.get_logprob_output_only_func(seq_length, inference_only=True),
+            forward_step_func=self.get_logprob_output_only_func(
+                seq_length,
+                inference_only=True,
+                return_per_token_entropy=return_per_token_entropy,
+            ),
             data_iterator=batch_iter,
             model=self._smart_pad_current_model,
             num_microbatches=num_microbatches,
@@ -1213,6 +1296,22 @@ class ForwardStepMixin(RouterReplayMixin):
             collect_non_loss_data=True,
             decoder_seq_length=seq_length,
         )
+        if return_per_token_entropy and mpu.is_pipeline_last_stage():
+            per_sample_output = []
+            for microbatch_output in output_tensor:
+                assert isinstance(microbatch_output, dict)
+                assert set(microbatch_output) == {"logprobs", "prev_per_token_entropy"}
+                batch_size = microbatch_output["logprobs"].shape[0]
+                assert all(value.shape[0] == batch_size for value in microbatch_output.values())
+                per_sample_output.append(
+                    [
+                        {
+                            key: value[sample_idx]
+                            for key, value in microbatch_output.items()
+                        } for sample_idx in range(batch_size)
+                    ]
+                )
+            output_tensor = per_sample_output
         clear_memory()
         return output_tensor
 
@@ -1296,6 +1395,7 @@ class ForwardStepMixin(RouterReplayMixin):
         model,
         batches_list: List[Dict[str, Any]],
         batch_log_str: str,
+        return_per_token_entropy: bool = False,
     ):
         """Compute logprobs using smart pad to group samples by seqlen.
 
@@ -1306,11 +1406,14 @@ class ForwardStepMixin(RouterReplayMixin):
             Expanded per-sample dicts.
         batch_log_str : str
             Log prefix for progress.
+        return_per_token_entropy : bool
+            Return ``logprobs`` and ``prev_per_token_entropy`` in each sample dict.
 
         Returns
         -------
-        list of Tensor
-            Per-sample logprobs tensors on CPU.
+        list
+            Per-sample CPU logprobs tensors, or per-sample dicts containing logprobs
+            and entropy.
         """
         self.batch_iters = 0
         total_samples = len(batches_list)
@@ -1336,7 +1439,10 @@ class ForwardStepMixin(RouterReplayMixin):
 
         # Pre-calculate actual total forward steps and update total_iters before forward
         smart_pad_helper.forward_per_seqlen_batches(
-            forward_step_wrapped_func=self._smart_pad_forward_step,
+            forward_step_wrapped_func=partial(
+                self._smart_pad_forward_step,
+                return_per_token_entropy=return_per_token_entropy,
+            ),
             dynamic_mbs_target_seqlen=dynamic_mbs_target_seqlen,
             dynamic_mbs_limit=dynamic_mbs_limit,
             update_total_iters_callback=lambda total_steps:
@@ -1348,8 +1454,19 @@ class ForwardStepMixin(RouterReplayMixin):
         flatten_logprobs_list = []
         if mpu.is_pipeline_last_stage():
             for per_forward_step_results in logprobs_list:
-                for logprob in per_forward_step_results:
-                    flatten_logprobs_list.append(logprob.cpu())
+                for result in per_forward_step_results:
+                    if return_per_token_entropy:
+                        assert isinstance(result, dict)
+                        assert set(result) == {"logprobs", "prev_per_token_entropy"}
+                        flatten_logprobs_list.append(
+                            {
+                                key: (value.float().cpu() if key == "logprobs" else value.cpu())
+                                for key, value in result.items()
+                            }
+                        )
+                    else:
+                        assert isinstance(result, torch.Tensor)
+                        flatten_logprobs_list.append(result.cpu())
 
         # Broadcast it from last PP stage to everything else.
         flatten_logprobs_list = BroadcastUtils.broadcast_object_within_pp(flatten_logprobs_list)
@@ -1514,7 +1631,9 @@ class ForwardStepMixin(RouterReplayMixin):
                 fp32_output = not use_linear_ce
                 if self.policy_config.ppo_pack_seq and not dyn_cp:
                     assert not self.training_config.use_linear_ce, "暂不支持"
-                    model_output = gptmodel_pack_foward(unwrapped_model, batch, fwd_kwargs)
+                    model_output = gptmodel_pack_foward(
+                        unwrapped_model, batch, fwd_kwargs, self.config
+                    )
                 else:
                     model_output = model(**fwd_kwargs, fp32_output=fp32_output)
 
@@ -1532,6 +1651,7 @@ class ForwardStepMixin(RouterReplayMixin):
                     mask = batch["mask"]
                     advantages = batch["advantages"]
                     prev_log_probs = batch["prev_log_probs"]
+                    prev_per_token_entropy = batch.get("prev_per_token_entropy", None)
                     ref_log_probs = batch.get("ref_log_probs", None)
                     teacher_log_probs = batch.get("teacher_log_probs", None)
                     rollout_log_probs = batch.get("rollout_log_probs", None)
@@ -1621,6 +1741,67 @@ class ForwardStepMixin(RouterReplayMixin):
                                 dtype=torch.int32, device="cpu"
                             )
 
+                    if not self.ppo_config.use_legacy_loss:
+                        loss_input = PolicyLossInputV2(
+                            advantages=advantages,
+                            prev_log_probs=prev_log_probs,
+                            ref_log_probs=ref_log_probs,
+                            curr_log_probs=curr_log_probs,
+                            response_mask=mask,
+                            scaled_entropy=scaled_entropy,
+                            rollout_log_probs=rollout_log_probs,
+                            per_token_entropy=per_token_entropy,
+                            prev_per_token_entropy=prev_per_token_entropy,
+                            parallel_logits=model_output if not use_linear_ce else None,
+                            sample_mask=batch.get("sample_mask", None),
+                            global_retention_ratio=batch.get("global_retention_ratio", None),
+                            entropy_aux_figures=batch.get("entropy_aux_figures", None),
+                            teacher_log_probs=teacher_log_probs,
+                            dumped_topk_logprobs=dumped_topk_logprobs,
+                            dumped_topk_token_ids=dumped_topk_token_ids,
+                            should_dump_metrics=self.should_dump_metrics and not use_linear_ce,
+                            prev_topk_logprobs=prev_topk_logprobs,
+                            curr_topk_logprobs=curr_topk_logprobs,
+                            cu_seqlens_padded=batch.get("cu_seqlens_padded", None),
+                            local_cp_size=batch.get("local_cp_size", 1),
+                            calculate_per_token_loss=self.calc_per_token_loss,
+                            token_weights=batch.get("token_weights", None),
+                        )
+                        policy_loss_fn = get_loss_fn("mcore", self.ppo_config.loss_func)
+                        bwd_loss, bwd_count, metrics_dict = policy_loss_fn(self.config, loss_input)
+                        metrics_dict.update(im_end_metrics)
+
+                        # Sum-return path: same GBS / token normalization as
+                        # factory GRPO (SEQ_MEAN_RL). Alive-sample count comes
+                        # from pre-reroute ``_step_effective_global_batch_size``.
+                        if self.calc_per_token_loss:
+                            # NOTE 当打开 calc_per_token_loss 时，
+                            # megatron 会累积第二个返回值，最后处理grad统一归一化
+                            total_tokens = mask.sum()
+                            cp_size = mpu.get_context_parallel_world_size()
+                            if cp_size > 1 and not dyn_cp:
+                                total_tokens = total_tokens / cp_size
+                            return (
+                                bwd_loss,
+                                total_tokens.clamp(min=1).to(torch.int),
+                                metrics_dict,
+                            )
+                        else:
+                            # NOTE 当不打开 calc_per_token_loss 时，
+                            # megatron 直接把 bwd_loss / num_mbs 作为 loss
+                            # 因此需要自己处理 gbs 的归一化
+                            num_mbs = self._step_num_microbatches
+                            n_alive_global = max(self._step_effective_global_batch_size, 1)
+                            dp_cp_size = mpu.get_data_parallel_world_size(
+                                with_context_parallel=True
+                            )
+                            scaled_loss = bwd_loss * num_mbs / n_alive_global * dp_cp_size
+                            return (
+                                scaled_loss,
+                                torch.tensor(1, dtype=torch.int, device=mask.device),
+                                metrics_dict,
+                            )
+
                     loss_input = PolicyLossInput(
                         advantages=advantages,
                         prev_log_probs=prev_log_probs,
@@ -1630,6 +1811,7 @@ class ForwardStepMixin(RouterReplayMixin):
                         scaled_entropy=scaled_entropy,
                         rollout_log_probs=rollout_log_probs,
                         per_token_entropy=per_token_entropy,
+                        prev_per_token_entropy=prev_per_token_entropy,
                         parallel_logits=model_output if not use_linear_ce else None,
                         sample_mask=batch.get("sample_mask", None),
                         global_retention_ratio=batch.get("global_retention_ratio", None),
@@ -1650,6 +1832,7 @@ class ForwardStepMixin(RouterReplayMixin):
                     metrics_dict.update(im_end_metrics)
 
                     if not is_seq_mean_rl_loss_fn(policy_loss_fn):
+                        # NOTE 当前只有 GRPO 会跳过这个分支
                         # Legacy micro-batch-mean losses: bwd_loss is already a
                         # mean. Preserve the original two-path behavior.
                         if self.calc_per_token_loss:
@@ -1666,8 +1849,8 @@ class ForwardStepMixin(RouterReplayMixin):
                     # Seq-mean RL (e.g. grpo): ``bwd_loss`` is already the GBS
                     # numerator from ``masked_sum_and_count_per_sample_or_token``
                     # (token-sum or sum-of-per-sample-means). Do not multiply by
-                    # mask.sum() again. Retention is applied at most once, in the
-                    # per-sample denominator below — not again inside loss_factory.
+                    # mask.sum() again. Alive-sample count comes from
+                    # pre-reroute ``_step_effective_global_batch_size``.
                     if self.calc_per_token_loss:
                         # Per-token: Megatron accumulates (loss_sum, token_cnt)
                         # across micro-batches, all-reduces token_cnt over DP×CP
@@ -1679,6 +1862,8 @@ class ForwardStepMixin(RouterReplayMixin):
                         # so divide by cp_size before the DP×CP all-reduce.
                         total_tokens = mask.sum()
                         cp_size = mpu.get_context_parallel_world_size()
+                        # NOTE pack_seq 会走到这里，主要是因为虽然pack_seq的序列是cp gather过的，
+                        # 但是只有自己 CP rank 的样本有梯度，其他 CP rank 的 token 被 detach 了。
                         if cp_size > 1 and not dyn_cp:
                             total_tokens = total_tokens / cp_size
                         return (
@@ -1686,26 +1871,16 @@ class ForwardStepMixin(RouterReplayMixin):
                             total_tokens.clamp(min=1).to(torch.int),
                             metrics_dict,
                         )
-
-                    num_mbs = self._step_num_microbatches
-                    gbs = self._step_global_batch_size
-                    assert gbs == self.training_config.train_gbs, (
-                        f"_step_global_batch_size ({gbs}) != train_gbs "
-                        f"({self.training_config.train_gbs})"
-                    )
-                    grr = batch.get("global_retention_ratio", None)
-                    if grr is not None:
-                        retention = grr.flatten()[0].clamp(min=1e-6)
                     else:
-                        retention = torch.ones((), device=mask.device, dtype=torch.float32)
-                    n_alive_global = retention * gbs
-                    dp_cp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
-                    scaled_loss = bwd_loss * num_mbs / n_alive_global * dp_cp_size
-                    return (
-                        scaled_loss,
-                        torch.tensor(1, dtype=torch.int, device=mask.device),
-                        metrics_dict,
-                    )
+                        num_mbs = self._step_num_microbatches
+                        n_alive_global = max(self._step_effective_global_batch_size, 1)
+                        dp_cp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+                        scaled_loss = bwd_loss * num_mbs / n_alive_global * dp_cp_size
+                        return (
+                            scaled_loss,
+                            torch.tensor(1, dtype=torch.int, device=mask.device),
+                            metrics_dict,
+                        )
 
                 return model_output, loss_func
 
@@ -1736,70 +1911,38 @@ class ForwardStepMixin(RouterReplayMixin):
     def _compute_step_gbs_and_token_cnt(
         self,
         batch: List[Dict[str, Any]],
-        dyn_cp: bool,
-    ) -> Tuple[int, torch.Tensor]:
-        """All-reduce global batch size and valid-token count for this step.
+    ) -> Tuple[int, int, torch.Tensor]:
+        """All-reduce gbs / effective_gbs / token_cnt for this train step.
 
-        Every rank contributes a local ``(sample_cnt, token_cnt)`` and then
-        all-reduces, so the result is identical on all ranks and can be used
-        for loss-normalization asserts.
+        Must be called on the **pre-reroute** per-sample batch (before dyn-CP
+        packing). CP siblings share the same sample list under static CP, so
+        counts are reduced over the DP group only.
 
-        Non-dyn-CP
-        ----------
-        ``batch`` is the per-DP sample list (CP siblings share the same list).
-        Local sample count is ``len(batch)``; token count is the sum of
-        ``mask``. Both are reduced over the DP group only.
-
-        Dyn-CP
-        ------
-        ``batch`` is already packed microbatches after reroute.
-        ``len(batch)`` is the local mb count, not the sample count. Sample
-        count comes from ``cu_seqlens_padded``. Packed tensors are replicated
-        across each local-CP subgroup, so both counts are divided by
-        ``local_cp_size`` before a DP×CP reduce.
+        ``sample_mask`` is all-or-nothing: if any sample has it, every sample
+        must have it. A sample is dead when its mask is 0/False; otherwise
+        alive. When the key is absent, ``effective_gbs == gbs``.
         """
         train_gbs = self.training_config.train_gbs
         device = torch.cuda.current_device()
-        local_stats = torch.zeros(2, device=device, dtype=torch.float32)
+        local_stats = torch.zeros(3, device=device, dtype=torch.float32)
 
-        if dyn_cp:
-            for b in batch:
-                mask = b.get("loss_mask", b.get("mask"))
-                assert mask is not None, (
-                    "dyn_cp packed microbatch is missing loss_mask/mask for "
-                    "global token_cnt accounting"
-                )
-                assert "cu_seqlens_padded" in b, (
-                    "dyn_cp packed microbatch is missing cu_seqlens_padded for "
-                    "global gbs accounting"
-                )
-                lcp = b.get("local_cp_size", 1)
-                lcp_val = lcp.item() if torch.is_tensor(lcp) else int(lcp)
-                lcp_val = max(lcp_val, 1)
-                n_samples = b["cu_seqlens_padded"].shape[0] - 1
-                local_stats[0] += float(n_samples) / lcp_val
-                local_stats[1] += mask.float().sum() / lcp_val
-            dist.all_reduce(
-                local_stats,
-                group=mpu.get_data_parallel_group(with_context_parallel=True),
-            )
+        local_stats[0] = float(len(batch))
+        if "sample_mask" in batch[0]:
+            local_stats[1] = torch.stack([b["sample_mask"] for b in batch]).float().sum()
         else:
-            local_stats[0] = float(len(batch))
-            for b in batch:
-                local_stats[1] += b["mask"].float().sum()
-            dist.all_reduce(local_stats, group=mpu.get_data_parallel_group())
+            local_stats[1] = float(len(batch))
+        for b in batch:
+            local_stats[2] += b["mask"].float().sum()
+        dist.all_reduce(local_stats, group=mpu.get_data_parallel_group())
 
         gbs = int(local_stats[0].item())
-        token_cnt = local_stats[1]
+        effective_gbs = int(local_stats[1].item())
+        token_cnt = local_stats[2]
         assert gbs == train_gbs, (
             f"all-reduced gbs ({gbs}) != training.train_gbs ({train_gbs}) "
-            f"(dyn_cp={dyn_cp}, local_batch_len={len(batch)})"
-        )
-        assert token_cnt.item() > 0, (
-            f"global valid token count is non-positive: {token_cnt.item()} "
-            f"(gbs={gbs}, dyn_cp={dyn_cp})"
-        )
-        return gbs, token_cnt
+            f"(local_batch_len={len(batch)})"
+        )  # NOTE 这里目前先限制，后续再放开
+        return gbs, effective_gbs, token_cnt
 
     def _update_policy(self, batch: List[Dict[str, Any]], num_microbatches: int):
         policy_config = self.policy_config
@@ -1872,9 +2015,6 @@ class ForwardStepMixin(RouterReplayMixin):
         rl_train_log_suffix = " (dyn_cp)" if dyn_cp else ""
         self.batch_log_str = f"rl_train{rl_train_log_suffix} microbatch "
         self._step_num_microbatches = actual_num_microbatches
-        self._step_global_batch_size, self._step_global_token_cnt = (
-            self._compute_step_gbs_and_token_cnt(batch, dyn_cp)
-        )
 
         data_iter = get_iterator_k_split_list(batch, actual_num_microbatches)
         fwd_bwd_function = get_forward_backward_func()
@@ -1903,6 +2043,7 @@ class ForwardStepMixin(RouterReplayMixin):
         if is_pipeline_last_stage() and len(metrics_micro_batch) > 0:
             token_level_accumulated = {}
             scalar_accumulated = {}
+            histogram_accumulated = {}
 
             for key in metrics_micro_batch[0].keys():
                 if key in dump_metrics_keys:
@@ -1924,6 +2065,8 @@ class ForwardStepMixin(RouterReplayMixin):
                 if values.dim() == 2 and values.shape[1] == 2:
                     # [[sum, count], ...] metrics
                     token_level_accumulated[key] = values.sum(dim=0)
+                elif key.endswith("_histogram"):
+                    histogram_accumulated[key] = values.sum(dim=0)
                 else:
                     # [scalar, ...] metrics
                     if key.endswith("_min"):
@@ -1942,6 +2085,18 @@ class ForwardStepMixin(RouterReplayMixin):
                 for i, k in enumerate(tk_keys):
                     token_level_accumulated[k] = all_vals[i]
 
+            for key in sorted(histogram_accumulated):
+                torch.distributed.all_reduce(
+                    histogram_accumulated[key],
+                    group=mpu.get_data_parallel_group(with_context_parallel=dyn_cp),
+                )
+
+            histogram_metrics = finalize_histogram_metrics(
+                self.ppo_config.loss_func,
+                self.config,
+                histogram_accumulated,
+            )
+
             if is_last_rank():
                 metrics = {"policy/seq_length": seq_length}
                 if dyn_cp_max_local_cp is not None:
@@ -1952,6 +2107,8 @@ class ForwardStepMixin(RouterReplayMixin):
                 for key, val in scalar_accumulated.items():
                     metric_key = key if key.startswith("eos/") else f"policy/{key}"
                     metrics[metric_key] = val.cpu().item()
+                for key, val in histogram_metrics.items():
+                    metrics[f"policy/{key}"] = val.cpu().item()
 
         aux_metrics = self._collect_aux_metrics(actual_num_microbatches)
         metrics.update(aux_metrics)
@@ -1994,7 +2151,7 @@ class ForwardStepMixin(RouterReplayMixin):
                 model_output = model(**fwd_kwargs, fp32_output=fp32_output)
             else:
                 assert not self.training_config.use_linear_ce, "暂不支持"
-                model_output = gptmodel_pack_foward(unwrapped_model, batch, fwd_kwargs)
+                model_output = gptmodel_pack_foward(unwrapped_model, batch, fwd_kwargs, self.config)
 
             if isinstance(model_output, tuple):
                 model_output = model_output[0]
@@ -2005,7 +2162,7 @@ class ForwardStepMixin(RouterReplayMixin):
                 assert isinstance(model_output, torch.Tensor)
 
             def loss_func(model_output):
-                loss_fn = get_policy_loss_fn(self.training_config.loss_func)
+                loss_fn = get_loss_fn("mcore", self.training_config.loss_func)
                 batch["should_dump_metrics"] = self.should_dump_metrics
                 loss_input = FinetuneLossInput(
                     logits=model_output if isinstance(model_output, torch.Tensor) else None,
@@ -2054,7 +2211,7 @@ class ForwardStepMixin(RouterReplayMixin):
             assert isinstance(model_output, torch.Tensor)
 
             def loss_func(model_output):
-                loss_fn = get_policy_loss_fn("rm_bt")
+                loss_fn = get_loss_fn("mcore", "rm_bt")
                 loss_input = FinetuneLossInput(
                     logits=model_output,
                     batch=batch,
@@ -2093,7 +2250,9 @@ class ForwardStepMixin(RouterReplayMixin):
                 batch
             ) * dp_size, f"{training_config.train_gbs=} {len(batch)=} {dp_size=}"
 
-        if self.config.debug.experimental_pad_to_max_length:
+        if isinstance(self.config, DpoConfig):
+            max_seq_length = self._get_dpo_forward_seq_length(batch)
+        elif self.config.debug.experimental_pad_to_max_length:
             max_seq_length = self.config.training.seq_length
         elif isinstance(self.config, RewardConfig):
             # RM 样本此时还没有 'tokens'，只有 chosen_tokens/rejected_tokens（rm_train 才融合）。
@@ -2492,7 +2651,7 @@ class ForwardStepMixin(RouterReplayMixin):
             if not self.policy_config.ppo_pack_seq:
                 values = model(**fwd_kwargs)
             else:
-                values = gptmodel_pack_foward(unwrapped_model, batch, fwd_kwargs)
+                values = gptmodel_pack_foward(unwrapped_model, batch, fwd_kwargs, self.config)
 
             if isinstance(values, tuple):
                 values = values[0]
@@ -2505,7 +2664,7 @@ class ForwardStepMixin(RouterReplayMixin):
                 ) > 1 and not self.policy_config.ppo_pack_seq:
                     values = all_gather_from_context_parallel_region(values)
                 values = values[:, :-1]
-                fn = get_policy_loss_fn("ppo_value_loss")
+                fn = get_loss_fn("mcore", "ppo_value_loss")
                 old_values = batch["values"]
                 returns = batch["returns"]
                 mask = batch["mask"]

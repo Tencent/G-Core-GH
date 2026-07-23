@@ -12,6 +12,7 @@ from gpatch_v4.orches.resource_allocator import (
     allocation_from_config,
 )
 from gpatch_v4.utils import log
+from gpatch_v4.utils.placement import is_partial_colocated
 
 
 def _instantiate_node_replacer(
@@ -212,6 +213,8 @@ class TrainerRetryMixin:
         assert considered, "allocation has no non-shared roles"
         if config.placement_type == "colocate":
             return max(considered)
+        if is_partial_colocated(config):
+            return allocation.role_nnodes["policy"]
         else:
             # disaggregated: roles occupy distinct nodes, sum them.
             return sum(considered)

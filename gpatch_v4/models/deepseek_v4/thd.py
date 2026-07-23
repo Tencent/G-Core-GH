@@ -114,6 +114,15 @@ class PackedSeqParams:
 
     qkv_format : str
         Always ``"thd"``.
+    split_sizes_cont_to_zz : list of int, optional
+        Per-destination token counts for contiguous-to-zigzag all-to-all.
+        Populated by ``cp_chunk_data`` on the rank-local copy.
+    split_sizes_zz_to_cont : list of int, optional
+        Per-source token counts received by the rank's zigzag partition.
+        Populated together with ``split_sizes_cont_to_zz``.
+    order_cont_to_zz : Tensor, optional
+        Rank-local permutation that groups contiguous tokens by zigzag
+        destination rank.
     """
 
     cu_seqlens_q: torch.Tensor  # TODO unused: 仅 __post_init__/validate 自查 + make_packed_seq_layout 内部建 seg_id；外部未读
@@ -128,6 +137,9 @@ class PackedSeqParams:
     # ``cp_chunk_data`` returns a new PSP with a CP-rank-sliced layout
     # (see :func:`cp_slice_layout`).
     layout: "_PackedSeqLayout | None" = None
+    split_sizes_cont_to_zz: list[int] | None = None
+    split_sizes_zz_to_cont: list[int] | None = None
+    order_cont_to_zz: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         assert self.cu_seqlens_q.shape == self.cu_seqlens_q_padded.shape
@@ -137,6 +149,23 @@ class PackedSeqParams:
         assert self.qkv_format == "thd"
         assert isinstance(self.max_seqlen_q, int) and self.max_seqlen_q > 0
         assert isinstance(self.total_seqlen, int) and self.total_seqlen > 0
+        assert (self.split_sizes_cont_to_zz is None) == (self.split_sizes_zz_to_cont is None)
+        assert (self.split_sizes_cont_to_zz is None) == (self.order_cont_to_zz is None)
+        if self.split_sizes_cont_to_zz is not None:
+            assert self.split_sizes_zz_to_cont is not None
+            assert self.order_cont_to_zz is not None
+            cp_size = len(self.split_sizes_cont_to_zz)
+            assert cp_size > 0
+            assert len(self.split_sizes_zz_to_cont) == cp_size
+            assert self.total_seqlen % (2 * cp_size) == 0
+            assert all(n >= 0 for n in self.split_sizes_cont_to_zz)
+            assert all(n >= 0 for n in self.split_sizes_zz_to_cont)
+            s_local = self.total_seqlen // cp_size
+            assert sum(self.split_sizes_cont_to_zz) == s_local
+            assert sum(self.split_sizes_zz_to_cont) == s_local
+            assert self.order_cont_to_zz.shape == (s_local, )
+            assert self.order_cont_to_zz.dtype == torch.int64
+            assert self.order_cont_to_zz.device == self.cu_seqlens_q_padded.device
 
     def validate(self) -> None:
         """Value/monotonicity/consistency checks; triggers GPU→CPU sync.
@@ -160,7 +189,6 @@ class PackedSeqParams:
 # ---------------------------------------------------------------------------
 
 
-# todo zz: track owned and prefixed global window indices
 @dataclass(frozen=True)
 class _PerMLayout:
     """Derived per-``m`` fields shared by HCA / CSA / Indexer / topk_idxs builders.
@@ -221,6 +249,12 @@ class _PerMLayout:
         non-leading seg in the "with CP all2all prefix" view. Used by CSA /
         Indexer to zero-kv / ``-inf``-gate the Ca half of seg-boundary
         windows.
+
+    causal_threshold_per_token_zz : Tensor, optional
+        Shape ``[s_local]`` long. Same values as
+        ``causal_threshold_per_token`` but gathered into zigzag receive
+        order for this CP rank. Populated by ``cp_chunk_data`` only;
+        ``None`` on the global layout from :func:`pack_sequences`.
     """
 
     causal_threshold_per_token: torch.Tensor  # used: HCA / Indexer future-causal gate
@@ -229,9 +263,9 @@ class _PerMLayout:
     wnd_pos_ids_with_prefix: torch.Tensor  # used: CSA/Indexer compressor RoPE positions (with CP prefix)
     pad_token_mask_with_prefix: torch.Tensor  # used: CSA/Indexer pad-token gate -inf
     first_of_seg_window_mask_with_prefix: torch.Tensor  # used: CSA/Indexer first-of-seg Ca slot zero+gate
+    causal_threshold_per_token_zz: torch.Tensor | None = None  # used: Indexer fused zigzag mask/topk
 
 
-# todo zz: track folded token and SWA-KV index maps
 @dataclass(frozen=True)
 class _PackedSeqLayout:
     """Top-level THD-derived fields produced by :func:`make_packed_seq_layout`.
@@ -285,6 +319,12 @@ class _PackedSeqLayout:
     sliding_window : int
         From ``config.sliding_window``; used by :func:`cp_slice_layout` for
         ``seg_id_per_token_with_prefix`` SW prefix length.
+
+    seg_id_per_token_zz : Tensor, optional
+        Shape ``[s_local]`` long. Same values as ``seg_id_per_token_full``
+        but gathered into zigzag receive order for this CP rank.
+        Populated by ``cp_chunk_data`` only; ``None`` on the global layout
+        from :func:`pack_sequences`.
     """
 
     seg_id_per_token: torch.Tensor  # used: modeling cross_seg_mask（HCA / Indexer 各 1 处）
@@ -293,6 +333,7 @@ class _PackedSeqLayout:
     pad_token_mask: torch.Tensor  # used: _per_m_layout 内部作 pad_token_mask_with_prefix 来源
     per_m: dict[int, _PerMLayout]
     sliding_window: int
+    seg_id_per_token_zz: torch.Tensor | None = None  # used: Indexer fused zigzag mask/topk
 
 
 # Public alias for cross-module type hints; the underscore prefix is kept on
@@ -476,6 +517,10 @@ def cp_slice_layout(
         │ per_m.first_of_seg_window_mask_with_prefix    │ ✅ slice with prefix │ [(s_local + l_prefix) // m] │
         ├───────────────────────────────────────────────┼──────────────────────┼─────────────────────────────┤
         │ per_m.seg_id_per_wnd                          │ ❌ stay global       │ [T // m]                    │
+        ├───────────────────────────────────────────────┼──────────────────────┼─────────────────────────────┤
+        │ seg_id_per_token_zz                           │ ✅ zigzag gather     │ [s_local]                   │
+        ├───────────────────────────────────────────────┼──────────────────────┼─────────────────────────────┤
+        │ per_m.causal_threshold_per_token_zz           │ ✅ zigzag gather     │ [s_local]                   │
         └───────────────────────────────────────────────┴──────────────────────┴─────────────────────────────┘
 
     q-axis fields are sliced to ``s_local`` so consumers index with the
@@ -484,6 +529,13 @@ def cp_slice_layout(
     stage-2, and per-query causality references that global axis. The
     ``with_prefix`` per-token positional fields carry the m-token CP
     all2all prefix that :func:`compressor_cp_ring` prepends on rank > 0.
+
+    ``*_zz`` fields are also rank-local ``[s_local]``, but ordered in
+    zigzag receive order (not contiguous ``sl``). They are filled by
+    :func:`gpatch_v4.models.deepseek_v4.cp.cp_chunk_data` after this
+    slice — gathering from the global vectors with the same token index
+    map that ``indexer_zigzag_all_to_all(..., cont_to_zz=True)`` would
+    produce.
 
     Parameters
     ----------
@@ -503,7 +555,6 @@ def cp_slice_layout(
         carry per-rank views (without and with CP prefix, respectively).
     """
 
-    # todo zz: gather per-segment folded layout and prefix views
     assert total_seqlen % cp_size == 0, (
         f"total_seqlen ({total_seqlen}) must be divisible by cp_size ({cp_size})"
     )
@@ -610,7 +661,6 @@ def pack_sequences(
     if device is None:
         device = input_ids[0].device
 
-    # todo zz: align every segment for 2P folded chunks
     total_align = cp_size * pad_to_multiple_of
 
     seqlens: list[int] = []
@@ -676,7 +726,6 @@ def pack_sequences(
             assert labels is not None  # narrows type for pyright
             labels_packed_flat[seg_start:seg_start + s] = labels[i].long()
             # mask the segment-final effective token; pad tail stays at ignore_index
-            labels_packed_flat[seg_start + s - 1] = label_ignore_index
 
     psp = PackedSeqParams(
         cu_seqlens_q=cu_seqlens_q,

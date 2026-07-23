@@ -1,7 +1,6 @@
 # coding=utf-8
 # Copyright (c) 2026 Tencent Inc. All rights reserved.
 # xiaotaoliu@tencent.com
-
 """FP8 block-wise quantization for DSV4 weight update to sglang.
 
 Applies 128×128 block-wise FP8 (float8_e4m3fn + float32/ue8m0 scale)
@@ -32,7 +31,8 @@ from dataclasses import dataclass
 
 import torch
 
-logger = logging.getLogger(__name__)
+from gpatch_v4.models.deepseek_v4.kernel.quantize_kernels import fp4_qat_to_sgl_fp8
+from gpatch_v4.utils import log
 
 # ---------------------------------------------------------------------------
 # Classification patterns (aligned with Miles quantizer_fp8.py)
@@ -109,10 +109,8 @@ def stream_atomic_units(
     for name, tensor in items:
         match = next(
             (
-                (group, idx, suffix)
-                for group in atomic_update_groups
-                for idx, suffix in enumerate(group.suffixes)
-                if name.endswith(suffix)
+                (group, idx, suffix) for group in atomic_update_groups
+                for idx, suffix in enumerate(group.suffixes) if name.endswith(suffix)
             ),
             None,
         )
@@ -132,9 +130,7 @@ def stream_atomic_units(
             yield list(slots)
             del pending[(prefix, group.key)]
     if pending:
-        raise RuntimeError(
-            f"Incomplete atomic update groups at end of stream: {sorted(pending)}"
-        )
+        raise RuntimeError(f"Incomplete atomic update groups at end of stream: {sorted(pending)}")
 
 
 def chunk_atomic_units_by_size(
@@ -164,11 +160,18 @@ def iter_sglang_dsv4_weight_buckets(
     max_bucket_bytes: int,
     *,
     moe_deepgemm: bool = False,
+    fp4_qat: bool = False,
 ) -> Iterator[list[tuple[str, torch.Tensor]]]:
-    """Quantize DSV4 weights then emit size-bounded buckets that respect fuse pairs."""
-    quantized = iter_fp8_quantized_weights(weights, moe_deepgemm=moe_deepgemm)
+    """Quantize DSV4 weights then emit size-bounded buckets that respect fuse pairs.
+
+    When ``fp4_qat`` is enabled, routed experts are first projected onto the
+    QAT FP4 grid and then represented in SGLang's FP8 expert format. This
+    preserves the FP4 deployment error learned during training.
+    """
+    quantized = iter_fp8_quantized_weights(weights, moe_deepgemm=moe_deepgemm, fp4_qat=fp4_qat)
     units = stream_atomic_units(quantized, get_dsv4_sglang_atomic_update_groups())
     yield from chunk_atomic_units_by_size(units, max_bucket_bytes)
+
 
 # ---------------------------------------------------------------------------
 # Lazy-loaded FP8 quantizer
@@ -190,9 +193,7 @@ def _init_fp8_quantizers():
         return
 
     try:
-        from sglang.srt.layers.quantization.fp8_utils import (
-            per_block_cast_to_fp8,
-        )
+        from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
         _per_block_cast_fn = per_block_cast_to_fp8
     except ImportError:
         _per_block_cast_fn = None
@@ -202,9 +203,7 @@ def _init_fp8_quantizers():
             quant_weight_ue8m0,
             transform_scale_ue8m0,
         )
-        from sglang.srt.model_loader.utils import (
-            should_deepgemm_weight_requant_ue8m0,
-        )
+        from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
         _quant_weight_ue8m0_fn = quant_weight_ue8m0
         _transform_scale_ue8m0_fn = transform_scale_ue8m0
         _should_ue8m0_fn = should_deepgemm_weight_requant_ue8m0
@@ -219,10 +218,8 @@ def _init_fp8_quantizers():
             "is available. Cannot perform FP8 quantization."
         )
 
-    logger.info(
-        "FP8 quantizer ready: per_block_cast=%s, ue8m0=%s",
-        _per_block_cast_fn is not None,
-        _quant_weight_ue8m0_fn is not None,
+    log(
+        f"FP8 quantizer ready per_block_cast={_per_block_cast_fn is not None}, ue8m0={_quant_weight_ue8m0_fn is not None}"
     )
     _fp8_ready = True
 
@@ -293,14 +290,16 @@ def quantize_fp8(
 
     if _use_ue8m0_scale(name, moe_deepgemm=moe_deepgemm) and _quant_weight_ue8m0_fn is not None:
         qweight, scale = _quant_weight_ue8m0_fn(
-            weight_2d, weight_block_size=_WEIGHT_BLOCK_SIZE,
+            weight_2d,
+            weight_block_size=_WEIGHT_BLOCK_SIZE,
         )
         scale = _transform_scale_ue8m0_fn(scale, mn=qweight.shape[-2])
     elif _per_block_cast_fn is not None:
         qweight, scale = _per_block_cast_fn(weight_2d)
     else:
         qweight, scale = _quant_weight_ue8m0_fn(
-            weight_2d, weight_block_size=_WEIGHT_BLOCK_SIZE,
+            weight_2d,
+            weight_block_size=_WEIGHT_BLOCK_SIZE,
         )
         scale = _transform_scale_ue8m0_fn(scale, mn=qweight.shape[-2])
 
@@ -309,10 +308,41 @@ def quantize_fp8(
     return [(name, qweight), (scale_name, scale)]
 
 
+def quantize_fp4_qat_expert(
+    name: str,
+    weight: torch.Tensor,
+    *,
+    moe_deepgemm: bool = False,
+) -> list[tuple[str, torch.Tensor]]:
+    """Deploy an FP4-QAT routed expert through SGLang's FP8 loader.
+
+    Quantize the FP32 master parameter directly to E2M1 1×32 and rebase it
+    into SGLang's E4M3 128×128 representation with one fused TileLang kernel.
+    """
+    assert _EXPERT_RE.search(name) is not None, f"Expected routed expert key, got {name!r}"
+    assert name.endswith(".weight"), f"Expected .weight suffix, got {name!r}"
+
+    qweight, fp8_scale = fp4_qat_to_sgl_fp8(weight)
+
+    # The regular SGLang path uses float32 scales unless its DeepGEMM path
+    # requires the transformed ue8m0 layout. Reuse exactly that decision and
+    # layout conversion so this branch is load-compatible with both workers.
+    scale: torch.Tensor = fp8_scale.float()
+    if moe_deepgemm:
+        _init_fp8_quantizers()
+        if _use_ue8m0_scale(name, moe_deepgemm=True):
+            assert _transform_scale_ue8m0_fn is not None
+            scale = _transform_scale_ue8m0_fn(fp8_scale, mn=qweight.shape[-2])
+
+    scale_name = name[:-len(".weight")] + ".weight_scale_inv"
+    return [(name, qweight), (scale_name, scale.contiguous())]
+
+
 def iter_fp8_quantized_weights(
     weights: Iterator[tuple[str, torch.Tensor]],
     *,
     moe_deepgemm: bool = False,
+    fp4_qat: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Wrap a bf16 weight iterator with FP8 block-wise quantization for sglang.
 
@@ -328,6 +358,9 @@ def iter_fp8_quantized_weights(
     moe_deepgemm : bool
         Whether the sglang MoE runner uses DeepGEMM. Controls ue8m0
         scale format for expert weights; see :func:`quantize_fp8`.
+    fp4_qat : bool
+        Recreate FP4 QAT's E2M1 1×32 quantization for routed experts before
+        converting them into SGLang's FP8 expert representation.
 
     Yields
     ------
@@ -341,7 +374,9 @@ def iter_fp8_quantized_weights(
                 f"got scale key {name!r}"
             )
 
-        if should_fp8_quantize(name):
+        if fp4_qat and _EXPERT_RE.search(name) is not None:
+            yield from quantize_fp4_qat_expert(name, tensor, moe_deepgemm=moe_deepgemm)
+        elif should_fp8_quantize(name):
             yield from quantize_fp8(name, tensor, moe_deepgemm=moe_deepgemm)
         else:
             yield name, tensor

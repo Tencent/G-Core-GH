@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
+import torch.nn as nn
 
 from gpatch_v4.models.deepseek_v4.mtp import mtp_roll_tensor
+from gpatch_v4.training_backend.fsdp2_backend.linear_ce import linear_ce_head_context
 
 # TODO: 这个文件需要重构，目前是 deepseek v4 强绑定的。
 
@@ -13,11 +14,14 @@ def calculate_mtp_loss(
     mtp_per_depth_h: list[torch.Tensor],
     labels: torch.Tensor,
     lm_head,
-    loss_fct,
+    loss_fct: nn.Module | None = None,
     loss_mask: torch.Tensor | None = None,
     cp_group=None,
     packed_seq_params=None,
     ignore_index: int = -100,
+    use_linear_ce: bool = False,
+    linear_ce_backend: str | None = None,
+    temperature: float = 1.0,
 ) -> list[torch.Tensor]:
     """Compute per-depth MTP masked-loss numerators using shared lm_head.
 
@@ -31,6 +35,11 @@ def calculate_mtp_loss(
         Shape ``[bsz, s_local]``; shifted next-token labels (possibly CP-chunked).
     packed_seq_params : PackedSeqParams, optional
         When provided (THD mode), roll is segment-aware.
+    use_linear_ce : bool
+        If True, each depth goes through the LM-head bypass with nested
+        ``linear_ce_head_context`` (keeps FSDP all-gather on ``lm_head``).
+    linear_ce_backend : str, optional
+        Required when ``use_linear_ce`` is True.
 
     Returns
     -------
@@ -41,16 +50,18 @@ def calculate_mtp_loss(
     if num_depth == 0:
         return []
 
+    if use_linear_ce:
+        assert linear_ce_backend is not None
+    else:
+        assert loss_fct is not None
+
     bsz, seq = labels.shape
-    cp_size = 1 if cp_group is None else dist.get_world_size(cp_group)
-    cp_rank = 0 if cp_group is None else dist.get_rank(cp_group)
 
     per_depth_num: list[torch.Tensor] = []
     rolled_labels = labels
     roll_kwargs = dict(cp_group=cp_group, packed_seq_params=packed_seq_params)
     rolled_mask = loss_mask
     for depth, hidden in enumerate(mtp_per_depth_h):
-        logits = lm_head(hidden)
         trail = depth + 1
         rolled_labels = mtp_roll_tensor(
             rolled_labels,
@@ -59,10 +70,23 @@ def calculate_mtp_loss(
             fill_value=ignore_index,
         ).clone()
 
-        depth_loss = loss_fct(
-            logits.view(-1, logits.shape[-1]),
-            rolled_labels.reshape(-1),
-        ).view(bsz, seq)
+        if use_linear_ce:
+            with linear_ce_head_context(
+                lm_head,
+                rolled_labels,
+                linear_ce_backend,
+                temperature,
+                return_entropy=False,
+            ):
+                log_probs = lm_head(hidden)
+            assert isinstance(log_probs, torch.Tensor)
+            depth_loss = (-log_probs).float().view(bsz, seq)
+        else:
+            logits = lm_head(hidden)
+            depth_loss = loss_fct(
+                logits.view(-1, logits.shape[-1]),
+                rolled_labels.reshape(-1),
+            ).view(bsz, seq)
 
         if rolled_mask is not None:
             rolled_mask = mtp_roll_tensor(

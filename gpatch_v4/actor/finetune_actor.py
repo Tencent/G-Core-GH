@@ -45,6 +45,9 @@ from gpatch_v4.training_backend import (
     TrainingEngineFactory,
     register_custom_loss_fn,
 )
+from gpatch_v4.training_backend.loss import (
+    register_custom_loss_fn as register_backend_custom_loss_fn,
+)
 from gpatch_v4.utils import (
     TimerSingleton,
     TrainReporterSingleton,
@@ -196,6 +199,7 @@ class FinetuneActor(
 
         if self.config.training.loss_func not in BUILDIN_LOSS_FUNC:
             assert self.config.training.loss_func == "custom", "Custom loss function must be provided"
+            #TODO: loss refact ing
             register_custom_loss_fn(
                 self.config.training.loss_func,
                 self.config.training.loss_func_py_path,

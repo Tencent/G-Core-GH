@@ -1,5 +1,6 @@
 import asyncio
 import traceback
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Type
@@ -22,7 +23,7 @@ from gpatch_v4.utils import (
     logging_memory_usage_details,
     safe_import_class,
 )
-
+from gpatch_v4.utils.placement import is_colocate, is_partial_colocated
 
 ORIGIN_PPO_STEP_KEY = "_origin_ppo_step"
 ORIGIN_MICROBATCH_IDX_KEY = "_origin_microbatch_idx"
@@ -115,7 +116,8 @@ class RolloutController:
         self.data_source: Optional[DataSourceBase] = None
         self.apply_sampling_rollout_attr = None
         self.agent_loop_actors: List = []
-        self.use_colocate = self.config.placement_type == "colocate"
+        self.use_colocate = is_colocate(self.config)
+        self.is_partial_colocated = is_partial_colocated(self.config)
 
         # Fire-side counters.  These advance when requests are *dispatched*,
         # not when they are consumed, so sliding prefetch (which issues
@@ -179,11 +181,11 @@ class RolloutController:
 
         await self.setup_agent_loop_actors()
 
-        if (self.use_colocate and len(self.agent_loop_actors) > 1):
-            await self.setup_colocate_group()
-
-        if train_actors is not None and self.use_colocate:
-            await self.set_train_actors(train_actors)
+        if self.use_colocate:
+            if len(self.agent_loop_actors) > 1:
+                await self.setup_colocate_group()
+            if train_actors is not None:
+                await self.set_train_actors(train_actors)
 
         log(
             f"[RolloutController] setup done: dp_size={dp_size}, "
@@ -191,6 +193,16 @@ class RolloutController:
             f"rb_multiplier={self.rb_multiplier}, "
             f"num_agent_loop_workers={self.training_config.num_agent_loop_workers}"
         )
+
+    @asynccontextmanager
+    async def partial_colocated_rollout(self, ppo_step: int):
+        """Keep sampler and gen-RMs awake while one PPO step is running."""
+        assert self.agent_loop_actors, "agent_loop_actors must be initialized"
+        await self.agent_loop_actors[0].begin_partial_colocated_rollout.remote(ppo_step)
+        try:
+            yield
+        finally:
+            await self.agent_loop_actors[0].end_partial_colocated_rollout.remote(ppo_step)
 
     async def setup_agent_loop_actors(self):
         """Create and initialize the AgentLoopActor pool."""
@@ -359,6 +371,25 @@ class RolloutController:
             )
             assert self._ready_queue.empty(
             ), ("single_controller requires collect before firing the next step")
+        elif self.is_partial_colocated:
+            assert num_ppo_steps == 1, (
+                "partial_colocated single_controller only supports num_ppo_steps=1"
+            )
+            assert self.config.placement_type == "partial_colocated", (
+                "step rollout lifecycle requires placement_type='partial_colocated'"
+            )
+            assert self.training_config.rollout_max_staleness == 0, (
+                "partial_colocated requires rollout_max_staleness == 0"
+            )
+            assert not self._inflight_tasks, (
+                "partial_colocated does not allow overlapping inflight steps"
+            )
+            assert self._ready_queue.empty(
+            ), ("partial_colocated requires collect before firing the next step")
+        else:
+            assert self.config.placement_type == "disaggregated", (
+                f"unsupported placement_type={self.config.placement_type!r}"
+            )
 
         agent_actors = self.agent_loop_actors
         num_agent_actors = len(agent_actors)
@@ -383,6 +414,18 @@ class RolloutController:
             if self.use_colocate:
                 task = asyncio.create_task(
                     self.dispatch_batches_to_agents(
+                        agent_actors,
+                        per_agent_batches,
+                        per_agent_indices,
+                        per_agent_microbatch_indices,
+                        cur_ppo_step,
+                    )
+                )
+                self._inflight_tasks.append(task)
+                total_fired += num_mb
+            elif self.is_partial_colocated:
+                task = asyncio.create_task(
+                    self.dispatch_partial_colocated_step(
                         agent_actors,
                         per_agent_batches,
                         per_agent_indices,
@@ -425,6 +468,45 @@ class RolloutController:
             f"across {num_ppo_steps} steps "
             f"(ppo_step {ppo_step}..{ppo_step + num_ppo_steps - 1})"
         )
+
+    async def dispatch_partial_colocated_step(
+        self,
+        agent_actors: List,
+        per_agent_batches: List[List[Dict[str, Any]]],
+        per_agent_indices: List[List[int]],
+        per_agent_microbatch_indices: List[List[int]],
+        ppo_step: int,
+    ):
+        """Dispatch one partial-colocated PPO step under one lifecycle context."""
+        assert self.is_partial_colocated
+        dispatch_items = []
+        for actor_idx, (batches_part, indices_part, mb_indices_part) in enumerate(
+            zip(per_agent_batches, per_agent_indices, per_agent_microbatch_indices)
+        ):
+            for cleaned_data, sample_idx, microbatch_idx in zip(
+                batches_part,
+                indices_part,
+                mb_indices_part,
+            ):
+                dispatch_items.append((microbatch_idx, actor_idx, cleaned_data, sample_idx))
+
+        async with self.partial_colocated_rollout(ppo_step):
+            results = await asyncio.gather(
+                *[
+                    self.dispatch_single_item_to_agent(
+                        agent_actors[actor_idx],
+                        cleaned_data,
+                        ppo_step,
+                        microbatch_idx,
+                        sample_idx,
+                    ) for microbatch_idx, actor_idx, cleaned_data, sample_idx in
+                    sorted(dispatch_items)
+                ],
+                return_exceptions=True,
+            )
+            errors = [result for result in results if isinstance(result, BaseException)]
+            if errors:
+                raise errors[0]
 
     async def dispatch_single_item_to_agent(
         self,
@@ -563,15 +645,13 @@ class RolloutController:
             item = await self._ready_queue.get()
             if isinstance(item, Exception):
                 raise item
-            assert isinstance(item, QueuedRolloutBatch), (
-                f"unexpected ready queue item type: {type(item)}"
-            )
+            assert isinstance(item, QueuedRolloutBatch
+                             ), (f"unexpected ready queue item type: {type(item)}")
             rbs.append(item.rollout_batch)
         return rbs
 
-    async def collect_ordered_rollout_batches(
-        self, ppo_step: int, num_mb: int
-    ) -> List[Dict[str, List[Any]]]:
+    async def collect_ordered_rollout_batches(self, ppo_step: int,
+                                              num_mb: int) -> List[Dict[str, List[Any]]]:
         """Collect rollout batches for ``ppo_step`` in original order."""
         self._assert_no_stale_ordered_steps(ppo_step)
 
@@ -579,9 +659,8 @@ class RolloutController:
             item = await self._ready_queue.get()
             if isinstance(item, Exception):
                 raise item
-            assert isinstance(item, QueuedRolloutBatch), (
-                f"unexpected ready queue item type: {type(item)}"
-            )
+            assert isinstance(item, QueuedRolloutBatch
+                             ), (f"unexpected ready queue item type: {type(item)}")
             assert item.ppo_step >= ppo_step, (
                 f"ordered collection saw stale ppo_step {item.ppo_step} "
                 f"while collecting {ppo_step}"
@@ -761,9 +840,8 @@ class RolloutController:
         num_expected: int,
     ) -> None:
         """Validate sample-level provenance, then remove internal attrs."""
-        assert len(rbs) == num_expected, (
-            f"expected {num_expected} rollout batches, got {len(rbs)}"
-        )
+        assert len(rbs
+                  ) == num_expected, (f"expected {num_expected} rollout batches, got {len(rbs)}")
         collected_microbatch_indices = []
         for rb in rbs:
             assert ORIGIN_PPO_STEP_KEY in rb
@@ -787,8 +865,7 @@ class RolloutController:
             del rb[ORIGIN_MICROBATCH_IDX_KEY]
         if self.training_config.rollout_ordered_collection:
             expected_microbatch_indices = [
-                microbatch_idx
-                for microbatch_idx in range(self._num_microbatches)
+                microbatch_idx for microbatch_idx in range(self._num_microbatches)
                 for _ in range(self.rb_multiplier)
             ]
             assert collected_microbatch_indices == expected_microbatch_indices, (

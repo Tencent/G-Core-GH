@@ -6,20 +6,20 @@ export PYTHONPATH="$PWD:$MCORE_PATH:$MBRIDGE_PATH:$MEGATRON_BRIDGE_PATH/src:$PYT
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
 
 # Reuse the shared mpirun + Ray bootstrap from math_rl_v4 — it's not task-specific.
-export GCORE_GPU=16
+export GCORE_NNODES=16
 source tasks/math_dsv4/scripts/mpirun-init-ray.sh
 
 python3 -u gpatch_v4/entry/train_lm_grpo.py \
     --config-path="../../tasks/math_dsv4/yaml" --config-name="math_dsv4_grpo_sgl_colocated.yaml" \
-    debug.debug_engine_update_weight=True \
-    policy.hf_model_path=/mnt/geminigmceph/user_yyyuuuzhang/code/gcore-dev-0710/ckpt_miniprogram_grpo_sglang/hf_fp4_fp8_e8m0/150 \
-    policy.hf_tokenizer_path=/mnt/geminigmceph/user_yyyuuuzhang/code/gcore-dev-0710/ckpt_miniprogram_grpo_sglang/hf_fp4_fp8_e8m0/150 \
-    policy.ref_hf_model_path=/mnt/geminigmceph/user_yyyuuuzhang/code/gcore-dev-0710/ckpt_miniprogram_grpo_sglang/hf_fp4_fp8_e8m0/150
+    policy.ppo_pack_seq=True \
+    training.auto_load_from_save_ckpt=False \
+    +policy.fp8_qat=True \
+    +training.linear_ce_backend=separate \
+    +training.use_linear_ce=True
 
-    # policy.hf_model_path=/mnt/geminigmceph/user_yyyuuuzhang/code/gcore-dev-0710/ckpt_miniprogram_grpo_sglang//hf_fp4_fp8/150/ \
-    # policy.hf_tokenizer_path=/mnt/geminigmceph/user_yyyuuuzhang/code/gcore-dev-0710/ckpt_miniprogram_grpo_sglang//hf_fp4_fp8/150/ \
-    # policy.ref_hf_model_path=/mnt/geminigmceph/user_yyyuuuzhang/code/gcore-dev-0710/ckpt_miniprogram_grpo_sglang//hf_fp4_fp8/150/
+    # debug.debug_engine_update_weight=True \
+    # +policy.fp8_qat=True \
+    # +policy.fp4_qat=True
 
-    # policy.hf_model_path=/mnt/geminigmceph/user_yyyuuuzhang/code/gcore-dev-0710/ckpt_miniprogram_grpo_sglang//hf/150/ \
-    # policy.hf_tokenizer_path=/mnt/geminigmceph/user_yyyuuuzhang/code/gcore-dev-0710/ckpt_miniprogram_grpo_sglang//hf/150/ \
-    # policy.ref_hf_model_path=/mnt/geminigmceph/user_yyyuuuzhang/code/gcore-dev-0710/ckpt_miniprogram_grpo_sglang//hf/150/
+    # +training.ppo_dump_metrics_interval=1 \
+    # +training.ppo_dump_metrics_dir=debug-tmp/grpo_thd_alignment \

@@ -20,9 +20,13 @@ def _cfg(**ppo_kw):
         ppo_dual_clip_ratio_c=None, ppo_clamp_kl_val=None,
         ppo_entropy_bonus=0.0, grpo_kl_loss_beta=0.0,
         opd_teacher_kl_loss_beta=0.0, enable_off_policy_correction=False, log_prob_top_k=16,
+        ppo_entropy_regularization_type=None,
     )
     d.update(ppo_kw)
-    return SimpleNamespace(ppo=SimpleNamespace(**d))
+    return SimpleNamespace(
+        ppo=SimpleNamespace(**d),
+        policy=SimpleNamespace(override_transformer_config={}),
+    )
 
 
 @patch("gpatch_v4.training_backend.loss_factory.reduce_metrics_across_data_parallel_group")

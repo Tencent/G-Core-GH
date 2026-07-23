@@ -1,0 +1,19 @@
+# @package _global_
+# GRPO loss (verl side): grpo advantage estimator, KL out of reward, vanilla policy
+# loss with symmetric clip 0.2 and dual-clip c=20 (aligns gcore ppo_dual_clip_ratio_c).
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: False
+
+actor_rollout_ref:
+  actor:
+    # 梯度 loss 按全局 response token 数归一，对齐 gcore 的 calculate_per_token_loss。
+    loss_agg_mode: token-mean
+    policy_loss:
+      loss_mode: vanilla
+    clip_ratio: 0.2
+    clip_ratio_c: 20
+    # KL loss off (对齐 gcore grpo_kl_loss_beta=0)。
+    use_kl_loss: False
+    # entropy bonus off (对齐 gcore ppo_entropy_bonus=0)。
+    entropy_coeff: 0

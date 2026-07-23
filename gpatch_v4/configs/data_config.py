@@ -20,6 +20,8 @@ class DataConfig(MappingProtocol):
     data_pathes : list of str or None
     eval_data_pathes : list of str or None
     sampler_seed : int
+    shuffle : bool
+        Whether to shuffle the train data.
     system_prompt : str or None
     dataloader_num_workers : int
     multiprocessing_method : str
@@ -50,6 +52,7 @@ class DataConfig(MappingProtocol):
     caption_medium_ratio: float = field(default=0.2, metadata={"help": "ratio for medium captions"})
     caption_short_ratio: float = field(default=0.1, metadata={"help": "ratio for short captions"})
     sampler_seed: int = field(default=42, metadata={"help": "Seed for the sampler"})
+    shuffle: bool = field(default=True, metadata={"help": "Whether to shuffle the train data"})
     system_prompt: Optional[str] = field(default=None, metadata={"help": "System prompt"})
     dataloader_num_workers: int = field(
         default=1, metadata={"help": "Number of workers for the dataloader"}

@@ -97,7 +97,12 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
     def __init__(self, config, policy_config, tokenizer: AutoTokenizer, is_critic_model=False):
         super().__init__(config, policy_config, tokenizer)
 
-        self.swap_impl = McoreSwapImpl()
+        early_swap_model = getattr(self.config.training, "early_swap_model", False)
+        if early_swap_model:
+            assert mpu.get_pipeline_model_parallel_world_size(
+            ) == 1, ("McoreEngine early_swap_model does not support pipeline parallelism")
+
+        self.swap_impl = McoreSwapImpl(early_swap_model=early_swap_model)
         self.forward_only_mbs = self.policy_config.forward_only_mbs
         self.prepare_data = PrepareDataForwardFactory.get_prepare_data_fwd(config)
 
@@ -119,8 +124,6 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                     override_transformer_config=self.policy_config.override_transformer_config
                 )
         self.logits_cpu_buffer = None
-
-        #TODO: 如果是 early swap actor model，看看是否需要创建一个 cpu_model_dict
 
     def setup_ref_model(self):
         save_latest_step = get_latest_checkpoint_folder(self.checkpoint_config.save_ref_ckpt_path)
@@ -305,6 +308,7 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
         assert not self.is_critic_model
 
         log_prob_top_k = getattr(self.ppo_config, "log_prob_top_k", 0)
+        return_per_token_entropy = self.ppo_config.loss_func == "steer"
         if self.policy_config.smart_pad_infer:
             assert log_prob_top_k == 0, (
                 "policy.smart_pad_infer + ppo.log_prob_top_k > 0 is not supported yet; "
@@ -335,6 +339,8 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             policy_kw: Dict[str, Any] = {"compute_topk": True}
             if policy_gather_ids_key is not None:
                 policy_kw["gather_target_ids_key"] = policy_gather_ids_key
+            if return_per_token_entropy:
+                policy_kw["return_per_token_entropy"] = True
             with self.get_router_replay_ctx():
                 prev_logps = call_logps_func(
                     self.model,
@@ -384,6 +390,8 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                     policy_kw["compute_topk"] = True
                 if policy_gather_ids_key is not None:
                     policy_kw["gather_target_ids_key"] = policy_gather_ids_key
+                if return_per_token_entropy:
+                    policy_kw["return_per_token_entropy"] = True
                 with self.get_router_replay_ctx():
                     prev_logps = call_logps_func(
                         self.model,
@@ -410,11 +418,23 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
         if self.policy_config.without_ref:
             assert ref_logps_list is None
 
+        prev_per_token_entropies_list = None
+        if return_per_token_entropy:
+            assert prev_logps is not None
+            prev_per_token_entropies = [result["prev_per_token_entropy"] for result in prev_logps]
+            prev_logps = [result["logprobs"] for result in prev_logps]
+
         prev_logps_list = None
         if compute_pre_logps:
             prev_logps_list = restor_shape(prev_logps)
             assert prev_logps_list is not None
-        return ref_logps_list, prev_logps_list
+            if return_per_token_entropy:
+                prev_per_token_entropies_list = restor_shape(prev_per_token_entropies)
+                assert prev_per_token_entropies_list is not None
+        output = (ref_logps_list, prev_logps_list)
+        if return_per_token_entropy:
+            output += (prev_per_token_entropies_list, )
+        return output
 
     def compute_log_probs_dynamic_cp(
         self,
@@ -661,6 +681,11 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             self.optimizer.zero_grad()
 
             mb_num_microbatches = num_microbatches
+            (
+                self._step_global_batch_size,
+                self._step_effective_global_batch_size,
+                self._step_global_token_cnt,
+            ) = self._compute_step_gbs_and_token_cnt(batch)
             dyn_cp_stats = None
             if self.config.policy.dist_config.dynamic_context_parallel:
                 batch, mb_num_microbatches, seqlen_sum, seqlen_sq_sum, _ = (

@@ -1,4 +1,4 @@
-"""CPU unit tests for ``McoreEngine._maybe_post_clip_grad_norm``.
+"""CPU unit tests for ``McoreEngine.maybe_post_clip_grad_norm``.
 
 The helper is exercised as an unbound method against minimal stub
 objects to avoid pulling cuda/ray dependencies.
@@ -45,8 +45,7 @@ def _make_stub_engine(
 
 
 def _call(engine, update_successful: bool) -> Optional[float]:
-    """Invoke the unbound helper with the stub engine as ``self``."""
-    return McoreEngine._maybe_post_clip_grad_norm(engine, update_successful)
+    return McoreEngine.maybe_post_clip_grad_norm(engine, update_successful)
 
 
 def test_switch_off_returns_none_and_skips_get_grad_norm():

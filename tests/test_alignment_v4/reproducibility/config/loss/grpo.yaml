@@ -1,0 +1,21 @@
+# @package _global_
+# GRPO loss for legacy vs new loss repro (via hydra.searchpath; independent of verl-align loss/grpo.yaml).
+# KL / entropy / IS knobs below; symmetric clip 0.2, dual-clip c=20; seq-mean aggregation.
+ppo:
+  advantage_type: "grpo"
+  loss_func: grpo
+  grpo_advantage_epsilon: 1.0e-6
+  grpo_kl_loss_beta: 0.1
+  ppo_entropy_bonus: 0.1
+  ppo_initial_policy_kl_penalty: 0.1
+  ppo_ratio_eps: 0.2
+  ppo_dual_clip_ratio_c: 20
+  ppo_logps_ratio_clamp: 20
+  enable_off_policy_correction: True
+  off_policy_correction_level: "token"
+  off_policy_correction_mode: "truncate"
+  off_policy_correction_upper_bound: 5.0
+
+policy:
+  override_transformer_config:
+    calculate_per_token_loss: False

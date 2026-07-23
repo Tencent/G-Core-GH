@@ -49,6 +49,7 @@ from gpatch_v4.utils import (
 )
 from gpatch_v4.utils.flops_counter import FlopsCounter
 from gpatch_v4.utils.ppo_utils import (
+    align_token_level_tensors_to_logprobs,
     calculate_kl_penalty,
     count_advantage_clip_samples,
     create_response_mask,
@@ -624,6 +625,18 @@ class RlTrainerMixin:
             mask = rollout_batch.get("mask", None)
             num_samples += len(prompt_lengths)
 
+            # Internal critic values are already on the S-1 logprob axis.
+            # External full-token values are aligned here instead of in an
+            # RPC client so every rollout path follows the same contract.
+            if values is not None and not self.require_critic_model():
+                values = align_token_level_tensors_to_logprobs(
+                    values,
+                    logprobs,
+                    sequence_lengths,
+                    self.config.ppo.ppo_value_truncate_head,
+                )
+                rollout_batch["values"] = values
+
             gdpo_rewards = None
             if self.config.ppo.advantage_type in [
                 "gdpo",
@@ -674,17 +687,14 @@ class RlTrainerMixin:
             rollout_batch["mask"] = mask
             mask_list.extend(rollout_batch["mask"])
 
-            #TODO(guanyouhe): 注意这里，可能有点问题，后面要处理
             if per_token_rewards is not None:
-                for i, (ptr, logps) in enumerate(zip(per_token_rewards, logprobs)):
-                    if ptr.shape[-1] != logps.shape[-1]:
-                        per_token_rewards[i] = torch.nn.functional.pad(
-                            ptr,
-                            (0, logps.size(-1) - ptr.size(-1)),
-                            value=0,
-                        )
+                per_token_rewards = align_token_level_tensors_to_logprobs(
+                    per_token_rewards,
+                    logprobs,
+                    sequence_lengths,
+                    self.config.ppo.ppo_value_truncate_head,
+                )
                 rollout_batch["per_token_rewards"] = per_token_rewards
-            ####
 
             if self.config.ppo.ppo_initial_policy_kl_penalty > 0:
                 ref_logprobs = rollout_batch["ref_logprobs"]
@@ -1263,10 +1273,20 @@ class ProfileMixin:
         try:
             events = self.prof.key_averages()
             comm_markers = (
-                "nccl", "allgather", "all_gather", "reducescatter", "reduce_scatter",
-                "alltoall", "all_to_all", "allreduce", "all_reduce", "broadcast",
-                "c10d", "reduce_kernel",
+                "nccl",
+                "allgather",
+                "all_gather",
+                "reducescatter",
+                "reduce_scatter",
+                "alltoall",
+                "all_to_all",
+                "allreduce",
+                "all_reduce",
+                "broadcast",
+                "c10d",
+                "reduce_kernel",
             )
+
             def _dev_us(evt):
                 # torch>=2.1 renamed self_cuda_time_total -> self_device_time_total
                 for attr in ("self_device_time_total", "self_cuda_time_total"):

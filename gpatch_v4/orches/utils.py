@@ -127,7 +127,7 @@ def get_current_node_ip() -> str:
     Resolution order:
 
     1. ``__HOST_IP__`` environment variable
-    2. IP of the ``bond1`` network interface
+    2. IP of the ``bond1`` / ``bond0`` network interface
     3. IP of the ``eth0`` network interface
     4. ``127.0.0.1`` as last resort
 
@@ -139,7 +139,7 @@ def get_current_node_ip() -> str:
     if host_ip:
         return host_ip
 
-    for iface in ("bond1", "eth0"):
+    for iface in ("bond1", "bond0", "eth0"):
         try:
             addrs = netifaces.ifaddresses(iface)
             ipv4 = addrs.get(netifaces.AF_INET)

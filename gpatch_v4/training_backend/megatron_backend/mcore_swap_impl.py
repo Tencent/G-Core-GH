@@ -12,9 +12,11 @@ from gpatch_v4.utils.common_utils import (
 
 
 class McoreSwapImpl:
-    @classmethod
+    def __init__(self, early_swap_model=False):
+        self.early_swap_model = early_swap_model
+
     @torch.no_grad()
-    def offload_model(cls, models, tag=""):
+    def offload_model(self, models, tag=""):
         """Offload model params/grads to CPU.
 
         Megatron layout: bf16 param + fp32 grad chunked in MP group;
@@ -31,6 +33,8 @@ class McoreSwapImpl:
                 for buffers in model_chunk_all_buffers:
                     for buffer in buffers:
                         offload_tensor_to_cpu(buffer.param_data)
+                        if self.early_swap_model:
+                            _attach_param_cpu_views(buffer)
                         release_tensor_mem(buffer.grad_data)
                 for _, param in model_chunk.module.named_parameters():
                     if not param.requires_grad:
@@ -52,9 +56,8 @@ class McoreSwapImpl:
         clear_memory()
         logging_memory_usage_details(f"memory tracking after {tag}model offload", rank=0)
 
-    @classmethod
     @torch.no_grad()
-    def release_grad(cls, models):
+    def release_grad(self, models):
         """Release FP32 grad_data to free GPU memory without offloading model params."""
         clear_memory()
         logging_memory_usage_details("memory tracking before release grad", rank=0)
@@ -69,9 +72,8 @@ class McoreSwapImpl:
         clear_memory()
         logging_memory_usage_details("memory tracking after release grad", rank=0)
 
-    @classmethod
     @torch.no_grad()
-    def onload_model(cls, models, onload_grad=True, tag=""):
+    def onload_model(self, models, onload_grad=True, tag=""):
         """Onload model params/grads back to GPU.
 
         Megatron layout: bf16 param + fp32 grad chunked in MP group;
@@ -105,9 +107,8 @@ class McoreSwapImpl:
         clear_memory()
         logging_memory_usage_details(f"memory tracking after {tag}model onload", rank=0)
 
-    @classmethod
     @torch.no_grad()
-    def offload_optimizer(cls, optimizers):
+    def offload_optimizer(self, optimizers):
         clear_memory()
         logging_memory_usage_details("memory tracking before optimizer offload", rank=0)
         if optimizers is None:
@@ -130,9 +131,8 @@ class McoreSwapImpl:
         clear_memory()
         logging_memory_usage_details("memory tracking after optimizer offload", rank=0)
 
-    @classmethod
     @torch.no_grad()
-    def onload_optimizer(cls, optimizers):
+    def onload_optimizer(self, optimizers):
         clear_memory()
         logging_memory_usage_details("memory tracking before optimizer onload", rank=0)
         if optimizers is None:
@@ -157,6 +157,26 @@ class McoreSwapImpl:
 
 
 # some helper functions
+
+
+def _attach_param_cpu_views(buffer):
+    """Expose DDP-buffer CPU slices on their original Parameters.
+
+    DDP parameters are views into ``buffer.param_data``. Export needs a
+    per-parameter CPU source so it can materialize only the current mbridge
+    bucket instead of restoring the whole DDP buffer.
+    """
+    if buffer.param_data is None:
+        return
+    cpu_buffer = buffer.param_data.gcore_cpu_data
+    for param, (start, end, _) in buffer.param_index_map.items():
+        cpu_view = cpu_buffer[start:end]
+        assert cpu_view.numel() == param.numel(
+        ), ("early swap does not support packed DDP parameters")
+        param.gcore_cpu_data = cpu_view.view(param.shape)
+        param.gcore_untyped_storage_data_size = (param.numel() * param.element_size())
+        if not hasattr(param, "gcore_ddp_param_data"):
+            param.gcore_ddp_param_data = param.data
 
 
 class _CheckTensorAttr:

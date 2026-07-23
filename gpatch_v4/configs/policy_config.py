@@ -37,6 +37,9 @@ class BasePolicyConfig(MappingProtocol):
     fp8 : bool
         Enable TE FP8 block-scaling grouped GEMM for DeepSeek-V4 MoE
         experts (``apply_hp(..., fp8=True)``). Orthogonal to QAT.
+    moe_router_force_load_balancing : bool
+        Force MoE TopKRouter load balancing with random expert indices;
+        benchmark switch via ``apply_hp``.
     rollout_gen_type : str or None
         ``"base"`` / ``"replay"`` / ``"dynamic_sampling"``.
     forward_only_mbs : int
@@ -97,6 +100,12 @@ class BasePolicyConfig(MappingProtocol):
     fp8: bool = field(
         default=False,
         metadata={"help": "Enable TE FP8 block-scaling grouped GEMM for DSV4 MoE experts"},
+    )
+    moe_router_force_load_balancing: bool = field(
+        default=False,
+        metadata={
+            "help": "DSV4 MoE force load balancing with random router indices (benchmark only)"
+        },
     )
 
     rollout_gen_type: Optional[str] = field(

@@ -45,7 +45,6 @@ def resolve_dead_threshold(
 ) -> float:
     if task_config is None:
         return default
-    assert "dead_group_threshold" in task_config
     cfg_val = getattr(task_config, "dead_group_threshold", None)
     if cfg_val is None:
         return default
@@ -179,6 +178,10 @@ def compute_gdpo_combined_advantages_with_dead_mask(
 
 
 def compute_gdpo_sample_bn_dead_mask_advantages(ctx: AdvantageContext) -> AdvantageResult:
+    assert ctx.config.ppo.loss_func == "grpo", (
+        f"custom_gdpo_sample_bn_dead_mask requires loss_func=grpo, "
+        f"got {ctx.config.ppo.loss_func!r}"
+    )
     gdpo_reward_weights = ctx.config.ppo.gdpo_reward_weights
     assert gdpo_reward_weights, (
         "gdpo_reward_weights must be configured (non-empty dict) for "

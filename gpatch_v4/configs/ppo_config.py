@@ -14,8 +14,14 @@ class PpoConfig(MappingProtocol):
         ``"grpo"`` / ``"ppo"`` / ``"on_policy_distill"`` / ``"gdpo"`` /
         ``"gdpo_sample_bn"`` / ``"custom"``.
     loss_func : str
-        ``"grpo"`` / ``"gspo"`` / ``"fipo"`` / ``"sapo"`` / ``"cispo"``.
+        ``"grpo"`` / ``"steer"`` / ``"gspo"`` / ``"fipo"`` / ``"sapo"`` /
+        ``"cispo"``.
+    use_legacy_loss : bool
+        If True (default), use ``loss_factory`` policy losses. If False, use
+        ``gpatch_v4.training_backend.loss`` (grpo/steer/cispo/gspo/sapo only).
     ppo_value_truncate_head : bool
+        When aligning full-token values or per-token rewards to next-token
+        log probabilities, truncate the first entry instead of the last.
     ppo_initial_policy_kl_penalty : float
     ppo_discount_factor : float
         GAE gamma.
@@ -98,7 +104,15 @@ class PpoConfig(MappingProtocol):
     advantage_type: str = field(default="grpo", metadata={"help": "Whether to use advantage."})
     # use_grpo: bool = field(default=True, metadata={"help": "Whether to use grpo."})
     loss_func: str = field(
-        default="grpo", metadata={"help": "Loss function. [grpo, gspo, fipo, sapo, cispo]"}
+        default="grpo", metadata={"help": "Loss function. [grpo, steer, gspo, fipo, sapo, cispo]"}
+    )
+    use_legacy_loss: bool = field(
+        default=True,
+        metadata={
+            "help":
+                "If True, use loss_factory policy losses. If False, use "
+                "gpatch_v4.training_backend.loss (grpo/steer/cispo/gspo/sapo only)."
+        },
     )
     loss_func_py_path: Optional[str] = field(
         default=None, metadata={"help": "Path to the loss function."}
@@ -125,7 +139,10 @@ class PpoConfig(MappingProtocol):
     )
 
     ppo_value_truncate_head: bool = field(
-        default=False, metadata={"help": "Whether to truncate the head of the value."}
+        default=False,
+        metadata={
+            "help": "Whether to truncate the head of full-token values and per-token rewards."
+        },
     )
     ppo_initial_policy_kl_penalty: float = field(
         default=0.0, metadata={"help": "Initial policy kl penalty."}
@@ -135,6 +152,27 @@ class PpoConfig(MappingProtocol):
     )
     ppo_gae_lambda: float = field(default=0.95, metadata={"help": "Ppo gae lambda."})
     ppo_entropy_bonus: float = field(default=0.0, metadata={"help": "Ppo entropy bonus."})
+    steer_token_weight_min: float = field(
+        default=0.8,
+        metadata={
+            "help":
+                (
+                    "Minimum STEER token weight. Applies only when loss_func='steer'; "
+                    "larger estimated entropy changes receive weights in "
+                    "[steer_token_weight_min, 1]."
+                )
+        },
+    )
+    steer_policy_method: str = field(
+        default="grpo",
+        metadata={
+            "help":
+                (
+                    "Base actor surrogate reweighted by STEER when loss_func='steer'. "
+                    "Options: grpo, cispo, gspo, sapo."
+                )
+        },
+    )
     ppo_ratio_eps: float = field(default=0.2, metadata={"help": "Ppo ratio eps."})
     ppo_dual_clip_ratio_c: Optional[float] = field(
         default=None,
@@ -439,17 +477,30 @@ class DistillConfig(PpoConfig):
                 "Strategy for selecting top-K token ids in OPD distillation. "
                 "Effective only when log_prob_top_k > 0. Options: "
                 "'only_stu' — use student's top-K ids; "
-                "'only_tch' — use teacher's top-K ids; " # 当teacher与student在topk上的权重分布差异太大，可能训崩。
+                "'only_tch' — use teacher's top-K ids; "  # 当teacher与student在topk上的权重分布差异太大，可能训崩。
                 "'intersection' — intersection of student and teacher top-K (MOPD)."
-                # (rionawang)TODO union: "'union' — union of student and teacher top-K (shape [S-1, 2K])."
+            # (rionawang)TODO union: "'union' — union of student and teacher top-K (shape [S-1, 2K])."
         }
     )
 
     # (rionawang)TODO union: add "union" back once implemented
     _VALID_OPD_TOP_K_STRATEGIES = ("only_stu", "only_tch", "intersection")
+    _VALID_STEER_POLICY_METHODS = ("grpo", "cispo", "gspo", "sapo")
 
     def __post_init__(self):
         super().__post_init__()
+        if self.loss_func == "steer":
+            assert not self.skip_prev_logps, (
+                "loss_func='steer' requires prev_log_probs; set skip_prev_logps=False."
+            )
+            assert 0.0 < self.steer_token_weight_min <= 1.0, (
+                "steer_token_weight_min must be in (0, 1], "
+                f"got {self.steer_token_weight_min}."
+            )
+            assert self.steer_policy_method in self._VALID_STEER_POLICY_METHODS, (
+                f"steer_policy_method must be one of {self._VALID_STEER_POLICY_METHODS}, "
+                f"got '{self.steer_policy_method}'."
+            )
         assert not (self.ppo_entropy_regularization_type is not None and self.log_prob_top_k > 0), (
             "ppo_entropy_regularization_type and log_prob_top_k > 0 are incompatible. "
             "Entropy regularization operates on 2D (B, S) log-probs, but "

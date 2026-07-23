@@ -2,6 +2,8 @@ import pytest
 import torch
 import tilelang
 import tilelang.language as T
+
+pytest.importorskip("tilelang.language.fp8")
 from tilelang.language.fp8 import determine_fp8_type
 
 

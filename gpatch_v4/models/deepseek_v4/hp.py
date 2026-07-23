@@ -20,8 +20,12 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from .checkpoint import _load_checkpoint_hp, _save_checkpoint_hp
-from .fp8 import MyGroupedLinearFp8
 from .mtp import DeepseekV4MTPBlock
+
+try:
+    from .fp8 import MyGroupedLinearFp8
+except ImportError:
+    MyGroupedLinearFp8 = None
 
 # pyright: reportAttributeAccessIssue=false, reportArgumentType=false, reportCallIssue=false, reportOperatorIssue=false, reportGeneralTypeIssues=false
 
@@ -130,6 +134,7 @@ def apply_hp(
     fp8_qat: bool = False,
     fp4_qat: bool = False,
     fp8: bool = False,
+    moe_router_force_load_balancing: bool = False,
 ) -> nn.Module:
     """Shard experts for EP, apply FSDP2, and bind ``clip_grad_norm_`` / ``load_checkpoint_hp`` / ``save_checkpoint_hp``.
 
@@ -197,6 +202,11 @@ def apply_hp(
         TE Float8BlockScaling via :class:`MyGroupedLinearFp8` (stacked
         ``[E,N,K]`` weights; auto-pads per-expert M to 16). Orthogonal
         to ``fp8_qat`` (fake-quant STE). Requires Transformer Engine.
+    moe_router_force_load_balancing : bool, keyword-only, default False
+        Sets ``model.config.moe_router_force_load_balancing`` (and MTP
+        deepcopy configs). When True, TopKRouter picks random unique top-k
+        indices for MoE load-balanced benchmarks. Mutually exclusive with
+        router replay.
 
     Returns
     -------
@@ -231,12 +241,12 @@ def apply_hp(
     model.config.fp8_qat = fp8_qat
     model.config.fp4_qat = fp4_qat
     model.config.fp8 = fp8
+    model.config.moe_router_force_load_balancing = moe_router_force_load_balancing
     # Sync backend knobs to every DeepseekV4Attention / DeepseekV4Experts
     # (including MTP blocks), because MTP blocks are constructed before
     # apply_hp runs, and their self.self_attn.config is a deepcopy that
     # may not have these attrs.
     for layer in _get_layers(model):
-        layer.mlp.experts.ep_backend = ep_backend
         if isinstance(layer, DeepseekV4MTPBlock):
             layer.config.attn_backend = attn_backend
             layer.config.indexer_backend = indexer_backend
@@ -246,6 +256,7 @@ def apply_hp(
             layer.config.fp8_qat = fp8_qat
             layer.config.fp4_qat = fp4_qat
             layer.config.fp8 = fp8
+            layer.config.moe_router_force_load_balancing = moe_router_force_load_balancing
             assert layer.self_attn.config.attn_backend == attn_backend
 
     if mp_policy is None:

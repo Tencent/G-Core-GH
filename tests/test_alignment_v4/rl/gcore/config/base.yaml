@@ -1,0 +1,86 @@
+# @package _global_
+# Model/loss/parallelism/staleness/rollout-agnostic gcore RL base for the gcore<->verl alignment
+# harness (Qwen3 | gsm8k | sglang rollout + mcore training). The orthogonal pieces
+# live in config groups composed by align.yaml:
+#   model/       -> policy+sampler model arch & paths
+#   loss/        -> ppo advantage/loss block (+ calculate_per_token_loss)
+#   parallelism/ -> policy.dist_config (TP/PP/CP/nodes) + ppo_pack_seq
+#   staleness/   -> on/off-policy ratios + sampling_repeat/keep + ppo_max_epochs_2
+#   rollout/     -> inference backend (sglang | vllm): sampler + bt_rm engine
+_target_: gpatch_v4.configs.config.RlConfig
+
+placement_type: "colocate"
+
+training:
+  training_backend: mcore
+  use_gen_rm_reward: False
+  use_bt_rm_reward: True
+  use_fast_tokenizer: True
+  # determinism + fresh-start switches for the alignment (apply_deterministic_mode
+  # also forces GPATCH_DISABLE_FA3 when attention_backend=flash; auto_load=False so a
+  # leftover save_*/iter_* is never auto-resumed).
+  apply_deterministic_mode: True
+  attention_backend: flash
+  auto_load_from_save_ckpt: False
+  rollout_mbs: 1
+  train_mbs: 1
+  data_parallel_random_init: False
+  save_interval: 10000
+  eval_interval: 10000
+  eval_before_train: False
+  build_from_mbridge: True
+  num_train_epoches: 1
+  seq_length: 10240
+  metrics_report:
+    - "acc_reward"
+    - "fmt_reward"
+  eval_rollout_gbs: 16
+  eval_rollout_mbs: 1
+
+checkpoint:
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 1.0e-6
+  lr_warmup_steps: 0
+  lr_decay_style: "constant"
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "hf-hub/zhuzilin/dapo-math-17k"
+  eval_data_pathes:
+    - "hf-hub/zhuzilin/aime-2024"
+  py_path: "tasks/math_rl_v4/dapo_dataset.py"
+  # data_pathes:
+  #   - "hf-hub/openai/gsm8k-jsonl/train"
+  # eval_data_pathes:
+  #   - "hf-hub/openai/gsm8k-jsonl/eval"
+  # py_path: "tasks/math_rl_v4/simple_dataset.py"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, and put your final answer within \\boxed{}."
+  fn_name: "get_dataset_and_dataloader"
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+  # deterministic: disable dataloader shuffle so the sample order is fixed (matches verl).
+  shuffle: False
+
+policy:
+  sampler_client:
+    rpc_type: ray
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+  export_weights_buffer_max_size_mb: 512
+
+# sampler (sglang rollout engine) + bt_rm (reward) live in the rollout/ group
+# (parallelism-paired variants), not here, because the engine sampling params
+# share a hydra list element with the parallelism-specific dist_config.
+
+debug:
+  debug_engine_update_weight: false
+  debug_align_mode: true

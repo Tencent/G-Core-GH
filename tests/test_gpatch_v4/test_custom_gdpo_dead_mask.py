@@ -39,9 +39,9 @@ sys.modules["custom_gdpo_dead_mask_advantage"] = _module
 _spec.loader.exec_module(_module)  # type: ignore[union-attr]
 
 # Bind for readability
-_resolve_dead_threshold = _module._resolve_dead_threshold
+_resolve_dead_threshold = _module.resolve_dead_threshold
 _calc_grpo_advantages_func_with_dead_mask = (
-    _module._calc_grpo_advantages_func_with_dead_mask
+    _module.calc_grpo_advantages_func_with_dead_mask
 )
 compute_gdpo_combined_advantages_with_dead_mask = (
     _module.compute_gdpo_combined_advantages_with_dead_mask

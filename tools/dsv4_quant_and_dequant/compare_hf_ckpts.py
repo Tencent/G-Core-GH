@@ -161,9 +161,7 @@ def _metrics(a: torch.Tensor, b: torch.Tensor):
 class HF:
     def __init__(self, d: str):
         self.dir = d
-        self.wm = json.load(open(os.path.join(d, "model.safetensors.index.json")))[
-            "weight_map"
-        ]
+        self.wm = json.load(open(os.path.join(d, "model.safetensors.index.json")))["weight_map"]
         self._open: dict[str, Any] = {}
         self._keys: dict[str, set[str]] = {}
 
@@ -210,9 +208,7 @@ def _present_keys(wm: dict[str, str], d: str):
     opened: dict[str, set[str]] = {}
     for k, fname in wm.items():
         if fname not in opened:
-            opened[fname] = set(
-                safe_open(os.path.join(d, fname), framework="pt").keys()
-            )
+            opened[fname] = set(safe_open(os.path.join(d, fname), framework="pt").keys())
         if k in opened[fname]:
             present.add(k)
         else:
@@ -253,9 +249,8 @@ def _compare_values(keys, A: "HF", B: "HF", device: torch.device, cos_tol, abs_t
             a_val = _deq(k, a_raw, A.scale_of(k) if k.endswith(".weight") else None, device)
             b_val = _deq(k, b_raw, B.scale_of(k) if k.endswith(".weight") else None, device)
             is_quant = (
-                a_raw.dtype in (FP8, torch.int8)
-                or b_raw.dtype in (FP8, torch.int8)
-                or a_raw.dtype != b_raw.dtype
+                a_raw.dtype in (FP8, torch.int8) or b_raw.dtype in (FP8, torch.int8) or
+                a_raw.dtype != b_raw.dtype
             )
             mad, cos, rel = _metrics(a_val, b_val)
             if is_quant:
@@ -297,7 +292,10 @@ def main(argv=None):
     ap.add_argument("--abs-tol", type=float, default=1e-2)
     ap.add_argument("--plain-tol", type=float, default=1e-6)
     ap.add_argument(
-        "--jobs", "-j", type=int, default=8,
+        "--jobs",
+        "-j",
+        type=int,
+        default=8,
         help="deprecated: parallelism is now the mpirun world size (kept for compat)",
     )
     ap.add_argument(
@@ -344,13 +342,13 @@ def main(argv=None):
             f"phantom_B={len(miss_b)} world={world} device={args.device}",
             flush=True,
         )
-        for k in miss_a[: args.max_report]:
+        for k in miss_a[:args.max_report]:
             print(f"  [PHANTOM {args.a_name}] {k}", flush=True)
-        for k in miss_b[: args.max_report]:
+        for k in miss_b[:args.max_report]:
             print(f"  [PHANTOM {args.b_name}] {k}", flush=True)
-        for k in cov["only_a"][: args.max_report]:
+        for k in cov["only_a"][:args.max_report]:
             print(f"  [ONLY {args.a_name}] {k}", flush=True)
-        for k in cov["only_b"][: args.max_report]:
+        for k in cov["only_b"][:args.max_report]:
             print(f"  [ONLY {args.b_name}] {k}", flush=True)
     else:
         cov = None
@@ -394,7 +392,7 @@ def main(argv=None):
 
         if shape_mismatch:
             print("\n[shape mismatches]", flush=True)
-            for r in shape_mismatch[: args.max_report]:
+            for r in shape_mismatch[:args.max_report]:
                 print("  " + r, flush=True)
 
     if args.dtype_only:
@@ -442,7 +440,7 @@ def main(argv=None):
 
     if all_reports:
         print("\n[examples]", flush=True)
-        for r in all_reports[: args.max_report]:
+        for r in all_reports[:args.max_report]:
             print("  " + r, flush=True)
 
     print("\n================ SUMMARY ================", flush=True)

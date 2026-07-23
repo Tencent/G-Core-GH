@@ -10,10 +10,11 @@ from megatron.core import mpu
 from megatron.core.utils import divide
 
 from gpatch_v4.configs.config import OnPolicyDistillConfig
+from gpatch_v4.core.seqlen_balancing import convert_mbs_for_pack_seq
 from gpatch_v4.extended_model import (
-    PrepareDataForwardFactory,
-    PostInitModelFactory,
     CheckpointContextFnFactory,
+    PostInitModelFactory,
+    PrepareDataForwardFactory,
     ResetRouterCorrectionBiasAccumFactory,
     UpdateRouterCorrectionBiasFactory,
 )
@@ -24,6 +25,9 @@ from gpatch_v4.training_backend.fsdp2_backend.checkpoint import (
     load_checkpoint,
 )
 from gpatch_v4.training_backend.fsdp2_backend.fsdp2_swap_impl import Fsdp2SwapImpl
+from gpatch_v4.training_backend.fsdp2_backend.linear_ce import (
+    install_linear_ce_head_bypass,
+)
 from gpatch_v4.training_backend.fsdp2_backend.mixin import (
     CheckpointMixin,
     ForwardStepMixin,
@@ -56,6 +60,7 @@ from gpatch_v4.utils import (
     reduce_max_stat_across_model_parallel_group,
     sync_cuda_and_get_time,
 )
+from gpatch_v4.utils.grpo_thd_alignment import build_grpo_thd_dump_records
 
 
 class Fsdp2EngineLm(
@@ -69,8 +74,12 @@ class Fsdp2EngineLm(
         self.prepare_data = PrepareDataForwardFactory.get_prepare_data_fwd(config)
         self.post_init_model = PostInitModelFactory.get_post_init_model(config)
         self.checkpoint_context_fn = CheckpointContextFnFactory.get_checkpoint_context_fn(config)
-        self.reset_router_correction_bias_accum = ResetRouterCorrectionBiasAccumFactory.get_reset_router_correction_bias_accum(config)
-        self.update_router_correction_bias = UpdateRouterCorrectionBiasFactory.get_update_router_correction_bias(config)
+        self.reset_router_correction_bias_accum = ResetRouterCorrectionBiasAccumFactory.get_reset_router_correction_bias_accum(
+            config
+        )
+        self.update_router_correction_bias = UpdateRouterCorrectionBiasFactory.get_update_router_correction_bias(
+            config
+        )
 
         cache_hf_metadata_files(
             self.policy_config.hf_model_path,
@@ -86,6 +95,8 @@ class Fsdp2EngineLm(
             ref_hf_model_path = load_latest_step
         log(f"creating ref model from {ref_hf_model_path}", rank=0)
         self.ref_model = self.get_fsdp2_model(init_context, ref_hf_model_path)
+        if self.training_config.use_linear_ce:
+            install_linear_ce_head_bypass(self.ref_model)
         with profile_memory_and_time(f"offload_ref_model", rank=0):
             self.offload_ref_model()
 
@@ -111,6 +122,8 @@ class Fsdp2EngineLm(
             )
 
         self.post_init_model(self.model)
+        if self.training_config.use_linear_ce:
+            install_linear_ce_head_bypass(self.model)
 
         if self.policy_config.without_optim:
             self.optimizer = None
@@ -162,23 +175,67 @@ class Fsdp2EngineLm(
 
     @override
     def rl_train_actor(self, dataloader_iter):
-        num_microbatches = divide(
-            self.training_config.train_gbs, self.training_config.train_mbs * self.dp_size
-        )
+        pack_seq = self.policy_config.ppo_pack_seq
+        if pack_seq:
+            assert self.policy_config.model_arch == "deepseek_v4", (
+                "FSDP2 GRPO THD currently supports only deepseek_v4"
+            )
+        if isinstance(self.config, OnPolicyDistillConfig):
+            assert not pack_seq, "FSDP2 OPD + DSV4 THD is not supported yet"
         self.set_model_train()
 
-        loss_fn = get_policy_loss_fn(self.config.ppo.advantage_type)
+        loss_fn = get_policy_loss_fn(self.config.ppo.loss_func)
         seq_mean_loss = is_seq_mean_rl_loss_fn(loss_fn)
+        calculate_per_token_loss = self.policy_config.override_transformer_config.get(
+            "calculate_per_token_loss", False
+        )
         metrics = {}
+        dumped_metrics_per_ppo_step = (
+            [] if self.should_dump_metrics and pack_seq and mpu.get_context_parallel_rank() == 0
+            else None
+        )
 
         for batch in dataloader_iter:
             self.optimizer.zero_grad()
+            dumped_batch = [None] * len(batch) if dumped_metrics_per_ppo_step is not None else None
+            sample_order = (
+                {
+                    id(sample): idx
+                    for idx, sample in enumerate(batch)
+                } if dumped_batch is not None else None
+            )
             if not self.training_config.freeze_router_correction_bias:
                 self.reset_router_correction_bias_accum(self.model)
-            seq_length = get_batches_max_seqlen(batch, self.training_config.pad_to_mulitiple_of)
-            seq_length = get_max_seqlen_within_dp(seq_length)
-
-            data_iter = get_k_split_list(batch, num_microbatches)
+            global_token_count = None
+            if seq_mean_loss and calculate_per_token_loss:
+                local_token_count = 0.0
+                for sample in batch:
+                    sample_count = float(torch.as_tensor(sample["mask"]).sum().item())
+                    local_token_count += sample_count
+                global_token_count = torch.tensor(
+                    local_token_count, dtype=torch.float32, device="cuda"
+                )
+                torch.distributed.all_reduce(global_token_count, group=self.dp_group)
+                assert global_token_count.item(
+                ) > 0, ("per-token RL loss requires at least one active response token")
+            if pack_seq:
+                seq_length = self.training_config.seq_length
+                data_iter = convert_mbs_for_pack_seq(
+                    batch,
+                    max_token_len=seq_length,
+                    pad_each_doc_to_multi_of=self.prepare_data._pad_each_doc_to_multi_of,
+                    dp_group=mpu.get_data_parallel_group(),
+                    cp_size=mpu.get_context_parallel_world_size(),
+                )
+                num_microbatches = len(data_iter)
+            else:
+                num_microbatches = divide(
+                    self.training_config.train_gbs,
+                    self.training_config.train_mbs * self.dp_size,
+                )
+                seq_length = get_batches_max_seqlen(batch, self.training_config.pad_to_mulitiple_of)
+                seq_length = get_max_seqlen_within_dp(seq_length)
+                data_iter = get_k_split_list(batch, num_microbatches)
 
             use_r3 = self.config.training.moe_router_replay
 
@@ -192,64 +249,111 @@ class Fsdp2EngineLm(
                     batches,
                     seq_length,
                     self.tokenizer.pad_token_id,
-                    ppo_pack_seq=False,
+                    ppo_pack_seq=pack_seq,
+                    pad_with_random_token=self.config.training.moe_pad_with_random_tokens,
+                    vocab_size=self._get_vocab_size(),
                 )
+                full_psp = batch_data.get("full_packed_seq_params")
+                if full_psp is not None and not getattr(self, "_logged_grpo_thd", False):
+                    log(
+                        f"[FSDP2 GRPO THD] qkv_format={full_psp.qkv_format}, "
+                        f"segments={full_psp.cu_seqlens_q.numel() - 1}, "
+                        f"packed_tokens={full_psp.total_seqlen}, "
+                        f"local_tokens={fwd_kwargs['input_ids'].shape[1]}, "
+                        f"cp_size={mpu.get_context_parallel_world_size()}",
+                        rank=0,
+                    )
+                    self._logged_grpo_thd = True
 
                 replay_ctx = (
-                    self._maybe_router_replay(self.model, batches, seq_length)
-                    if use_r3 else nullcontext()
+                    self._maybe_router_replay(
+                        self.model,
+                        batches,
+                        seq_length,
+                        packed_seq_params=full_psp,
+                    ) if use_r3 else nullcontext()
                 )
                 with replay_ctx:
                     train_forward_context = (
                         nullcontext()
-                        if self.training_config.recompute
-                        else self.checkpoint_context_fn()[0]
+                        if self.training_config.recompute else self.checkpoint_context_fn()[0]
                     )
-                    with train_forward_context:
-                        logits = self.model(**fwd_kwargs).logits.float()
                     target = batch_data["target"]
-
-                    # CP-aware logprobs
-                    curr_log_probs = self.gather_log_probs_packed(
-                        logits, target, allow_compile=True
-                    )
+                    pre_shifted = full_psp is not None
                     response_mask = batch_data["mask"]
 
-                    # Entropy: compute on all positions per rank, then all-gather
-                    probs = logits.softmax(dim=-1)
-                    entropy = -(probs * logits.log_softmax(dim=-1)).sum(dim=-1)
-                    entropy = self._all_gather_cp_aware(entropy)
-                    entropy = entropy[:, :-1]
-                    scaled_entropy = masked_mean(entropy, response_mask)
+                    # Keep linear_ce context through backward (recompute-safe).
+                    with self._maybe_rl_linear_ce_context(
+                        self.model,
+                        target,
+                        pre_shifted=pre_shifted,
+                        return_entropy=True,
+                    ):
+                        with train_forward_context:
+                            model_out = self.model(**fwd_kwargs)
+                        curr_log_probs, entropy = self._rl_logprobs_and_entropy_from_head_output(
+                            model_out.logits,
+                            target,
+                            response_mask,
+                            pre_shifted=pre_shifted,
+                            allow_compile=True,
+                        )
 
-                    advantages = batch_data["advantages"]
+                        assert curr_log_probs.shape == response_mask.shape, (
+                            f"current logprob shape {tuple(curr_log_probs.shape)} "
+                            f"must match response mask shape {tuple(response_mask.shape)}"
+                        )
+                        if dumped_batch is not None:
+                            assert sample_order is not None
+                            dump_records = build_grpo_thd_dump_records(
+                                batches,
+                                batch_data,
+                                curr_log_probs,
+                            )
+                            for sample, record in zip(batches, dump_records, strict=True):
+                                dumped_batch[sample_order[id(sample)]] = record
+                        scaled_entropy = masked_mean(entropy, response_mask)
 
-                    loss_input = PolicyLossInput(
-                        advantages=advantages,
-                        prev_log_probs=batch_data["prev_log_probs"],
-                        ref_log_probs=batch_data.get("ref_log_probs", None),
-                        curr_log_probs=curr_log_probs,
-                        response_mask=response_mask,
-                        scaled_entropy=scaled_entropy,
-                        rollout_log_probs=batch_data.get("rollout_log_probs", None),
-                        per_token_entropy=entropy,
-                        teacher_log_probs=batch_data.get("teacher_log_probs", None),
-                        should_dump_metrics=False,
-                    )
+                        advantages = batch_data["advantages"]
 
-                    bwd_loss, step_metrics = loss_fn(self.config, loss_input)
-                    # Keep router_replay_ctx alive through backward: gradient
-                    # checkpointing re-runs forward during recompute and still
-                    # needs the pinned expert indices from rollout.
-                    if seq_mean_loss:
-                        # bwd_loss = sum of per-seq token-means in this mb. Dividing
-                        # by train_gbs and multiplying by dp_size makes the FSDP
-                        # gradient (averaged over DP) equal (1/train_gbs) * sum over
-                        # the global batch of d(per-seq token-mean)/dθ.
-                        (bwd_loss * self.dp_size / self.training_config.train_gbs).backward()
-                    else:
-                        (bwd_loss / num_microbatches).backward()
+                        loss_input = PolicyLossInput(
+                            advantages=advantages,
+                            prev_log_probs=batch_data["prev_log_probs"],
+                            ref_log_probs=batch_data.get("ref_log_probs", None),
+                            curr_log_probs=curr_log_probs,
+                            response_mask=response_mask,
+                            scaled_entropy=scaled_entropy,
+                            rollout_log_probs=batch_data.get("rollout_log_probs", None),
+                            per_token_entropy=entropy,
+                            teacher_log_probs=batch_data.get("teacher_log_probs", None),
+                            entropy_aux_figures=batch_data.get("entropy_aux_figures", None),
+                            cu_seqlens_padded=batch_data.get("cu_seqlens_padded", None),
+                            local_cp_size=1,
+                            calculate_per_token_loss=calculate_per_token_loss,
+                            should_dump_metrics=False,
+                        )
+
+                        bwd_loss, step_metrics = loss_fn(self.config, loss_input)
+                        # Keep router_replay_ctx alive through backward: gradient
+                        # checkpointing re-runs forward during recompute and still
+                        # needs the pinned expert indices from rollout.
+                        if seq_mean_loss:
+                            if calculate_per_token_loss:
+                                # bwd_loss is this micro-batch's token-sum numerator.
+                                # FSDP averages DP gradients, so multiply by dp_size
+                                # and divide once by the global active-token count.
+                                (bwd_loss * self.dp_size / global_token_count).backward()
+                            else:
+                                # bwd_loss is the sum of per-sequence token means.
+                                (bwd_loss * self.dp_size /
+                                 self.training_config.train_gbs).backward()
+                        else:
+                            (bwd_loss / num_microbatches).backward()
                 extend_value_to_dict(metrics, {f"policy/{k}": v for k, v in step_metrics.items()})
+
+            if dumped_batch is not None:
+                assert all(record is not None for record in dumped_batch)
+                dumped_metrics_per_ppo_step.extend(dumped_batch)
 
             grad_norm = self.clip_grad_norm_()
             if not torch.isfinite(grad_norm):
@@ -294,6 +398,8 @@ class Fsdp2EngineLm(
                 reduced_metrics[key] = val.detach().cpu().item()
             else:
                 reduced_metrics[key] = val
+        if dumped_metrics_per_ppo_step is not None:
+            reduced_metrics["dumped_metrics_per_ppo_step"] = dumped_metrics_per_ppo_step
         return reduced_metrics
 
     @override

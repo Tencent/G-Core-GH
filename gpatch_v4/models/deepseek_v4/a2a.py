@@ -1,6 +1,5 @@
 # coding=utf-8
 # Copyright (c) 2026 Tencent Inc. All rights reserved.
-
 """All-to-all primitives for Expert Parallelism (EP).
 
 Two autograd-aware ``all_to_all`` variants for MoE token dispatch:
@@ -34,7 +33,6 @@ class _AllToAll(torch.autograd.Function):
     --------
     The dual of an even all-to-all is the same op: re-apply on ``grad``.
     """
-
     @staticmethod
     def forward(ctx, group, input):
         ctx.group = group
@@ -88,18 +86,12 @@ class _AllToAllUneven(torch.autograd.Function):
     ``out_splits`` (sender becomes receiver and vice versa), so
     backward applies the same op with the splits swapped.
     """
-
     @staticmethod
     def forward(ctx, group, input, in_splits, out_splits):
         ctx.group = group
         ctx.in_splits = in_splits
         ctx.out_splits = out_splits
-        out = torch.empty(
-            sum(out_splits),
-            *input.shape[1:],
-            dtype=input.dtype,
-            device=input.device
-        )
+        out = torch.empty(sum(out_splits), *input.shape[1:], dtype=input.dtype, device=input.device)
         dist.all_to_all_single(
             out,
             input.contiguous(),

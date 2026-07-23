@@ -50,7 +50,17 @@ def get_megatron_optimizer_config_overrides(model, config, optimizer_config):
     return config_overrides if config_overrides else None
 
 
+def should_use_distributed_optimizer(optimizer_config) -> bool:
+    """False for layer-wise emerging optimizers (e.g. muon); they need DDP all-reduce."""
+    override = getattr(optimizer_config, 'override_optimizer_config', None) or {}
+    use_layer_wise = override.get('use_layer_wise_distributed_optimizer', False)
+    if use_layer_wise and optimizer_config.optimizer_type not in ('adam', 'sgd'):
+        return False
+    return True
+
+
 def setup_megatron_optim_config(model, optimizer_config) -> McoreOptimizerConfig:
+    use_dist_opt = should_use_distributed_optimizer(optimizer_config)
     optim_args = {
         "optimizer": optimizer_config.optimizer_type,
         "lr": optimizer_config.lr,
@@ -62,7 +72,7 @@ def setup_megatron_optim_config(model, optimizer_config) -> McoreOptimizerConfig
         "weight_decay": optimizer_config.weight_decay,
         "bf16": True,
         "params_dtype": torch.bfloat16,
-        "use_distributed_optimizer": True,
+        "use_distributed_optimizer": use_dist_opt,
     }
 
     override_config = optimizer_config.override_optimizer_config

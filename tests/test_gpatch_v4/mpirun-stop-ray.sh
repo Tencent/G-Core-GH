@@ -1,7 +1,7 @@
-if [ -z "${GCORE_GPU}" ]; then
+if [ -z "${GCORE_NNODES}" ]; then
     cp /etc/mpi/hostfile /root/hostfile
 else
-    head -n $GCORE_GPU /etc/mpi/hostfile > /root/hostfile
+    head -n $GCORE_NNODES /etc/mpi/hostfile > /root/hostfile
 fi
 sed -i 's/slots=8/slots=1/g' /root/hostfile
 

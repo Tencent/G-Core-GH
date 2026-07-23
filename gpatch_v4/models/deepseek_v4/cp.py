@@ -31,6 +31,7 @@ import torch
 from torch import distributed as dist
 from torch.autograd import Function
 
+from .a2a import all_to_all_uneven
 from .thd import PackedSeqParams, cp_slice_layout
 
 __all__ = [
@@ -38,6 +39,7 @@ __all__ = [
     "swa_ring_kv",
     "compressor_cp_ring",
     "compressor_cp_ag",
+    "indexer_zigzag_all_to_all",
     "build_cp_causal_mask",
 ]
 
@@ -72,7 +74,6 @@ def _ring_all_to_all(
     return recv_flat.movedim(0, seq_dim).contiguous()
 
 
-# todo zz: support forward and reverse fold-prefix exchange
 class _SendLastAndPrepend(Function):
     r"""Send last ``k`` tokens along ``seq_dim`` to the next CP rank, recv
     the corresponding prefix from the previous CP rank, and **return the
@@ -218,6 +219,171 @@ class _AllGatherSeq(Function):
 # ---------------------------------------------------------------------------
 
 
+def _indexer_zigzag_cp_rank_ids(
+    packed_seq_params: PackedSeqParams,
+    cp_size: int,
+) -> torch.Tensor:
+    assert packed_seq_params.layout is not None
+    total_seqlen = packed_seq_params.total_seqlen
+    assert total_seqlen % cp_size == 0
+
+    cu_padded = packed_seq_params.cu_seqlens_q_padded
+    seg_lengths = cu_padded[1:] - cu_padded[:-1]
+    assert torch.all(
+        seg_lengths % (2 * cp_size) == 0
+    ).item(), ("each packed segment length must be divisible by 2 * cp_size "
+               f"({2 * cp_size})")
+
+    positions = torch.arange(total_seqlen, device=cu_padded.device, dtype=torch.int32)
+    seg_ids = packed_seq_params.layout.seg_id_per_token_full
+    assert seg_ids.shape == (total_seqlen, )
+    seg_starts = cu_padded[:-1][seg_ids]
+    chunk_lengths = (seg_lengths // (2 * cp_size))[seg_ids]  # seq -> seg -> 2xCP chunks
+    chunk_ids = (positions - seg_starts) // chunk_lengths
+    return torch.minimum(chunk_ids, 2 * cp_size - 1 - chunk_ids)
+
+
+def _indexer_zigzag_split_sizes(
+    packed_seq_params: PackedSeqParams,
+    cp_rank: int,
+    cp_size: int,
+    sliced_layout,
+):
+    """Build zigzag a2a split sizes and attach rank-local ``*_zz`` layout fields.
+
+    Each padded segment is split into ``2 * cp_size`` equal chunks and assigned
+    to ranks in ``[0, ..., P-1, P-1, ..., 0]`` order.
+
+    Parameters
+    ----------
+    packed_seq_params : PackedSeqParams
+        Global, unsliced THD metadata (``layout`` MUST be the global layout).
+    cp_rank : int
+    cp_size : int
+    sliced_layout : _PackedSeqLayout
+        Contiguous per-rank layout from :func:`cp_slice_layout`.
+
+    Returns
+    -------
+    split_sizes_cont_to_zz : list of int
+        Tokens sent from this contiguous partition to each zigzag rank.
+    split_sizes_zz_to_cont : list of int
+        Tokens received by this zigzag rank from each contiguous partition.
+    order_cont_to_zz : Tensor
+        Rank-local stable permutation grouped by zigzag destination rank.
+    sliced_layout : _PackedSeqLayout
+        ``sliced_layout`` with ``seg_id_per_token_zz`` and per-``m``
+        ``causal_threshold_per_token_zz`` filled in zigzag receive order.
+    """
+    assert packed_seq_params.layout is not None
+    global_layout = packed_seq_params.layout
+    cp_rank_id_per_token = _indexer_zigzag_cp_rank_ids(packed_seq_params, cp_size)
+
+    s_local = packed_seq_params.total_seqlen // cp_size
+    device = cp_rank_id_per_token.device
+    cp_rank_id_per_chunk = cp_rank_id_per_token.view(cp_size, s_local)
+    local_cp_rank_ids = cp_rank_id_per_chunk[cp_rank]
+    split_sizes_cont_to_zz_tensor = torch.bincount(local_cp_rank_ids, minlength=cp_size)
+    split_sizes_zz_to_cont_tensor = (cp_rank_id_per_chunk == cp_rank).sum(dim=1)
+
+    split_sizes_cont_to_zz = split_sizes_cont_to_zz_tensor.tolist()
+    split_sizes_zz_to_cont = split_sizes_zz_to_cont_tensor.tolist()
+    order_cont_to_zz = torch.argsort(local_cp_rank_ids, stable=True)
+
+    local_arange = torch.arange(s_local, device=device, dtype=torch.long)
+    zz_token_indices = torch.cat(
+        [i * s_local + local_arange[cp_rank_id_per_chunk[i] == cp_rank] for i in range(cp_size)]
+    )
+
+    assert sum(split_sizes_cont_to_zz) == s_local
+    assert sum(split_sizes_zz_to_cont) == s_local
+    assert zz_token_indices.shape == (s_local, )
+
+    sliced_layout = dataclasses.replace(
+        sliced_layout,
+        seg_id_per_token_zz=global_layout.seg_id_per_token_full[zz_token_indices],
+        per_m={
+            m:
+                dataclasses.replace(
+                    per_m,
+                    causal_threshold_per_token_zz=(
+                        global_layout.per_m[m].causal_threshold_per_token[zz_token_indices]
+                    ),
+                )
+            for m, per_m in sliced_layout.per_m.items()
+        },
+    )
+    return split_sizes_cont_to_zz, split_sizes_zz_to_cont, order_cont_to_zz, sliced_layout
+
+
+def indexer_zigzag_all_to_all(
+    tensors: tuple[torch.Tensor, ...],
+    packed_seq_params: PackedSeqParams,
+    cp_group,
+    *,
+    seq_dim: int,
+    cont_to_zz: bool,
+) -> tuple[torch.Tensor, ...]:
+    """Switch rank-local tensors between contiguous and zigzag token order.
+
+    Parameters
+    ----------
+    tensors : tuple of Tensor
+        Every tensor has the same rank-local token count on ``seq_dim``.
+    packed_seq_params : PackedSeqParams
+        Rank-local metadata returned by :func:`cp_chunk_data`.
+    cp_group : torch.distributed.ProcessGroup
+    seq_dim : int
+        Token axis shared by all input tensors.
+    cont_to_zz : bool
+        ``True`` dispatches contiguous tokens to per-segment zigzag ranks;
+        ``False`` returns computed rows to their contiguous owners.
+
+    Returns
+    -------
+    tuple of Tensor
+        Tensors in the requested ownership and token order.
+    """
+    cp_size = dist.get_world_size(cp_group)
+    if cp_size == 1:
+        return tensors
+
+    split_sizes_cont_to_zz = packed_seq_params.split_sizes_cont_to_zz
+    split_sizes_zz_to_cont = packed_seq_params.split_sizes_zz_to_cont
+    assert split_sizes_cont_to_zz is not None
+    assert split_sizes_zz_to_cont is not None
+    assert len(split_sizes_cont_to_zz) == cp_size
+    assert len(split_sizes_zz_to_cont) == cp_size
+
+    s_local = packed_seq_params.total_seqlen // cp_size
+    order_cont_to_zz = packed_seq_params.order_cont_to_zz
+    assert order_cont_to_zz is not None
+
+    outputs = []
+    for tensor in tensors:
+        seq_first = tensor.movedim(seq_dim, 0).contiguous()
+        assert seq_first.shape[0] == s_local
+        if cont_to_zz:
+            send = seq_first[order_cont_to_zz]
+            output = all_to_all_uneven(
+                send,
+                split_sizes_cont_to_zz,
+                split_sizes_zz_to_cont,
+                cp_group,
+            )
+        else:
+            output = all_to_all_uneven(
+                seq_first,
+                split_sizes_zz_to_cont,
+                split_sizes_cont_to_zz,
+                cp_group,
+            )
+            tmp = output.clone()
+            output[order_cont_to_zz] = tmp
+        outputs.append(output.movedim(0, seq_dim).contiguous())
+    return tuple(outputs)
+
+
 def cp_chunk_data(
     cp_rank: int,
     cp_size: int,
@@ -245,6 +411,8 @@ def cp_chunk_data(
     ``layout`` is sliced via :func:`gpatch_v4.models.deepseek_v4.thd.cp_slice_layout`
     so per-token / per-window positional fields carry the per-rank
     "with CP all2all prefix" view that downstream compressors consume.
+    The returned PSP also caches this rank's contiguous↔zigzag Indexer
+    all-to-all split sizes.
     Other PSP fields (cu_seqlens_q*, max_seqlen_q, total_seqlen) stay
     GLOBAL — attention's compressor stage-2 all-gathers back to the
     global window axis.
@@ -284,7 +452,6 @@ def cp_chunk_data(
         If ``tokens.shape[1] % cp_size != 0``, or if ``position_ids`` is
         provided and its shape does not match ``tokens``.
     """
-    # todo zz: shard BSHD globally and THD independently per segment
     s_full = tokens.shape[1]
     assert s_full % cp_size == 0, (
         f"tokens seq_len ({s_full}) must be divisible by cp_size ({cp_size})"
@@ -313,13 +480,31 @@ def cp_chunk_data(
             "packed_seq_params.layout is None; pack_sequences() should "
             "have populated it"
         )
+        global_layout = packed_seq_params.layout
         sliced_layout = cp_slice_layout(
-            packed_seq_params.layout,
+            global_layout,
             cp_rank,
             cp_size,
             packed_seq_params.total_seqlen,
         )
-        local_psp = dataclasses.replace(packed_seq_params, layout=sliced_layout)
+        (
+            split_sizes_cont_to_zz,
+            split_sizes_zz_to_cont,
+            order_cont_to_zz,
+            sliced_layout,
+        ) = _indexer_zigzag_split_sizes(
+            packed_seq_params,
+            cp_rank,
+            cp_size,
+            sliced_layout,
+        )
+        local_psp = dataclasses.replace(
+            packed_seq_params,
+            layout=sliced_layout,
+            split_sizes_cont_to_zz=split_sizes_cont_to_zz,
+            split_sizes_zz_to_cont=split_sizes_zz_to_cont,
+            order_cont_to_zz=order_cont_to_zz,
+        )
     else:
         local_psp = None
 
@@ -349,7 +534,6 @@ def swa_ring_kv(
         Shape ``[B, 1, s_local + N_ring, head_dim]`` on rank > 0,
         ``[B, 1, s_local, head_dim]`` on rank 0.
     """
-    # todo zz: exchange both fold-half SWA prefixes per segment
     if cp_group is None:
         return kv_local
     cp_size = dist.get_world_size(cp_group)
@@ -388,7 +572,6 @@ def compressor_cp_ring(
         ``m`` on rank > 0, ``0`` on rank 0. Use as ``start_position`` offset
         for the compressor so window absolute positions stay correct.
     """
-    # todo zz: exchange per-segment folded compressor prefixes
     if cp_group is None:
         return hidden_states, 0
     cp_size = dist.get_world_size(cp_group)
@@ -438,7 +621,6 @@ def compressor_cp_ag(
     torch.Tensor
         Shape ``[B, 1, cp_size * n_local_windows, head_dim]``, same on all ranks.
     """
-    # todo zz: trim folded prefixes and restore global window order
     if cp_group is None:
         return local_compressed
     cp_size = dist.get_world_size(cp_group)
@@ -504,7 +686,6 @@ def build_cp_causal_mask(
         Shape ``[1, 1, s_local, s_local + swa_prefix_len]``.
         ``0.0`` for visible positions, ``-inf`` otherwise.
     """
-    # todo zz: build mask from folded q and KV position maps
     device = device or torch.device("cuda")
     q_pos = torch.arange(s_local, device=device) + cp_rank * s_local  # [s_local]
     k_pos = torch.arange(s_local + swa_prefix_len, device=device

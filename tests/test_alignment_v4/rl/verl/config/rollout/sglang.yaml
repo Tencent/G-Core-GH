@@ -1,0 +1,20 @@
+# @package _global_
+# Rollout backend = sglang (the rollout/ group selects the inference engine; add
+# rollout/vllm.yaml later). Mirrors gcore rollout/sglang. rollout.n lives in
+# staleness; rollout.tensor_model_parallel_size + agent live in parallelism.
+actor_rollout_ref:
+  rollout:
+    name: sglang
+    gpu_memory_utilization: 0.7
+    temperature: 1.0
+    top_p: 1.0
+    # 与 gcore sglang 显式对齐：max_running_requests=128、开启 cuda graph、
+    # 注意力后端 flashinfer。
+    max_num_seqs: 128
+    enforce_eager: False
+    engine_kwargs:
+      sglang:
+        enable_deterministic_inference: True
+        attention_backend: flashinfer
+    log_prob_use_dynamic_bsz: False
+    log_prob_micro_batch_size_per_gpu: 1

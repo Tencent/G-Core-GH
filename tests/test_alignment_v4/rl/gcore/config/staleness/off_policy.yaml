@@ -1,0 +1,10 @@
+# @package _global_
+# Off-policy: rollout_gbs=8 prompts x sampling_repeat_n=8 = 64 samples,
+# train_gbs=8 -> 64//8 = 8 optimizer steps/rollout (later steps are off-policy:
+# train_gbs != rollout_gbs * sampling_keep_n).
+training:
+  rollout_gbs: 4
+  train_gbs: 8
+  sampling_repeat_n: 8
+  sampling_keep_n: 8
+  ppo_max_epochs_2: 1

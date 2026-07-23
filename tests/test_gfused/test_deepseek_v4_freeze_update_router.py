@@ -18,10 +18,10 @@ Exercises the real ``DeepseekV4TopKRouter`` + the real
 
 Token counting is driven by a permanently-registered forward hook
 (:func:`register_router_correction_bias_accum_tracking_hook`) that only
-increments the per-expert accumulator while the compute phase (a
-``contextvars.ContextVar`` set by :func:`compute_phase`) equals ``"forward"``.
-Recompute during gradient checkpointing runs under the ``"recompute"`` phase and
-is therefore never double-counted; any forward outside the ``"forward"`` phase
+increments the per-expert accumulator while :func:`train_forward_context`
+is active. Recompute during gradient checkpointing uses
+:func:`checkpoint_context_fn`'s second context (a no-op) and is therefore
+never double-counted; any forward outside ``train_forward_context``
 (eval, logprob, etc.) does not affect the counts either.
 
 Usage::
@@ -43,11 +43,12 @@ import torch.nn as nn
 
 from gpatch_v4.models.deepseek_v4.freeze_update_router import (
     _ACCUM_ATTR,
-    compute_phase,
+    checkpoint_context_fn,
     freeze_router_weights,
     init_router_correction_bias_accumulators,
     register_router_correction_bias_accum_tracking_hook,
     reset_router_correction_bias_accum,
+    train_forward_context,
     update_router_correction_bias,
 )
 from gpatch_v4.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4TopKRouter
@@ -87,6 +88,7 @@ def _router_config(
         hidden_size=hidden,
         scoring_func=scoring_func,
         routed_scaling_factor=routed_scaling_factor,
+        moe_router_force_load_balancing=False,
     )
 
 
@@ -135,7 +137,7 @@ def _reference_updated_bias(bias: torch.Tensor, counts: torch.Tensor, speed: flo
 
 def _enable_bias_tracking(model: nn.Module) -> None:
     """Set up the new counting path: accumulator buffers + the permanent
-    forward hook. Counting itself only fires inside ``compute_phase("forward")``.
+    forward hook. Counting itself only fires inside ``train_forward_context``.
     """
     init_router_correction_bias_accumulators(model)
     register_router_correction_bias_accum_tracking_hook(model)
@@ -202,11 +204,11 @@ def test_freeze_switch_off_allows_router_weight_update():
 
 
 def test_bias_tracking_counts_routed_tokens():
-    """The forward hook (under compute_phase("forward")) counts the assigned experts.
+    """The forward hook (under train_forward_context) counts the assigned experts.
 
     The new tracking hook has no ``valid_mask`` / pad argument — it bincounts the
-    router's top-k ``indices`` over every token routed during the ``"forward"``
-    phase. Verify the accumulator equals that bincount and totals
+    router's top-k ``indices`` over every token routed during train forward.
+    Verify the accumulator equals that bincount and totals
     ``n_tokens * top_k``.
     """
     torch.manual_seed(1)
@@ -216,7 +218,7 @@ def test_bias_tracking_counts_routed_tokens():
 
     hidden = torch.randn(6, HIDDEN)
 
-    with compute_phase("forward"):
+    with train_forward_context():
         outs = model(hidden)
 
     for gate, out in zip(model.gates, outs):
@@ -296,7 +298,7 @@ def test_bias_update_end_to_end_from_real_routing():
 
     reset_router_correction_bias_accum(model)
     start_bias = [g.e_score_correction_bias.detach().clone() for g in model.gates]
-    with compute_phase("forward"):
+    with train_forward_context():
         model(hidden)
     observed = [_counts(g).detach().clone() for g in model.gates]
     observed_t = torch.stack(observed, dim=0)
@@ -329,7 +331,7 @@ def test_bias_frozen_when_update_not_called():
 
     # Simulate a step with tracking on but the update deliberately skipped.
     reset_router_correction_bias_accum(model)
-    with compute_phase("forward"):
+    with train_forward_context():
         loss = model.router_loss(hidden)
     loss.backward()
     optimizer.step()
@@ -357,15 +359,14 @@ def test_bias_update_skipped_in_eval():
 
 
 def test_counting_only_happens_inside_forward_phase():
-    """Counting fires only within ``compute_phase("forward")``.
+    """Counting fires only within ``train_forward_context``.
 
     The tracking hook is registered permanently, but it only increments the
-    accumulator while the compute phase equals ``"forward"``. Forwards run in
-    the default (``"outside"``) phase — eval / logprob / any other forward — and
-    forwards run in the ``"recompute"`` phase (gradient-checkpointing recompute)
-    must NOT touch ``local_tokens_per_expert``. This is what keeps those forwards
-    from polluting the per-step token counts and guards against double-counting
-    on recompute.
+    accumulator while ``train_forward_context`` is active. Forwards outside
+    that context — eval / logprob / any other forward — and recompute
+    (``checkpoint_context_fn()[1]``, a no-op) must NOT touch
+    ``local_tokens_per_expert``. This keeps those forwards from polluting
+    the per-step token counts and guards against double-counting on recompute.
     """
     torch.manual_seed(9)
     model = _RouterModel(num_routers=2)
@@ -374,31 +375,30 @@ def test_counting_only_happens_inside_forward_phase():
 
     hidden = torch.randn(8, HIDDEN)
 
-    # 1. forward in the default "outside" phase -> hook is a no-op -> no counting.
+    # 1. forward outside train_forward_context -> hook is a no-op -> no counting.
     model(hidden)
     for gate in model.gates:
-        assert _counts(gate).sum().item() == 0.0, "forward outside forward-phase must not count"
+        assert _counts(gate).sum().item() == 0.0, "forward outside train_forward_context must not count"
 
-    # 2. forward INSIDE compute_phase("forward") -> counts exactly this forward.
-    with compute_phase("forward"):
+    # 2. forward INSIDE train_forward_context -> counts exactly this forward.
+    with train_forward_context():
         model(hidden)
     counted = [_counts(gate).detach().clone() for gate in model.gates]
     for gate, snap in zip(model.gates, counted):
         assert snap.sum().item() == hidden.shape[0] * gate.top_k
 
-    # 3. forward in the "recompute" phase -> hook is a no-op -> counts frozen
-    #    (this is the gradient-checkpointing double-count guard).
-    with compute_phase("recompute"):
+    # 3. recompute context (checkpoint_context_fn second slot) -> no-op -> counts frozen.
+    with checkpoint_context_fn()[1]:
         model(hidden)
     for gate, snap in zip(model.gates, counted):
         assert torch.equal(_counts(gate), snap), (
             "recompute-phase forward must not count (double-count guard)"
         )
 
-    # 4. more forwards back in the default "outside" phase -> counts still frozen.
+    # 4. more forwards outside train_forward_context -> counts still frozen.
     for _ in range(3):
         model(hidden)
     for gate, snap in zip(model.gates, counted):
         assert torch.equal(_counts(gate), snap), (
-            "forward outside forward-phase must not count"
+            "forward outside train_forward_context must not count"
         )

@@ -120,7 +120,10 @@ class UpdateWeightFactoryTest(unittest.IsolatedAsyncioTestCase):
         )
         sentinel = object()
         weights = iter(())
-        engine = SimpleNamespace(export_weights=lambda: weights)
+        engine = SimpleNamespace(
+            model=SimpleNamespace(config=SimpleNamespace(fp4_qat=False)),
+            export_weights=lambda: weights
+        )
         with patch(
             "gpatch_v4.generation_backend.sglang_model_specific."
             "sglang_weight_update_dsv4.iter_sglang_dsv4_weight_buckets",
@@ -128,7 +131,27 @@ class UpdateWeightFactoryTest(unittest.IsolatedAsyncioTestCase):
         ) as iterator:
             self.assertIs(factory.iter_dsv4_update_buckets(engine, 1024), sentinel)
         iterator.assert_called_once_with(
-            weights, 1024, moe_deepgemm=False
+            weights, 1024, moe_deepgemm=False, fp4_qat=False
+        )
+
+    def test_dsv4_sglang_reads_fp4_qat_from_model_config(self):
+        factory = get_update_weight_factory(
+            context=self.context, model_arch=MODEL_ARCH.DEEPSEEK_V4
+        )
+        sentinel = object()
+        weights = iter(())
+        engine = SimpleNamespace(
+            model=SimpleNamespace(config=SimpleNamespace(fp4_qat=True)),
+            export_weights=lambda: weights,
+        )
+        with patch(
+            "gpatch_v4.generation_backend.sglang_model_specific."
+            "sglang_weight_update_dsv4.iter_sglang_dsv4_weight_buckets",
+            return_value=sentinel,
+        ) as iterator:
+            self.assertIs(factory.iter_dsv4_update_buckets(engine, 1024), sentinel)
+        iterator.assert_called_once_with(
+            weights, 1024, moe_deepgemm=False, fp4_qat=True
         )
 
     def test_mixin_caches_factory_and_syncs_dist_group(self):

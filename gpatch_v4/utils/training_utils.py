@@ -607,46 +607,21 @@ def pad_or_truncate_last_dim(
     value,
     pad_with_random_token: bool = False,
     vocab_size: int = 0,
-    truncate_left: bool = True,
-    valid_len: Optional[Union[int, torch.Tensor]] = None,
     forbidden_token_ids: Optional[list] = None,
 ):
-    """Normalize the last dimension to ``len``.
-
-    ``valid_len`` identifies the real prefix before any existing right
-    padding.  Strip that padding first, then truncate the real sequence from
-    the left or right.  This prevents suffix truncation from retaining stale
-    smart-padding instead of real tokens.
-    """
-    if valid_len is not None:
-        if torch.is_tensor(valid_len):
-            assert valid_len.numel() == 1, f"valid_len must be scalar, got {valid_len.shape}"
-            valid_len = int(valid_len.item())
+    if pad_with_random_token:
+        if vocab_size == 0:
+            t = pad_by_repeating_tokens(t, len)
         else:
-            valid_len = int(valid_len)
-        assert 0 <= valid_len <= t.shape[-1], (
-            f"invalid valid_len {valid_len} for tensor shape {t.shape}"
-        )
-        t = t[..., :valid_len]
-
-    # Truncate before padding so truncate_left applies to real content even
-    # when random/repeated token padding is enabled.
-    if t.shape[-1] > len:
-        if truncate_left:
-            t = t[..., -len:]
-        else:
-            t = t[..., :len]
-    elif t.shape[-1] < len:
-        if pad_with_random_token:
-            if vocab_size == 0:
-                t = pad_by_repeating_tokens(t, len)
-            else:
-                t = pad_by_random_tokens(
-                    t, len, vocab_size=vocab_size, forbidden_token_ids=forbidden_token_ids
-                )
-        else:
+            t = pad_by_random_tokens(
+                t, len, vocab_size=vocab_size, forbidden_token_ids=forbidden_token_ids
+            )
+    else:
+        if t.shape[-1] < len:
             padded_len = len - t.shape[-1]
             t = torch.nn.functional.pad(t, (0, padded_len), value=value)
+        if t.shape[-1] > len:
+            t = t[..., :len]
     assert t.shape[-1] == len, f"len mismatch {t.shape} {len=}"
     return t
 
@@ -1048,6 +1023,11 @@ def dataclass_from_args(args, cls):
             else:
                 kw_args[f.name] = getattr(args, f.name)
     return cls(**kw_args)
+
+
+def selective_log_softmax_raw(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    logprobs = logits.log_softmax(dim=-1)
+    return torch.gather(logprobs, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
 
 
 def from_parallel_logits_to_logprobs(

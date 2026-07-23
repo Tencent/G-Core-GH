@@ -1,7 +1,6 @@
 # coding=utf-8
 # Copyright (c) 2026 Tencent Inc. All rights reserved.
 # nrwu@tencent.com
-
 """FP4 / FP8 block-wise quantizers — inverse of HF ``Fp8Dequantize``.
 
 Used by :func:`gpatch_v4.models.deepseek_v4.parallelize._save_checkpoint_hp`
@@ -47,11 +46,12 @@ __all__ = [
     "quant_fp8_e4m3_scale_e8m0",
 ]
 
-
 # E2M1 (FP4) value table. Mirrors ``Fp8Dequantize._FP4_E2M1_LUT`` so the
 # inverse code points map back exactly. Layout: positive values at idx 0..7,
 # sign-flipped values at idx 8..15.
-_FP4_E2M1_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+_FP4_E2M1_LUT = (
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+)
 _FP4_POS_LUT_T = torch.tensor(_FP4_E2M1_LUT[:8], dtype=torch.float32)
 _FP4_MAX = 6.0
 
@@ -84,9 +84,7 @@ def quant_fp4_e2m1_scale_e8m0_packed(
     assert M % bm == 0 and N % bn == 0, (
         f"value shape ({M}, {N}) not divisible by block ({bm}, {bn})"
     )
-    assert N % 2 == 0, (
-        f"FP4 packing requires N (={N}) to be even (two nibbles per byte)"
-    )
+    assert N % 2 == 0, (f"FP4 packing requires N (={N}) to be even (two nibbles per byte)")
     # NaN guard: a single NaN in `value` poisons its block's max_abs → scale,
     # producing NaN code points in the packed output. Cheaper to fail loud here
     # than to debug a NaN-laced checkpoint downstream.
@@ -95,7 +93,7 @@ def quant_fp4_e2m1_scale_e8m0_packed(
 
     # 1) reshape into per-block tiles for max-abs computation.
     blk = value.float().reshape(*leading, M // bm, bm, N // bn, bn)
-    max_abs = blk.abs().amax(dim=(-3, -1))   # (..., M/bm, N/bn)
+    max_abs = blk.abs().amax(dim=(-3, -1))  # (..., M/bm, N/bn)
 
     # 2) E8M0 scale = 2^k where k = ceil(log2(max_abs / 6.0)). We round UP so
     # the largest |x| in the block fits inside ``±_FP4_MAX`` after dividing by
@@ -114,7 +112,7 @@ def quant_fp4_e2m1_scale_e8m0_packed(
     # bucketize uses midpoints between consecutive positive LUT entries to pick
     # the nearest LUT value (the LUT is monotone increasing on idx 0..7).
     pos_lut = _FP4_POS_LUT_T.to(value.device)
-    midpoints = (pos_lut[1:] + pos_lut[:-1]) / 2.0          # 7 thresholds → 8 buckets
+    midpoints = (pos_lut[1:] + pos_lut[:-1]) / 2.0  # 7 thresholds → 8 buckets
     idx = torch.bucketize(abs_scaled.contiguous(), midpoints)  # int64, in [0, 7]
     code = (idx + sign_bit.to(torch.int64) * 8).to(torch.uint8)  # in [0, 15]
 
@@ -161,7 +159,7 @@ def quant_fp8_e4m3_scale_e8m0(
     fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)  # 448.0
 
     blk = value.float().reshape(*leading, M // bm, bm, N // bn, bn)
-    max_abs = blk.abs().amax(dim=(-3, -1))                # (..., M/bm, N/bn)
+    max_abs = blk.abs().amax(dim=(-3, -1))  # (..., M/bm, N/bn)
 
     safe_max = max_abs.clamp(min=torch.finfo(torch.float32).tiny)
     exponent = torch.ceil(torch.log2(safe_max / fp8_max))
@@ -195,7 +193,9 @@ def _unpack_fp4(packed: torch.Tensor) -> torch.Tensor:
     return unpacked.reshape(*packed.shape[:-1], 2 * packed.shape[-1])
 
 
-def dequant_fp4_e2m1_fp8_scale_e8m0_packed(quantized: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+def dequant_fp4_e2m1_fp8_scale_e8m0_packed(
+    quantized: torch.Tensor, scales: torch.Tensor
+) -> torch.Tensor:
     """Mirror of HF ``Fp8Dequantize._dequantize_one`` (FP4 + FP8 branches).
 
     Inlined so tests don't need to construct the full HF quantizer pipeline.
@@ -221,7 +221,8 @@ def dequant_fp4_e2m1_fp8_scale_e8m0_packed(quantized: torch.Tensor, scales: torc
     block_n = cols // scale_cols
     # E8M0 has no CUDA mul kernel; promote both sides to fp32.
     # Emit in scales.dtype if it's a real float >= 2 bytes, otherwise bf16.
-    out_dtype = scales.dtype if scales.dtype.is_floating_point and scales.element_size() >= 2 else torch.bfloat16
+    out_dtype = scales.dtype if scales.dtype.is_floating_point and scales.element_size(
+    ) >= 2 else torch.bfloat16
     original_shape = quantized_fp32.shape
     q = quantized_fp32.reshape(-1, scale_rows, block_m, scale_cols, block_n)
     s = scales.to(torch.float32).reshape(-1, scale_rows, scale_cols).unsqueeze(-1).unsqueeze(2)

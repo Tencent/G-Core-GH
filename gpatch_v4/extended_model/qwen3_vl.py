@@ -1,4 +1,3 @@
-from functools import partial
 from typing import Any, Dict, List, Tuple
 
 import torch
@@ -17,16 +16,17 @@ from gpatch_v4.configs.config import FinetuneConfig
 from gpatch_v4.core.constants import MODEL_ARCH
 from gpatch_v4.extended_model.base import PrepareDataForward
 from gpatch_v4.extended_model.mtp_mixin import OnlineMtpSftMixin
-from gpatch_v4.utils import get_tensor_on_this_cp_rank, pad_3d_seq_dim
-from gpatch_v4.utils import pad_or_truncate_last_dim as pad_or_truncate_last_dim_left
-from gpatch_v4.utils import qwen2vl_pad_and_split
+from gpatch_v4.utils import (
+    get_tensor_on_this_cp_rank,
+    pad_3d_seq_dim,
+    pad_or_truncate_last_dim,
+    qwen2vl_pad_and_split,
+)
 from gpatch_v4.utils.dynamic_cp_utils import (
     _round_up,
     dyn_cp_schedule_default,
     dyn_cp_schedule_smart_padding,
 )
-
-pad_or_truncate_last_dim = partial(pad_or_truncate_last_dim_left, truncate_left=False)
 
 
 class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
@@ -96,16 +96,17 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         vision_data_l = []
         input_features_l = []
         feature_attention_mask_l = []
-        audio_feature_l = []
+        video_second_per_grid_l = []
         non_blocking = True
         for batch in batches:
             assert batch["tokens"].shape[-1] <= seqlen
             tokens_l.append(pad_or_truncate_last_dim(batch["tokens"], seqlen, pad_token_id))
             assert batch["position_ids"].shape[-1] >= seqlen, "小于 seqlen 时，不能 Pad 0"
             position_ids_l.append(pad_or_truncate_last_dim(batch["position_ids"], seqlen, 0))
-            image_input_mask_l.append(
-                pad_or_truncate_last_dim(batch["image_input_mask"], seqlen, 0)
-            )
+            if "image_input_mask" in batch and batch["image_input_mask"] is not None:
+                image_input_mask_l.append(
+                    pad_or_truncate_last_dim(batch["image_input_mask"], seqlen, 0)
+                )
 
             if "vision_data" in batch and batch["vision_data"] is not None:
                 vision_grid_thw_l.append(batch["vision_grid_thw"])
@@ -116,10 +117,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 feature_attention_mask_l.append(
                     batch["feature_attention_mask"].cuda(non_blocking=non_blocking)
                 )
-
-            if "audio_feature" in batch and batch["audio_feature"] is not None:
-                audio_feature = batch["audio_feature"]
-                audio_feature_l.append(audio_feature)
+            if "video_second_per_grid" in batch and batch["video_second_per_grid"] is not None:
+                video_second_per_grid_l.append(batch["video_second_per_grid"])
 
         tokens = torch.stack(tokens_l).view(len(tokens_l), -1).cuda(non_blocking=non_blocking)
         position_ids = torch.cat(position_ids_l, dim=1).cuda(non_blocking=non_blocking)
@@ -137,16 +136,16 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         input_features = None
         feature_attention_mask = None
+        video_second_per_grid = None
         # audio 的数据不能放到一起处理，不同音频之后可能使用了
         # 同一个 attn。输出的 shape 也不对
         # shape 可以参考 megatron_datasets/qwenvl_dataset_map.py get_audio_token_cnt
         if len(input_features_l) > 0:
             input_features = input_features_l
             feature_attention_mask = feature_attention_mask_l
-
-        audio_feature = None
-        if len(audio_feature_l) > 0:
-            audio_feature = torch.cat(audio_feature_l, dim=0).cuda(non_blocking=non_blocking)
+        if len(video_second_per_grid_l) > 0:
+            video_second_per_grid = torch.cat(video_second_per_grid_l,
+                                              dim=0).cuda(non_blocking=non_blocking)
 
         fwd_kwargs = dict(
             input_ids=tokens,
@@ -161,9 +160,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         if input_features is not None:
             fwd_kwargs["input_features"] = input_features
             fwd_kwargs["feature_attention_mask"] = feature_attention_mask
-
-        if audio_feature is not None:
-            fwd_kwargs["audio_feature"] = audio_feature
+        if video_second_per_grid is not None:
+            fwd_kwargs["video_second_per_grid"] = video_second_per_grid
 
         return fwd_kwargs
 
@@ -185,6 +183,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         advantages_l = []
         mask_l = []
         logprobs_l = []
+        prev_per_token_entropies_l = []
         ref_logprobs_l = []
         rollout_logprobs_l = []
 
@@ -192,22 +191,28 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         vision_data_l = []
         input_features_l = []
         feature_attention_mask_l = []
-        audio_feature_l = []
+        video_second_per_grid_l = []
         non_blocking = True
         has_ref_logprobs = "ref_logprobs" in batches[0]
         has_rollout_logprobs = "rollout_log_probs" in batches[0]
+        has_prev_per_token_entropies = "prev_per_token_entropies" in batches[0]
         for batch in batches:
             assert batch["tokens"].shape[-1] <= seqlen
             tokens_l.append(pad_or_truncate_last_dim(batch["tokens"], seqlen, pad_token_id))
             assert batch["position_ids"].shape[-1] >= seqlen, "小于 seqlen 时，不能 Pad 0"
             position_ids_l.append(pad_or_truncate_last_dim(batch["position_ids"], seqlen, 0))
-            image_input_mask_l.append(
-                pad_or_truncate_last_dim(batch["image_input_mask"], seqlen, 0)
-            )
+            if "image_input_mask" in batch and batch["image_input_mask"] is not None:
+                image_input_mask_l.append(
+                    pad_or_truncate_last_dim(batch["image_input_mask"], seqlen, 0)
+                )
 
             advantages_l.append(pad_or_truncate_last_dim(batch["advantages"], seqlen - 1, 0))
             mask_l.append(pad_or_truncate_last_dim(batch["mask"], seqlen - 1, 0))
             logprobs_l.append(pad_or_truncate_last_dim(batch["logprobs"], seqlen - 1, 0))
+            if has_prev_per_token_entropies:
+                prev_per_token_entropies_l.append(
+                    pad_or_truncate_last_dim(batch["prev_per_token_entropies"], seqlen - 1, 0)
+                )
             if has_ref_logprobs:
                 ref_logprobs_l.append(
                     pad_or_truncate_last_dim(batch["ref_logprobs"], seqlen - 1, 0)
@@ -227,10 +232,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 feature_attention_mask_l.append(
                     batch["feature_attention_mask"].cuda(non_blocking=non_blocking)
                 )
-
-            if "audio_feature" in batch and batch["audio_feature"] is not None:
-                audio_feature = batch["audio_feature"]
-                audio_feature_l.append(audio_feature)
+            if "video_second_per_grid" in batch and batch["video_second_per_grid"] is not None:
+                video_second_per_grid_l.append(batch["video_second_per_grid"])
 
         tokens = torch.stack(tokens_l).view(len(tokens_l), -1).cuda(non_blocking=non_blocking)
         position_ids = torch.cat(position_ids_l, dim=1).cuda(non_blocking=non_blocking)
@@ -238,6 +241,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         advantages = torch.stack(advantages_l)
         mask = torch.stack(mask_l)
         logprobs = torch.stack(logprobs_l)
+        if has_prev_per_token_entropies:
+            prev_per_token_entropies = torch.stack(prev_per_token_entropies_l)
         ref_logprobs = torch.stack(ref_logprobs_l) if has_ref_logprobs else None
         rollout_log_probs = torch.stack(rollout_logprobs_l) if has_rollout_logprobs else None
 
@@ -271,16 +276,16 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         input_features = None
         feature_attention_mask = None
+        video_second_per_grid = None
         # audio 的数据不能放到一起处理，不同音频之后可能使用了
         # 同一个 attn。输出的 shape 也不对
         # shape 可以参考 megatron_datasets/qwenvl_dataset_map.py get_audio_token_cnt
         if len(input_features_l) > 0:
             input_features = input_features_l
             feature_attention_mask = feature_attention_mask_l
-
-        audio_feature = None
-        if len(audio_feature_l) > 0:
-            audio_feature = torch.cat(audio_feature_l, dim=0).cuda(non_blocking=non_blocking)
+        if len(video_second_per_grid_l) > 0:
+            video_second_per_grid = torch.cat(video_second_per_grid_l,
+                                              dim=0).cuda(non_blocking=non_blocking)
 
         batch = {
             "input_ids": tokens,
@@ -298,15 +303,19 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             'target': tokens.detach().clone(),
             "input_features": input_features,
             "feature_attention_mask": feature_attention_mask,
+            "video_second_per_grid": video_second_per_grid,
             "mtp_labels": mtp_labels,
             "mtp_loss_mask": mtp_loss_mask,
             "sample_mask": sample_mask,
             "global_retention_ratio": global_retention_ratio,
             "entropy_aux_figures": entropy_aux_figures,
-            "audio_feature": audio_feature,
         }
+        if has_prev_per_token_entropies:
+            batch["prev_per_token_entropy"] = prev_per_token_entropies
         if mpu.is_pipeline_last_stage():
             keys_to_cuda = ["mask", "prev_log_probs", "advantages"]
+            if has_prev_per_token_entropies:
+                keys_to_cuda.append("prev_per_token_entropy")
             if batch["ref_log_probs"] is not None:
                 keys_to_cuda.append("ref_log_probs")
             if batch["rollout_log_probs"] is not None:
@@ -332,10 +341,9 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         if batch["input_features"] is not None:
             fwd_kwargs["input_features"] = batch["input_features"]
             fwd_kwargs["feature_attention_mask"] = batch["feature_attention_mask"]
+        if batch["video_second_per_grid"] is not None:
+            fwd_kwargs["video_second_per_grid"] = batch["video_second_per_grid"]
         self._maybe_set_mtp_sft_fwd_kwargs(fwd_kwargs, batch["mtp_labels"], batch["mtp_loss_mask"])
-
-        if audio_feature is not None:
-            fwd_kwargs["audio_feature"] = audio_feature
 
         return batch, fwd_kwargs
 
@@ -362,16 +370,16 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         vision_data_l = []
         input_features_l = []
         feature_attention_mask_l = []
-        audio_feature_l = []
         non_blocking = True
         for batch in batches:
             assert batch["tokens"].shape[-1] <= seqlen
             tokens_l.append(pad_or_truncate_last_dim(batch["tokens"], seqlen, pad_token_id))
             assert batch["position_ids"].shape[-1] >= seqlen, "小于 seqlen 时，不能 Pad 0"
             position_ids_l.append(pad_or_truncate_last_dim(batch["position_ids"], seqlen, 0))
-            image_input_mask_l.append(
-                pad_or_truncate_last_dim(batch["image_input_mask"], seqlen, 0)
-            )
+            if "image_input_mask" in batch and batch["image_input_mask"] is not None:
+                image_input_mask_l.append(
+                    pad_or_truncate_last_dim(batch["image_input_mask"], seqlen, 0)
+                )
 
             values_l.append(pad_or_truncate_last_dim(batch["values"], seqlen - 1, 0.0))
             returns_l.append(pad_or_truncate_last_dim(batch["returns"], seqlen - 1, 0.0))
@@ -386,9 +394,6 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 feature_attention_mask_l.append(
                     batch["feature_attention_mask"].cuda(non_blocking=non_blocking)
                 )
-
-            if "audio_feature" in batch and batch["audio_feature"] is not None:
-                audio_feature_l.append(batch["audio_feature"])
 
         tokens = torch.stack(tokens_l).view(len(tokens_l), -1).cuda(non_blocking=non_blocking)
         position_ids = torch.cat(position_ids_l, dim=1).cuda(non_blocking=non_blocking)
@@ -413,10 +418,6 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             input_features = input_features_l
             feature_attention_mask = feature_attention_mask_l
 
-        audio_feature = None
-        if len(audio_feature_l) > 0:
-            audio_feature = torch.cat(audio_feature_l, dim=0).cuda(non_blocking=non_blocking)
-
         batch = {
             "input_ids": tokens,
             "position_ids": position_ids,
@@ -430,7 +431,6 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             "mask": mask,
             "input_features": input_features,
             "feature_attention_mask": feature_attention_mask,
-            "audio_feature": audio_feature,
         }
         if mpu.is_pipeline_last_stage():
             for k in ["mask", "values", "returns"]:
@@ -449,9 +449,6 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         if batch["input_features"] is not None:
             fwd_kwargs["input_features"] = batch["input_features"]
             fwd_kwargs["feature_attention_mask"] = batch["feature_attention_mask"]
-
-        if audio_feature is not None:
-            fwd_kwargs["audio_feature"] = audio_feature
 
         return batch, fwd_kwargs
 
@@ -524,7 +521,6 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         input_features_l = []
         feature_attention_mask_l = []
         video_second_per_grid_l = []
-        audio_feature_l = []
         meta_info_l = []
         non_blocking = True
         loss_weights_list = []
@@ -551,8 +547,9 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             if "vision_data" in batch and batch["vision_data"] is not None:
                 vision_grid_thw_l.append(batch["vision_grid_thw"])
                 vision_data_l.append(batch["vision_data"])
-            image_input_mask = pad_or_truncate_last_dim(batch["image_input_mask"], seq_len, 0)
-            image_input_mask_l.append(image_input_mask)
+            if "image_input_mask" in batch and batch["image_input_mask"] is not None:
+                image_input_mask = pad_or_truncate_last_dim(batch["image_input_mask"], seq_len, 0)
+                image_input_mask_l.append(image_input_mask)
 
             if "input_features" in batch and batch["input_features"] is not None:
                 input_features_l.append(batch["input_features"].cuda(non_blocking=non_blocking))
@@ -561,10 +558,6 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 )
             if "video_second_per_grid" in batch and batch["video_second_per_grid"] is not None:
                 video_second_per_grid_l.append(batch["video_second_per_grid"])
-
-            if "audio_feature" in batch and batch["audio_feature"] is not None:
-                audio_feature = batch["audio_feature"]
-                audio_feature_l.append(audio_feature)
 
             if "square_averaging_weight" in batch:
                 square_averaging_weight_list.append(batch["square_averaging_weight"])
@@ -626,10 +619,6 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             video_second_per_grid = torch.cat(video_second_per_grid_l,
                                               dim=0).cuda(non_blocking=non_blocking)
 
-        audio_feature = None
-        if len(audio_feature_l) > 0:
-            audio_feature = torch.cat(audio_feature_l, dim=0).cuda(non_blocking=non_blocking)
-
         batch = {
             "tokens": tokens,
             "labels": labels,
@@ -647,7 +636,6 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             "input_features": input_features,
             "feature_attention_mask": feature_attention_mask,
             "video_second_per_grid": video_second_per_grid,
-            "audio_feature": audio_feature,
             "meta_info": meta_info_l if len(meta_info_l) > 0 else None,
         }
 
@@ -671,9 +659,6 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             fwd_kwargs["feature_attention_mask"] = batch["feature_attention_mask"]
         if batch["video_second_per_grid"] is not None:
             fwd_kwargs["video_second_per_grid"] = batch["video_second_per_grid"]
-
-        if audio_feature is not None:
-            fwd_kwargs["audio_feature"] = audio_feature
 
         # labels/loss_mask are already CP-split above; let the model compute the
         # MTP loss from them when online_mtp_sft is enabled.
@@ -1263,7 +1248,9 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         vision_grid_thw_l = []
         vision_data_l = []
-        audio_feature_l = []
+        input_features_l = []
+        feature_attention_mask_l = []
+        video_second_per_grid_l = []
         teacher_names = list(self.config.teachers.keys())
         is_single_teacher = len(teacher_names) == 1
         routing_field = getattr(self.config.ppo, "g_opd_teacher_routing_field", "teacher_type")
@@ -1272,9 +1259,10 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             tokens_l.append(pad_or_truncate_last_dim(batch["tokens"], seqlen, pad_token_id))
             assert batch["position_ids"].shape[-1] >= seqlen, "小于 seqlen 时，不能 Pad 0"
             position_ids_l.append(pad_or_truncate_last_dim(batch["position_ids"], seqlen, 0))
-            image_input_mask_l.append(
-                pad_or_truncate_last_dim(batch["image_input_mask"], seqlen, 0)
-            )
+            if "image_input_mask" in batch and batch["image_input_mask"] is not None:
+                image_input_mask_l.append(
+                    pad_or_truncate_last_dim(batch["image_input_mask"], seqlen, 0)
+                )
 
             adv = batch["advantages"]
             if adv.dim() == 2:
@@ -1316,9 +1304,13 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 vision_grid_thw_l.append(batch["vision_grid_thw"])
                 vision_data_l.append(batch["vision_data"])
 
-            if "audio_feature" in batch and batch["audio_feature"] is not None:
-                audio_feature = batch["audio_feature"]
-                audio_feature_l.append(audio_feature)
+            if "input_features" in batch and batch["input_features"] is not None:
+                input_features_l.append(batch["input_features"].cuda(non_blocking=non_blocking))
+                feature_attention_mask_l.append(
+                    batch["feature_attention_mask"].cuda(non_blocking=non_blocking)
+                )
+            if "video_second_per_grid" in batch and batch["video_second_per_grid"] is not None:
+                video_second_per_grid_l.append(batch["video_second_per_grid"])
 
         non_blocking = True
         tokens = torch.stack(tokens_l).view(len(tokens_l), -1).cuda(non_blocking=non_blocking)
@@ -1348,9 +1340,17 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             vision_data = vision_data.cuda(non_blocking=non_blocking)
             vision_grid_thw = vision_grid_thw.cuda(non_blocking=non_blocking)
 
-        audio_feature = None
-        if len(audio_feature_l) > 0:
-            audio_feature = torch.cat(audio_feature_l, dim=0).cuda(non_blocking=non_blocking)
+        input_features = None
+        feature_attention_mask = None
+        video_second_per_grid = None
+        # audio 的数据不能放到一起处理，不同音频之后可能使用了
+        # 同一个 attn。输出的 shape 也不对
+        if len(input_features_l) > 0:
+            input_features = input_features_l
+            feature_attention_mask = feature_attention_mask_l
+        if len(video_second_per_grid_l) > 0:
+            video_second_per_grid = torch.cat(video_second_per_grid_l,
+                                              dim=0).cuda(non_blocking=non_blocking)
 
         batch = {
             "input_ids": tokens,
@@ -1369,7 +1369,9 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             'target': tokens.detach().clone(),
             "mtp_labels": mtp_labels,
             "mtp_loss_mask": mtp_loss_mask,
-            "audio_feature": audio_feature,
+            "input_features": input_features,
+            "feature_attention_mask": feature_attention_mask,
+            "video_second_per_grid": video_second_per_grid,
         }
         if has_topk:
             batch["prev_topk_logprobs"] = prev_topk_logprobs
@@ -1399,8 +1401,11 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         )
         self._maybe_set_mtp_sft_fwd_kwargs(fwd_kwargs, batch["mtp_labels"], batch["mtp_loss_mask"])
 
-        if audio_feature is not None:
-            fwd_kwargs["audio_feature"] = audio_feature
+        if batch["input_features"] is not None:
+            fwd_kwargs["input_features"] = batch["input_features"]
+            fwd_kwargs["feature_attention_mask"] = batch["feature_attention_mask"]
+        if batch["video_second_per_grid"] is not None:
+            fwd_kwargs["video_second_per_grid"] = batch["video_second_per_grid"]
 
         return batch, fwd_kwargs
 
@@ -1444,9 +1449,10 @@ class Qwen3VLOffPoilicyDistillPrepareDataForward(Qwen3VLPrepareDataForward):
 
             assert batch["position_ids"].shape[-1] >= seq_len, "小于 seq_len 时，不能 Pad 0"
             position_ids_l.append(pad_or_truncate_last_dim(batch["position_ids"], seq_len, 0))
-            image_input_mask_l.append(
-                pad_or_truncate_last_dim(batch["image_input_mask"], seq_len, 0)
-            )
+            if "image_input_mask" in batch and batch["image_input_mask"] is not None:
+                image_input_mask_l.append(
+                    pad_or_truncate_last_dim(batch["image_input_mask"], seq_len, 0)
+                )
             if "vision_data" in batch and batch["vision_data"] is not None:
                 vision_grid_thw_l.append(batch["vision_grid_thw"])
                 vision_data_l.append(batch["vision_data"])

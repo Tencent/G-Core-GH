@@ -27,6 +27,25 @@ def _weight_export_debug_log(msg: str) -> None:
     print(f"[weight_export] {msg}", flush=True)
 
 
+def _dsv4_update_trace_exported_expert(name: str, tensor: torch.Tensor, ep_size: int) -> None:
+    """Log the EP-restored routed-expert shape when update tracing is enabled."""
+    if os.getenv("GCORE_DSV4_UPDATE_TRACE", "0") != "1":
+        return
+    if not name.startswith("model.layers.0.mlp.experts."):
+        return
+
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    flat = tensor.detach().reshape(-1)
+    positions = (0, flat.numel() // 2, flat.numel() - 1)
+    samples = [float(flat[pos].float()) for pos in positions] if flat.numel() else []
+    print(
+        "[dsv4-update-trace][export] "
+        f"rank={rank} key={name} ep_size={ep_size} "
+        f"full_shape={tuple(tensor.shape)} dtype={tensor.dtype} samples={samples}",
+        flush=True,
+    )
+
+
 # DSV4-Flash on-disk dtype layout (derived from upstream safetensors shard survey).
 #
 # FP8 (float8_e4m3fn + E8M0 scale, 128×128 block):
@@ -70,7 +89,7 @@ _F32_DISK_KEY_RE = re.compile("|".join(_F32_DISK_KEY_PATTERNS))
 
 # ``attn.wo_a`` weight disk keys (base layers + MTP). ``wo_a`` is normally FP8
 # (it is covered by _FP8_DISK_KEY_RE above), but the SGLang fp4->fp8 dequantized
-# mirror stores it as BF16 (no ``.scale``). 
+# mirror stores it as BF16 (no ``.scale``).
 _WO_A_DISK_KEY_RE = re.compile(
     r"^(?:.*\.)?layers\.\d+\.attn\.wo_a\.weight$|^mtp\.\d+\.attn\.wo_a\.weight$"
 )
@@ -105,9 +124,8 @@ def resolve_dsv4_export_dtypes(config) -> tuple[str, bool]:
     expert_dtype = getattr(config, "expert_dtype", None)
     if expert_dtype is None:
         expert_dtype = "fp8" if is_sgl_ckpt_fmt else "fp4"
-    assert expert_dtype in ("fp4", "fp8"), (
-        f"Unsupported DeepSeek-V4 expert_dtype={expert_dtype!r}"
-    )
+    assert expert_dtype in ("fp4",
+                            "fp8"), (f"Unsupported DeepSeek-V4 expert_dtype={expert_dtype!r}")
     return expert_dtype, is_sgl_ckpt_fmt
 
 
@@ -310,11 +328,8 @@ def _iter_deepseek_v4_gathered_state_dict(model: Module, ) -> Iterator[tuple[str
         if name.startswith("mtp."):
             continue
 
+        is_expert_weight = (".mlp.experts.gate_up_proj" in name or ".mlp.experts.down_proj" in name)
         if isinstance(tensor, DTensor):
-            is_expert_weight = (
-                ".mlp.experts.gate_up_proj" in name or ".mlp.experts.down_proj" in name
-            )
-
             if is_expert_weight and ep_size > 1:
                 # Keep the same expert gather semantics as checkpoint.py:
                 # gather ep_fsdp shards first, then all_gather over ep ranks
@@ -358,6 +373,8 @@ def _iter_deepseek_v4_gathered_state_dict(model: Module, ) -> Iterator[tuple[str
         else:
             full_tensor = tensor.detach()
 
+        if is_expert_weight:
+            _dsv4_update_trace_exported_expert(name, full_tensor, ep_size)
         yield name.removeprefix("model."), full_tensor
         del full_tensor
 

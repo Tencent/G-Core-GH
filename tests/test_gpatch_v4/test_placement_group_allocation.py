@@ -15,7 +15,10 @@ from gpatch_v4.configs.config import (
     RlConfig,
 )
 from gpatch_v4.configs.dist_config import DistConfig
+from gpatch_v4.configs.infer_engine_config import InferEngineConfig
 from gpatch_v4.configs.policy_config import BasePolicyConfig
+from gpatch_v4.configs.reward_config import RewardModelInfo
+from gpatch_v4.configs.sampler_config import ModelInfo
 
 
 def _dist_config(nnodes=1, gpus_per_node=8, tp=1, pp=1):
@@ -131,6 +134,65 @@ class TestCreatePlacementGroupsColocate(unittest.TestCase):
             "b": BasePolicyConfig(dist_config=_dist_config(nnodes=1, gpus_per_node=8)),
         }
 
+        fixture = _PGFixture()
+        with patch.object(pg_mod, "_create_placement_group", side_effect=fixture):
+            with self.assertRaises(AssertionError):
+                pg_mod.create_placement_groups(cfg)
+
+
+class TestCreatePlacementGroupsPartialColocated(unittest.TestCase):
+    """Partial colocate: sampler/gen-rm split the policy GPU pool."""
+    def _build_rl_partial(self, sampler_nnodes=1, gen_rm_nnodes=1):
+        cfg = RlConfig(placement_type="partial_colocated")
+        cfg.training.single_controller = True
+        cfg.training.async_rollout = True
+        cfg.training.rollout_max_staleness = 0
+        cfg.training.use_gen_rm_reward = True
+        cfg.training.use_bt_rm_reward = False
+        cfg.policy.dist_config = _dist_config(nnodes=2, gpus_per_node=8)
+        cfg.sampler.dist_config = _dist_config(nnodes=sampler_nnodes, gpus_per_node=8)
+        cfg.sampler.backend = "sglang"
+        cfg.sampler.model_info = [ModelInfo()]
+        cfg.sampler.infer_engine_configs = [
+            InferEngineConfig(
+                dist_config=_dist_config(
+                    nnodes=sampler_nnodes, gpus_per_node=8, tp=8
+                )
+            )
+        ]
+        cfg.gen_rm.dist_config = _dist_config(nnodes=gen_rm_nnodes, gpus_per_node=8)
+        cfg.gen_rm.backend = "sglang"
+        cfg.gen_rm.reward_model_info = [RewardModelInfo()]
+        cfg.gen_rm.infer_engine_configs = [
+            InferEngineConfig(
+                dist_config=_dist_config(
+                    nnodes=gen_rm_nnodes, gpus_per_node=8, tp=4
+                )
+            )
+        ]
+        cfg.bt_rm.dist_config = _dist_config(nnodes=0, gpus_per_node=8)
+        return cfg
+
+    def test_sampler_and_gen_rm_split_policy_slice(self):
+        from gpatch_v4.orches import placement_group as pg_mod
+
+        cfg = self._build_rl_partial()
+        fixture = _PGFixture()
+        with patch.object(pg_mod, "_create_placement_group", side_effect=fixture):
+            groups = pg_mod.create_placement_groups(cfg)
+
+        assert fixture.received_num_gpus == 16
+        assert groups["policy"][1] == list(range(16))
+        assert groups["sampler"][1] == list(range(8))
+        assert groups["gen_rm"][1] == list(range(8, 16))
+        assert groups["bt_rm"][1] == []
+        assert set(groups["sampler"][1]).isdisjoint(set(groups["gen_rm"][1]))
+        assert set(groups["sampler"][1]) | set(groups["gen_rm"][1]) == set(groups["policy"][1])
+
+    def test_policy_must_equal_sampler_plus_gen_rm(self):
+        from gpatch_v4.orches import placement_group as pg_mod
+
+        cfg = self._build_rl_partial(sampler_nnodes=1, gen_rm_nnodes=2)
         fixture = _PGFixture()
         with patch.object(pg_mod, "_create_placement_group", side_effect=fixture):
             with self.assertRaises(AssertionError):

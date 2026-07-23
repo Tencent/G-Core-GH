@@ -11,7 +11,7 @@ class RayBaseActor:
         Resolution order:
 
         1. ``__HOST_IP__`` environment variable
-        2. IP of the ``bond1`` network interface
+        2. IP of the ``bond1`` / ``bond0`` network interface
         3. IP of the ``eth0`` network interface
         4. ``127.0.0.1`` as last resort
 

@@ -1,0 +1,77 @@
+# gcore metric -> verl metric 映射（GRPO 训练阶段）
+# key: gcore 指标名；value: 对应 verl 指标名（列表=一对多；null=verl 无对应）
+
+# ===== policy / actor =====
+policy/policy_loss: actor/pg_loss          # 策略梯度损失
+policy/loss: actor/loss                    # 总损失
+policy/grpo_kl_loss: actor/kl_loss         # KL 正则项
+policy/scaled_entropy: actor/entropy       # 策略熵
+policy/grad_norm: actor/grad_norm          # 梯度范数
+policy/lr: actor/lr                        # 学习率
+policy/seq_length: null                    # 单样本整条序列长，verl global_seqlen 口径不同
+policy/ppo_ratio: null                     # 平均重要性采样比，verl 未直接记录
+policy/ppo_ratio_clamped: null
+policy/ppo_ratio_clamped_upper_frac: actor/pg_clipfrac        # 上界裁剪占比
+policy/ppo_ratio_clamped_lower_frac: actor/pg_clipfrac_lower  # 下界裁剪占比
+policy/ppo_ratio_clamped_effective_upper_frac: null
+policy/ppo_ratio_clamped_effective_lower_frac: null
+policy/ppo_dual_clip_frac: null            # dual-clip 占比，verl 默认不记录
+
+# ===== off-policy 校正 (gcore) <-> rollout_corr (verl) =====
+policy/off_policy_correction/actor_ppl: rollout_corr/training_ppl       # 训练策略 ppl
+policy/off_policy_correction/actor_log_ppl: rollout_corr/training_log_ppl
+policy/off_policy_correction/sampler_ppl: rollout_corr/rollout_ppl      # rollout 策略 ppl
+policy/off_policy_correction/sampler_log_ppl: rollout_corr/rollout_log_ppl
+policy/off_policy_correction/kl: rollout_corr/kl                        # rollout vs 训练 KL
+policy/off_policy_correction/k3_kl: rollout_corr/k3_kl                  # K3 估计 KL
+policy/off_policy_correction/log_ppl_diff: rollout_corr/log_ppl_diff
+policy/off_policy_correction/log_ppl_abs_diff: rollout_corr/log_ppl_abs_diff
+policy/off_policy_correction/ppl_ratio: rollout_corr/ppl_ratio
+policy/off_policy_correction/chi2_token: rollout_corr/chi2_token        # token 级卡方散度
+policy/off_policy_correction/chi2_seq: rollout_corr/chi2_seq            # 序列级卡方散度
+policy/off_policy_correction/correction_ratio_mean: null
+policy/off_policy_correction/correction_ratio_min: null
+policy/off_policy_correction/correction_ratio_max: null
+
+# ===== reward =====
+rollout-rewards/global_rewards:            # 全局平均奖励（GRPO 无 critic，score==reward）
+  - critic/score/mean
+  - critic/rewards/mean
+
+# ===== advantages / returns =====
+ppo-metrics/global_advantages_mean: critic/advantages/mean
+ppo-metrics/global_advantages_max: critic/advantages/max
+ppo-metrics/global_advantages_min: critic/advantages/min
+ppo-metrics/global_advantages_std: null    # verl 未记录 advantage std
+ppo-metrics/global_returns_mean: critic/returns/mean
+ppo-metrics/global_returns_max: critic/returns/max
+ppo-metrics/global_returns_min: critic/returns/min
+ppo-metrics/global_returns_std: null
+
+# ===== 长度统计 =====
+rollout-metrics/global_response_lengths_mean: response_length/mean
+rollout-metrics/global_response_lengths_max: response_length/max
+rollout-metrics/global_response_lengths_min: response_length/min
+rollout-metrics/global_prompt_lengths: prompt_length/mean
+rollout-metrics/global_prompt_lengths_max: prompt_length/max
+rollout-metrics/global_prompt_lengths_min: prompt_length/min
+rollout-metrics/global_overlong_penalty: null       # 超长惩罚，verl 无对应
+rollout-metrics/global_response_lengths_p10: null
+rollout-metrics/global_response_lengths_p50: null
+rollout-metrics/global_response_lengths_p90: null
+rollout-metrics/global_response_lengths_max_cnt: null
+rollout-metrics/global_response_lengths_min_cnt: null
+# 以下来自现有 metric_map.log，若该 run 未产出则不会出现
+rollout-metrics/global_format_aligned_fraction: format_aligned/fraction
+rollout-metrics/global_response_clip_ratio: response_length/clip_ratio
+
+# ===== 时序 =====
+time_perf/total_time: timing_s/step          # 整个 ppo step 墙钟
+time_perf/rollout: timing_s/gen              # 生成墙钟
+time_perf/compute_logps: timing_s/old_log_prob
+time_perf/train_step: timing_s/update_actor
+time_perf/generate_ppo_data: timing_s/adv    # advantage/returns 计算
+time_perf/sampler_generate: null             # sampler 累计耗时，非墙钟
+time_perf/bt_rm_generate: null
+time_perf/external_reward: null
+time_perf/gen_rm_generate: null

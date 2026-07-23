@@ -129,7 +129,7 @@ def get_dataset_and_dataloader(
         train_dataset,
         rank=dp_rank,
         num_replicas=dp_size,
-        shuffle=True,
+        shuffle=config.data.shuffle,
         seed=config.data.sampler_seed,
         drop_last=True,
     )

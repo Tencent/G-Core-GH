@@ -114,6 +114,27 @@ class ColocateAgentMixin:
         futs = [actor.log_memory.remote(tag=tag) for actor in self._train_actors]
         await asyncio.gather(*futs)
 
+    async def begin_partial_colocated_rollout(self, ppo_step: int):
+        """Wake sampler and all gen-RMs once for a partial-colocated PPO step."""
+        calls = [self.sampler_client.mark_ppo_step_begin(0, ppo_step)]
+        if self.gen_rm_client is not None:
+            calls.extend(
+                self.gen_rm_client.mark_ppo_step_begin(rm_idx, ppo_step=ppo_step)
+                for rm_idx in range(self.gen_rm_client.num_rms)
+            )
+        await asyncio.gather(*calls)
+
+    async def end_partial_colocated_rollout(self, ppo_step: int):
+        """Flush sampler KV and sleep sampler/gen-RM after a partial PPO step."""
+        await self.sampler_client.infer_engine_flush_cache(0)
+        calls = [self.sampler_client.mark_ppo_step_end(0, ppo_step)]
+        if self.gen_rm_client is not None:
+            calls.extend(
+                self.gen_rm_client.mark_ppo_step_end(rm_idx, ppo_step=ppo_step)
+                for rm_idx in range(self.gen_rm_client.num_rms)
+            )
+        await asyncio.gather(*calls)
+
     @asynccontextmanager
     async def sampler_phase(self, ppo_step: int, sampler_idx: int = 0):
         """Wake sampler (leader only) → barrier → yield → barrier → flush + sleep (leader only) → barrier."""

@@ -11,6 +11,7 @@ from gpatch_v4.client import GenRmClient, SamplerClient
 from gpatch_v4.configs.config import RlConfig
 from gpatch_v4.rollout_generator.async_rollout.mixin import ColocateAgentMixin
 from gpatch_v4.utils import import_fn_from_path, log, log_debug
+from gpatch_v4.utils.data_manipulate_utils import ensure_sample_hierarchical_id
 
 
 class BaseAgentLoopActor(ColocateAgentMixin, abc.ABC):
@@ -261,6 +262,8 @@ class AgentLoopActor(BaseAgentLoopActor):
             sample_indices,
             use_colocate=use_colocate,
         )
+        for rb in rbs:
+            ensure_sample_hierarchical_id(rb)
 
         if self.worker_id == 0:
             log(

@@ -1,0 +1,19 @@
+# @package _global_
+# GRPO loss: KL off / entropy off, symmetric clip 0.2, grpo advantage epsilon 1e-6,
+# dual-clip c=20 (aligns verl clip_ratio_c).
+ppo:
+  advantage_type: "grpo"
+  loss_func: grpo
+  grpo_advantage_epsilon: 1.0e-6
+  grpo_kl_loss_beta: 0
+  ppo_entropy_bonus: 0
+  ppo_initial_policy_kl_penalty: 0
+  ppo_ratio_eps: 0.2
+  ppo_dual_clip_ratio_c: 20
+  ppo_logps_ratio_clamp: 20
+
+policy:
+  override_transformer_config:
+    # 梯度 loss 按全局 response token 数归一（token-mean），对齐 verl 的
+    # loss_agg_mode=token-mean；否则 gcore 默认是 per-sample 等权。
+    calculate_per_token_loss: True

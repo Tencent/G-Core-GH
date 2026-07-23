@@ -93,9 +93,10 @@ class OnPolicyDistillRolloutGenerator(BaseRolloutGenerator):
             all_issue_cos = []
             for _, t_client in teacher_items:
                 for rbi, rollout_batch in enumerate(rbs):
+                    teacher_batch = self.get_teacher_rollout_batch(rollout_batch)
                     lightweight_batch = {
-                        k: rollout_batch[k]
-                        for k in teacher_keys if k in rollout_batch
+                        k: teacher_batch[k]
+                        for k in teacher_keys if k in teacher_batch
                     }
                     # Truncate stu_topk_ids to response length for transfer efficiency.
                     if "stu_topk_ids" in lightweight_batch:
@@ -130,17 +131,7 @@ class OnPolicyDistillRolloutGenerator(BaseRolloutGenerator):
             for t_name, _ in teacher_items:
                 for rbi, rollout_batch in enumerate(rbs):
                     resp = all_results[idx]
-                    rollout_batch[f"teacher_logprobs_{t_name}"] = resp["teacher_logprobs"]
-                    if "teacher_on_stu_topk_logprobs" in resp:
-                        rollout_batch[f"teacher_on_stu_topk_logprobs_{t_name}"] = (
-                            resp["teacher_on_stu_topk_logprobs"]
-                        )
-                    if "teacher_topk_ids" in resp:
-                        rollout_batch[f"teacher_topk_ids_{t_name}"] = resp["teacher_topk_ids"]
-                    if "teacher_topk_logprobs" in resp:
-                        rollout_batch[f"teacher_topk_logprobs_{t_name}"] = (
-                            resp["teacher_topk_logprobs"]
-                        )
+                    self.fillback_teacher_logps(rollout_batch, resp, t_name)
                     idx += 1
                 assert check_rollout_batches(rbs), \
                     f"rbs format error after teacher {t_name}"
@@ -159,6 +150,119 @@ class OnPolicyDistillRolloutGenerator(BaseRolloutGenerator):
     @override
     def _post_process_rm_rollout_batch(self, rollout_batches: List[Dict[str, List[Any]]]):
         return self.apply_sampling_rollout_attr.add_back_rollout_attr(rollout_batches)
+
+    def get_teacher_rollout_batch(self, rollout_batch: Dict[str,
+                                                            List[Any]]) -> Dict[str, List[Any]]:
+        if "teacher_tokens" in rollout_batch:
+            teacher_rollout_batch = {}
+            teacher_rollout_batch["tokens"] = rollout_batch["teacher_tokens"]
+            teacher_rollout_batch["prompt_lengths"] = rollout_batch["teacher_prompt_lengths"]
+            teacher_rollout_batch["sequence_lengths"] = rollout_batch["teacher_sequence_lengths"]
+            if "teacher_res" in rollout_batch:
+                for rbs in rollout_batch["teacher_res"]:
+                    for k, v in rbs.items():
+                        if k not in teacher_rollout_batch:
+                            teacher_rollout_batch[k] = []
+                        teacher_rollout_batch[k].append(v)
+            if self.config.ppo.log_prob_top_k > 0:
+                teacher_rollout_batch["stu_topk_ids"] = []
+                for i in range(len(rollout_batch["stu_topk_ids"])):
+                    tea_prompt_len = teacher_rollout_batch["prompt_lengths"][i]
+                    stu_prompt_len = rollout_batch["prompt_lengths"][i]
+                    tea_seq_len = teacher_rollout_batch["sequence_lengths"][i]
+                    stu_seq_len = rollout_batch["sequence_lengths"][i]
+                    tea_response_len = tea_seq_len - tea_prompt_len
+                    stu_response_len = stu_seq_len - stu_prompt_len
+                    assert tea_response_len == stu_response_len
+                    input = rollout_batch["stu_topk_ids"][i]
+                    stu_topk_ids = torch.zeros(
+                        (tea_seq_len - 1, input.shape[1]),
+                        dtype=input.dtype,
+                        layout=input.layout,
+                        device=input.device
+                    )
+                    stu_topk_ids[tea_prompt_len - 1:tea_seq_len - 1] = input[stu_prompt_len -
+                                                                             1:stu_seq_len - 1]
+                    teacher_rollout_batch["stu_topk_ids"].append(stu_topk_ids)
+        else:
+            teacher_rollout_batch = rollout_batch
+
+        return teacher_rollout_batch
+
+    def fillback_teacher_logps(
+        self,
+        rollout_batch: Dict[str, List[Any]],
+        response: Dict[str, List[Any]],
+        t_name: str,
+    ) -> Dict[str, List[Any]]:
+        if "teacher_tokens" in rollout_batch:
+            rollout_batch[f"teacher_logprobs_{t_name}"] = []
+            if "teacher_on_stu_topk_logprobs" in response:
+                rollout_batch[f"teacher_on_stu_topk_logprobs_{t_name}"] = []
+            if "teacher_topk_ids" in response:
+                rollout_batch[f"teacher_topk_ids_{t_name}"] = []
+            if "teacher_topk_logprobs" in response:
+                rollout_batch[f"teacher_topk_logprobs_{t_name}"] = []
+
+            for i in range(len(rollout_batch["teacher_tokens"])):
+                tea_prompt_len = rollout_batch["teacher_prompt_lengths"][i]
+                stu_prompt_len = rollout_batch["prompt_lengths"][i]
+                tea_seq_len = rollout_batch["teacher_sequence_lengths"][i]
+                stu_seq_len = rollout_batch["sequence_lengths"][i]
+                input = response["teacher_logprobs"][i]
+                assert input.shape[0] == tea_seq_len - 1
+                assert tea_seq_len - tea_prompt_len == stu_seq_len - stu_prompt_len
+                logprobs = torch.zeros(
+                    (stu_seq_len - 1), dtype=input.dtype, layout=input.layout, device=input.device
+                )
+                logprobs[stu_prompt_len - 1:] = input[tea_prompt_len - 1:]
+                rollout_batch[f"teacher_logprobs_{t_name}"].append(logprobs)
+                if "teacher_on_stu_topk_logprobs" in response:
+                    input = response["teacher_on_stu_topk_logprobs"][i]
+                    assert input.shape[0] == tea_seq_len - 1
+                    logprobs = torch.zeros(
+                        (stu_seq_len - 1, input.shape[1]),
+                        dtype=input.dtype,
+                        layout=input.layout,
+                        device=input.device
+                    )
+                    logprobs[stu_prompt_len - 1:, :] = input[tea_prompt_len - 1:, :]
+                    rollout_batch[f"teacher_on_stu_topk_logprobs_{t_name}"].append(logprobs)
+                if "teacher_topk_ids" in response:
+                    input = response["teacher_topk_ids"][i]
+                    assert input.shape[0] == tea_seq_len - 1
+                    ids = torch.full(
+                        (stu_seq_len - 1, input.shape[1]),
+                        -1,
+                        dtype=input.dtype,
+                        layout=input.layout,
+                        device=input.device
+                    )
+                    ids[stu_prompt_len - 1:, :] = input[tea_prompt_len - 1:, :]
+                    rollout_batch[f"teacher_topk_ids_{t_name}"].append(ids)
+                if "teacher_topk_logprobs" in response:
+                    input = response["teacher_topk_logprobs"][i]
+                    assert input.shape[0] == tea_seq_len - 1
+                    logprobs = torch.zeros(
+                        (stu_seq_len - 1, input.shape[1]),
+                        dtype=input.dtype,
+                        layout=input.layout,
+                        device=input.device
+                    )
+                    logprobs[stu_prompt_len - 1:, :] = input[tea_prompt_len - 1:, :]
+                    rollout_batch[f"teacher_topk_ids_{t_name}"].append(logprobs)
+        else:
+            rollout_batch[f"teacher_logprobs_{t_name}"] = response["teacher_logprobs"]
+            if "teacher_on_stu_topk_logprobs" in response:
+                rollout_batch[f"teacher_on_stu_topk_logprobs_{t_name}"] = (
+                    response["teacher_on_stu_topk_logprobs"]
+                )
+            if "teacher_topk_ids" in response:
+                rollout_batch[f"teacher_topk_ids_{t_name}"] = response["teacher_topk_ids"]
+            if "teacher_topk_logprobs" in response:
+                rollout_batch[f"teacher_topk_logprobs_{t_name}"] = (
+                    response["teacher_topk_logprobs"]
+                )
 
     @override
     async def __call__(self, data_iter, num_microbatches, curr_ppo_step):

@@ -8,9 +8,35 @@ import torch
 from gpatch_v4.models.deepseek_v4.weight_export import (
     iter_disk_checkpoint_tensors,
 )
+from gpatch_v4.models.deepseek_v4.checkpoint import (
+    routed_expert_disk_key_order,
+)
 
 
 class TestDsv4WeightExport(unittest.TestCase):
+    def test_routed_expert_checkpoint_order_is_numeric(self):
+        """Avoid lexical ``0, 1, 10, 100`` ordering before MergeModulelist."""
+        keys = [
+            "layers.0.ffn.experts.0.w1.weight",
+            "layers.0.ffn.experts.1.w1.weight",
+            "layers.0.ffn.experts.10.w1.weight",
+            "layers.0.ffn.experts.100.w1.weight",
+            "layers.0.ffn.experts.2.w1.weight",
+            "layers.0.ffn.experts.255.w1.weight",
+        ]
+        ordered = sorted(keys, key=routed_expert_disk_key_order)
+        self.assertEqual(
+            ordered,
+            [
+                "layers.0.ffn.experts.0.w1.weight",
+                "layers.0.ffn.experts.1.w1.weight",
+                "layers.0.ffn.experts.2.w1.weight",
+                "layers.0.ffn.experts.10.w1.weight",
+                "layers.0.ffn.experts.100.w1.weight",
+                "layers.0.ffn.experts.255.w1.weight",
+            ],
+        )
+
     def test_split_and_quantize_fp4_experts(self):
         gate_up = torch.randn(2, 256, 128, dtype=torch.float32)
         exported = dict(
@@ -49,14 +75,14 @@ class TestDsv4WeightExport(unittest.TestCase):
         dense = torch.randn(128, 128, dtype=torch.float32)
         exported = dict(
             iter_disk_checkpoint_tensors(
-                "layers.0.self_attn.q_a_proj.weight",
+                "layers.0.mlp.gate.weight",
                 dense,
                 dtype_format="bf16",
             )
         )
-        self.assertIn("layers.0.attn.wq_a.weight", exported)
-        self.assertEqual(exported["layers.0.attn.wq_a.weight"].dtype, torch.bfloat16)
-        self.assertNotIn("layers.0.attn.wq_a.scale", exported)
+        self.assertIn("layers.0.ffn.gate.weight", exported)
+        self.assertEqual(exported["layers.0.ffn.gate.weight"].dtype, torch.bfloat16)
+        self.assertNotIn("layers.0.ffn.gate.scale", exported)
 
     def test_skip_mtp(self):
         dense = torch.randn(128, 128, dtype=torch.float32)

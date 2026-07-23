@@ -258,9 +258,7 @@ class TrainingConfig(MappingProtocol):
     )
     freeze_router_weight: bool = field(
         default=False,
-        metadata={
-            "help": "freeze MoE router weight (requires_grad=False)."
-        },
+        metadata={"help": "freeze MoE router weight (requires_grad=False)."},
     )
     freeze_router_correction_bias: bool = field(
         default=True,
@@ -347,10 +345,6 @@ class TrainingConfig(MappingProtocol):
         },
     )
     enable_mtp: bool = field(default=False, metadata={"help": "Whether to build mtp model."})
-    mtp_loss_scaling_factor: Optional[float] = field(
-        default=None,
-        metadata={"help": "Scaling factor for mtp loss."},
-    )
     online_mtp_sft: bool = field(
         default=False,
         metadata={"help": "Whether to tune the mtp layers (during rl or sft)."},

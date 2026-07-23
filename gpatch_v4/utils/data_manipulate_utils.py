@@ -1,8 +1,42 @@
-from typing import Dict, List, Union
+from typing import Any, Dict, List, Union
 
 import numpy as np
 import torch
 from tensordict import TensorDict
+
+
+def ensure_sample_hierarchical_id(rb: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+    """Fill missing ``group_id`` / ``traj_id`` / ``segment_id`` on a rollout batch.
+
+    Rules for missing fields:
+    - ``group_id`` <- ``unique_id``
+    - ``traj_id`` <- ``0..n-1`` within each ``unique_id`` group
+    - ``segment_id`` <- ``traj_id``
+
+    Having ``segment_id`` without ``traj_id`` is invalid.
+    """
+    has_traj = "traj_id" in rb
+    has_seg = "segment_id" in rb
+    assert not (has_seg and not has_traj), ("segment_id present without traj_id is not allowed")
+
+    if "group_id" not in rb:
+        assert "unique_id" in rb, "cannot fill group_id without unique_id"
+        rb["group_id"] = list(rb["unique_id"])
+
+    if not has_traj:
+        assert "unique_id" in rb, "cannot fill traj_id without unique_id"
+        traj_ids: List[int] = []
+        counters: Dict[Any, int] = {}
+        for uid in rb["unique_id"]:
+            tid = counters.get(uid, 0)
+            counters[uid] = tid + 1
+            traj_ids.append(tid)
+        rb["traj_id"] = traj_ids
+
+    if not has_seg:
+        rb["segment_id"] = list(rb["traj_id"])
+
+    return rb
 
 
 def union_two_dict(dict1: Dict, dict2: Dict):

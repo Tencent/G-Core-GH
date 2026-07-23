@@ -1,7 +1,7 @@
-if [ -z "${GCORE_GPU}" ]; then
+if [ -z "${GCORE_NNODES}" ]; then
     cp /etc/mpi/hostfile /root/hostfile
 else
-    head -n $GCORE_GPU /etc/mpi/hostfile > /root/hostfile
+    head -n $GCORE_NNODES /etc/mpi/hostfile > /root/hostfile
 fi
 sed -i 's/slots=8/slots=1/g' /root/hostfile
 
@@ -11,7 +11,7 @@ pkill -9 -f python
 export RAY_DEDUP_LOGS=0
 export PYTHONUNBUFFERED=1
 export VLLM_LOG_STATS_INTERVAL=3
-export GPATCH_EXTRA_PROPAGATE_ENV=VLLM_LOG_STATS_INTERVAL
+export GPATCH_EXTRA_PROPAGATE_ENV=VLLM_LOG_STATS_INTERVAL,$GPATCH_EXTRA_PROPAGATE_ENV
 
 mpirun -v --allow-run-as-root \
   --bind-to none --map-by slot --hostfile /root/hostfile \

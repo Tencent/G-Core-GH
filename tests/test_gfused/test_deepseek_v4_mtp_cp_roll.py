@@ -41,8 +41,8 @@ def _roll_worker(rank: int, world_size: int, init_method: str) -> None:
     full = torch.arange(bsz * s_full, dtype=torch.long).view(bsz, s_full)
     local = full[:, start:end].clone()
 
-    rolled1, _ = _roll_tensor_cp(local, shifts=-1, dim=1, cp_group=group)
-    rolled2, _ = _roll_tensor_cp(rolled1, shifts=-1, dim=1, cp_group=group)
+    rolled1, _ = _roll_tensor_cp(local, cp_group=group)
+    rolled2, _ = _roll_tensor_cp(rolled1, cp_group=group)
 
     ref1 = torch.roll(full, shifts=-1, dims=1)
     ref1[:, -1] = 0
@@ -255,7 +255,7 @@ class TestMtpPerDepthValidCount(unittest.TestCase):
 class TestDsv4MtpCpRoll(unittest.TestCase):
     def test_roll_cp_size_1_fallback(self) -> None:
         x = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
-        rolled, _ = _roll_tensor_cp(x, shifts=-1, dim=1, cp_group=None)
+        rolled, _ = _roll_tensor_cp(x, cp_group=None)
         exp = torch.tensor([[2, 3, 4, 0]], dtype=torch.long)
         self.assertTrue(torch.equal(rolled, exp))
 

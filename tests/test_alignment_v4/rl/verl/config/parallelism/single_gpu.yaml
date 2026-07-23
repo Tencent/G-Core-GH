@@ -1,0 +1,23 @@
+# @package _global_
+# single GPU, all parallelism off (TP=PP=CP=1 for actor & ref, rollout TP=1).
+# Launch with NGPUS_PER_NODE=1 (see scripts/run.sh).
+actor_rollout_ref:
+  model:
+    # thd sequence packing (data_format="thd"): TP=1/CP=1 -> align_size=1 -> zero
+    # per-seq padding, varlen flash attention via cu_seqlens. Same pack impl as
+    # gcore (ppo_pack_seq=True), so packed inputs align bit-level.
+    use_remove_padding: True
+  actor:
+    megatron:
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+  rollout:
+    tensor_model_parallel_size: 1
+    agent:
+      num_workers: 8
+  ref:
+    megatron:
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1

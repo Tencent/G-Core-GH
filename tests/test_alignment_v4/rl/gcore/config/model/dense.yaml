@@ -1,0 +1,17 @@
+# @package _global_
+# Dense Qwen3-0.6B model variant (the alignment target shared with verl).
+policy:
+  model_arch: qwen3
+  hf_model_path: "hf-hub/Qwen/Qwen3-0.6B"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3-0.6B"
+  ref_hf_model_path: "hf-hub/Qwen/Qwen3-0.6B"
+  override_transformer_config:
+    # 对齐 verl actor 的 activation recompute（full/uniform/1）。
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+
+sampler:
+  model_info:
+    - model_arch: qwen3
+      hf_model_path: "hf-hub/Qwen/Qwen3-0.6B"

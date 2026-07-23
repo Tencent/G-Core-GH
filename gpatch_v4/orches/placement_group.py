@@ -22,6 +22,10 @@ from gpatch_v4.orches.resource_allocator import (
     allocation_from_config,
 )
 from gpatch_v4.utils.common_utils import logging_rank0
+from gpatch_v4.utils.placement import (
+    is_partial_colocated,
+    validate_partial_colocated_config,
+)
 
 
 @ray.remote(num_gpus=1)
@@ -295,6 +299,26 @@ def create_placement_groups(config):
             gen_rm_offset = 0
             bt_rm_offset = 0
             teacher_offset = 0
+        elif is_partial_colocated(config):
+            validate_partial_colocated_config(config)
+            assert isinstance(config, RlConfig
+                             ), ("partial_colocated placement currently supports only RlConfig")
+            policy_num_gpus = allocation.role_num_gpus("policy")
+            sampler_num_gpus = allocation.role_num_gpus("sampler")
+            gen_rm_num_gpus = allocation.role_num_gpus("gen_rm")
+            assert policy_num_gpus == sampler_num_gpus + gen_rm_num_gpus, (
+                "partial_colocated requires policy GPU count to equal "
+                f"sampler + gen_rm, got {policy_num_gpus} != "
+                f"{sampler_num_gpus} + {gen_rm_num_gpus}"
+            )
+            bt_rm_num_gpus = 0
+            teacher_num_gpus = 0
+
+            num_gpus = policy_num_gpus
+            rollout_offset = 0
+            gen_rm_offset = sampler_num_gpus
+            bt_rm_offset = policy_num_gpus
+            teacher_offset = policy_num_gpus
         elif config.placement_type == "disaggregated":
             # Each role may specify its own num_gpus_per_node for sub-node allocation.
             # For example, sampler and gen_rm can each use 4 GPUs on a single 8-GPU node.

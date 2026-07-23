@@ -18,6 +18,10 @@ from gpatch_v4.trainer.grpo_single_ctrl_trainer import GrpoSingleCtrlTrainer
 # ---- Fakes ---------------------------------------------------------- #
 
 
+class RlConfig(SimpleNamespace):
+    pass
+
+
 class _FakeEngineGroup:
     """No-op stand-in for sampler_group / gen_rm_group."""
     async def write_engine_log_marker(self, *args, **kwargs):
@@ -130,6 +134,9 @@ class _FakeTrainGroup:
     async def save_checkpoint(self, step: int):
         self.events.append(("save_checkpoint", step))
 
+    async def prepare_for_final_save(self):
+        self.events.append(("prepare_for_final_save", ))
+
     async def log_memory(self, tag: str):
         pass
 
@@ -140,7 +147,8 @@ def _make_config(
     placement_type: str = "disaggregated",
 ) -> Any:
     is_colocate = placement_type == "colocate"
-    return SimpleNamespace(
+    cfg_cls = RlConfig if placement_type == "partial_colocated" else SimpleNamespace
+    cfg = cfg_cls(
         placement_type=placement_type,
         training=SimpleNamespace(
             async_rollout=not is_colocate,
@@ -148,12 +156,38 @@ def _make_config(
             rollout_max_staleness=max_stale,
             save_interval=save_interval,
             load_aware_sampler_dispatch_stagger_s=0,
+            use_gen_rm_reward=placement_type == "partial_colocated",
+            use_bt_rm_reward=False,
         ),
         debug=SimpleNamespace(
             trainer_return_ppo_step_metrics=False,
             skip_rollout_load_from_disk=False,
         ),
     )
+    if placement_type == "partial_colocated":
+        dc_policy = SimpleNamespace(nnodes=2, num_gpus_per_node=8)
+        dc_sampler = SimpleNamespace(
+            nnodes=1,
+            num_gpus_per_node=8,
+            tensor_model_parallel_size=8,
+            pipeline_model_parallel_size=1,
+        )
+        dc_gen_rm = SimpleNamespace(nnodes=1, num_gpus_per_node=8)
+        cfg.policy = SimpleNamespace(dist_config=dc_policy)
+        cfg.sampler = SimpleNamespace(
+            dist_config=dc_sampler,
+            backend="sglang",
+            model_info=[SimpleNamespace()],
+            infer_engine_configs=[SimpleNamespace(dist_config=dc_sampler)],
+        )
+        cfg.gen_rm = SimpleNamespace(
+            dist_config=dc_gen_rm,
+            backend="sglang",
+            reward_model_info=[SimpleNamespace()],
+            infer_engine_configs=[SimpleNamespace(dist_config=dc_sampler)],
+        )
+        cfg.bt_rm = SimpleNamespace(dist_config=SimpleNamespace(nnodes=0, num_gpus_per_node=8))
+    return cfg
 
 
 async def _run_loop(
@@ -199,10 +233,9 @@ def _save_events(events):
 
 
 def _update_events_non_initial(events):
-    """The very first ``update_weights`` call is ``offload=True`` (init);
-    return only the mid-training updates (``offload=False``).
-    """
-    return [e for e in events if e[0] == "update_weights" and e[1] is False]
+    """Return update events after the first initialization update."""
+    updates = [e for e in events if e[0] == "update_weights"]
+    return updates[1:]
 
 
 # ---- Tests ---------------------------------------------------------- #
@@ -253,6 +286,20 @@ class SlidingPrefetchLoopTest(unittest.IsolatedAsyncioTestCase):
         update_events = [e for e in events if e[0] == "update_weights"]
         assert update_events
         assert all(e[1] is True for e in update_events)
+
+    async def test_partial_colocated_drains_rollout_before_training(self):
+        """partial_colocated sleeps inference engines before policy train_step."""
+        events, _ = await _run_loop(
+            max_stale=0,
+            total_ppo_step=1,
+            placement_type="partial_colocated",
+        )
+
+        collect_idx = events.index(("collect", 0))
+        train_idx = next(i for i, e in enumerate(events) if e[0] == "train_step")
+        wait_indices = [i for i, e in enumerate(events) if e[0] == "wait_all_inflight"]
+
+        assert any(collect_idx < i < train_idx for i in wait_indices)
 
     async def test_colocate_rejects_nonzero_staleness(self):
         trainer = object.__new__(GrpoSingleCtrlTrainer)

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from gpatch_v4.models.deepseek_v4.cp import cp_chunk_data
 from gpatch_v4.models.deepseek_v4.thd import (
     PackedSeqParams,
     _PerMLayout,
@@ -280,6 +281,86 @@ class TestCpSliceLayout(unittest.TestCase):
         self.assertIsNot(sliced, layout)
         self.assertIsNot(sliced.per_m[4], layout.per_m[4])
 
+    def test_cp_chunk_data_caches_zigzag_split_sizes(self):
+        seqs = [
+            torch.arange(100, device=DEVICE),
+            torch.arange(300, device=DEVICE),
+            torch.arange(500, device=DEVICE),
+        ]
+        tokens, position_ids, _, psp = pack_sequences(
+            seqs,
+            None,
+            config=_config(),
+            pad_to_multiple_of=128,
+            cp_size=4,
+        )
+        self.assertIsNone(psp.split_sizes_cont_to_zz)
+        self.assertIsNone(psp.split_sizes_zz_to_cont)
+        self.assertIsNone(psp.order_cont_to_zz)
+
+        expected_cont_to_zz = (
+            [80, 80, 64, 32],
+            [48, 48, 64, 96],
+            [64, 64, 64, 64],
+            [64, 64, 64, 64],
+        )
+        expected_zz_to_cont = (
+            [80, 48, 64, 64],
+            [80, 48, 64, 64],
+            [64, 64, 64, 64],
+            [32, 96, 64, 64],
+        )
+        cp_rank_ids = []
+        for seg_len in (128, 384, 512):
+            chunk_len = seg_len // 8
+            for rank in (0, 1, 2, 3, 3, 2, 1, 0):
+                cp_rank_ids.extend([rank] * chunk_len)
+        cp_rank_ids = torch.tensor(cp_rank_ids, device=DEVICE).view(4, 256)
+
+        s_local = tokens.shape[1] // 4
+        local_arange = torch.arange(s_local, device=DEVICE)
+        for cp_rank in range(4):
+            *_, local_psp = cp_chunk_data(
+                cp_rank,
+                4,
+                tokens=tokens,
+                position_ids=position_ids,
+                packed_seq_params=psp,
+            )
+            assert local_psp is not None
+            self.assertEqual(
+                local_psp.split_sizes_cont_to_zz,
+                expected_cont_to_zz[cp_rank],
+            )
+            self.assertEqual(
+                local_psp.split_sizes_zz_to_cont,
+                expected_zz_to_cont[cp_rank],
+            )
+            self.assertTrue(torch.equal(
+                local_psp.order_cont_to_zz,
+                torch.argsort(cp_rank_ids[cp_rank], stable=True),
+            ))
+
+            zz_idx = torch.cat([
+                i * s_local + local_arange[cp_rank_ids[i] == cp_rank]
+                for i in range(4)
+            ])
+            layout = local_psp.layout
+            assert layout is not None
+            self.assertIsNotNone(layout.seg_id_per_token_zz)
+            self.assertEqual(layout.seg_id_per_token_zz.shape, (s_local,))
+            self.assertTrue(torch.equal(
+                layout.seg_id_per_token_zz,
+                psp.layout.seg_id_per_token_full[zz_idx],
+            ))
+            for m, per_m in layout.per_m.items():
+                self.assertIsNotNone(per_m.causal_threshold_per_token_zz)
+                self.assertEqual(per_m.causal_threshold_per_token_zz.shape, (s_local,))
+                self.assertTrue(torch.equal(
+                    per_m.causal_threshold_per_token_zz,
+                    psp.layout.per_m[m].causal_threshold_per_token[zz_idx],
+                ))
+
     def test_with_prefix_meta_values(self):
         """pad_token_mask_with_prefix / first_of_seg_window_mask_with_prefix
         carry the per-rank-with-prefix view of pad / seg-boundary flags.
@@ -395,18 +476,18 @@ class TestPackSequences(unittest.TestCase):
         self.assertTrue(torch.equal(pos.squeeze(0), expected))
 
     def test_labels_mask(self):
-        seqs = [self._seq(s, 0) for s in [3, 5]]
-        labs_in = [torch.full((3,), 7, dtype=torch.long, device=DEVICE),
-                   torch.full((5,), 9, dtype=torch.long, device=DEVICE)]
+        # Mirror _sft_train_thd: shift each sample before packing so the final
+        # effective label remains a valid next-token target (for example EOS).
+        raw_seqs = [self._seq(4, 10), self._seq(6, 20)]
+        seqs = [seq[:-1] for seq in raw_seqs]
+        labs_in = [seq[1:] for seq in raw_seqs]
         _, _, labs, _ = pack_sequences(
             seqs, labs_in, config=_config({"compressed_sparse_attention": 4}), pad_to_multiple_of=4,
         )
-        # seg 0 (padded len 4): real [7,7,7] then pad [-100]; seg-final = -100
-        # → [7, 7, -100, -100]
-        # seg 1 (padded len 8): real [9,9,9,9,9] then pad [-100]*3; seg-final = -100
-        # → [9, 9, 9, 9, -100, -100, -100, -100]
+        # Only pad positions are ignored; segment-final targets 13 and 25
+        # must remain trainable.
         expected = torch.tensor(
-            [7, 7, -100, -100, 9, 9, 9, 9, -100, -100, -100, -100],
+            [11, 12, 13, -100, 21, 22, 23, 24, 25, -100, -100, -100],
             dtype=torch.long, device=DEVICE,
         )
         assert labs is not None

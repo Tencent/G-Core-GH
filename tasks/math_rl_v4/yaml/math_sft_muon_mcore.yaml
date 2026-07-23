@@ -48,6 +48,7 @@ optimizer:
     muon_nesterov: true
     muon_num_ns_steps: 5
     muon_extra_scale_factor: 0.2
+    use_layer_wise_distributed_optimizer: true
 
 data:
   data_pathes:

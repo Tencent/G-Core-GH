@@ -1,0 +1,9 @@
+# @package _global_
+# Dense Qwen3-0.6B model variant (the alignment target shared with gcore). verl
+# infers the arch from the HF config, so this is just the HF path + grad ckpt
+# (recompute granularity/method live in parallelism via actor.megatron). The
+# ref model reuses the actor's path, and rollout loads the same weights.
+actor_rollout_ref:
+  model:
+    path: "hf-hub/Qwen/Qwen3-0.6B"
+    enable_gradient_checkpointing: True

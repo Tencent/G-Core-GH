@@ -152,8 +152,9 @@ class Wemm3EmbeddingPrepareDataForward(PrepareDataForward):
             if "vision_data" in batch and batch["vision_data"] is not None:
                 vision_grid_thw_l.append(batch["vision_grid_thw"])
                 vision_data_l.append(batch["vision_data"])
-            image_input_mask = pad_or_truncate_last_dim(batch["image_input_mask"], seq_len, 0)
-            image_input_mask_l.append(image_input_mask)
+            if "image_input_mask" in batch and batch["image_input_mask"] is not None:
+                image_input_mask = pad_or_truncate_last_dim(batch["image_input_mask"], seq_len, 0)
+                image_input_mask_l.append(image_input_mask)
 
             if "input_features" in batch and batch["input_features"] is not None:
                 input_features = pad_or_truncate_last_dim(

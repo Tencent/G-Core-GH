@@ -26,9 +26,7 @@ import torch
 def _load_fp_quantize():
     """Load ``fp_quantize`` by file path to avoid ``gpatch_v4`` package side effects."""
     repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    path = os.path.join(
-        repo, "gpatch_v4", "models", "deepseek_v4", "fp_quantize.py"
-    )
+    path = os.path.join(repo, "gpatch_v4", "models", "deepseek_v4", "fp_quantize.py")
     name = "gpatch_v4_dsv4_fp_quantize_standalone"
     if name in sys.modules:
         return sys.modules[name]
@@ -47,8 +45,22 @@ quant_fp8_e4m3_scale_e8m0 = _fpq.quant_fp8_e4m3_scale_e8m0
 
 FP4_TABLE = torch.tensor(
     [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
     ],
     dtype=torch.float32,
 )
@@ -68,7 +80,7 @@ def is_wo_a_weight(name: str) -> bool:
 
 def scale_key(weight_key: str) -> str:
     assert weight_key.endswith(".weight"), weight_key
-    return weight_key[: -len(".weight")] + ".scale"
+    return weight_key[:-len(".weight")] + ".scale"
 
 
 def dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -76,9 +88,8 @@ def dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     return dequant_fp4_e2m1_fp8_scale_e8m0_packed(weight, scale)
 
 
-def cast_e2m1fn_to_e4m3fn(
-    x: torch.Tensor, scale: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def cast_e2m1fn_to_e4m3fn(x: torch.Tensor,
+                          scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Lossless FP4 (int8-packed) -> FP8 e4m3 with 128x128 E8M0 outer scale.
 
     Copied from DeepSeek-V4-Flash ``inference/convert.py``. The per-32 E8M0
@@ -115,32 +126,28 @@ def cast_e2m1fn_to_e4m3fn(
     return x.to(torch.float8_e4m3fn), scale_max_offset_bits.squeeze(-1).to(torch.float8_e8m0fnu)
 
 
-def official_expert_to_sgl(
-    weight: torch.Tensor, scale: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def official_expert_to_sgl(weight: torch.Tensor,
+                           scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Official FP4 expert -> SGL FP8 expert (float32 128x128 scale)."""
     q, s = cast_e2m1fn_to_e4m3fn(weight, scale)
     return q, s.float().contiguous()
 
 
-def sgl_expert_to_official(
-    weight: torch.Tensor, scale: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def sgl_expert_to_official(weight: torch.Tensor,
+                           scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """SGL FP8 expert -> official FP4 packed expert (E8M0 1x32 scale)."""
     full = dequant_fp8_block(weight, scale).float()
     return quant_fp4_e2m1_scale_e8m0_packed(full, block_size=(1, 32))
 
 
-def official_dense_to_sgl(
-    weight: torch.Tensor, scale: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def official_dense_to_sgl(weight: torch.Tensor,
+                          scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Dense FP8: keep weight bytes, cast E8M0 scale -> float32."""
     return weight, scale.float().contiguous()
 
 
-def sgl_dense_to_official(
-    weight: torch.Tensor, scale: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def sgl_dense_to_official(weight: torch.Tensor,
+                          scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Dense FP8: keep weight bytes, cast float32 scale -> E8M0."""
     return weight, scale.float().to(torch.float8_e8m0fnu).contiguous()
 

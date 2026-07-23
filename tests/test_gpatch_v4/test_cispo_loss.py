@@ -12,6 +12,7 @@ from gpatch_v4.training_backend.loss_factory import (
     PolicyLossInput,
     cispo_loss_func,
     grpo_loss_func,
+    is_seq_mean_rl_loss_fn,
 )
 
 _REDUCE_METRICS_PATH = (
@@ -78,6 +79,8 @@ def _make_loss_input(
 
 class TestCispoBasic:
     """CISPO loss returns valid outputs and flows gradients."""
+    def test_registered_for_global_seq_mean_normalization(self):
+        assert is_seq_mean_rl_loss_fn(cispo_loss_func)
 
     @patch(_REDUCE_METRICS_PATH)
     def test_returns_loss_and_metrics(self, mock_reduce):
@@ -88,8 +91,10 @@ class TestCispoBasic:
 
         assert bwd_loss.dim() == 0
         assert not torch.isnan(bwd_loss)
-        for key in ["loss", "policy_loss", "ppo_ratio", "ppo_ratio_clamped",
-                     "scaled_entropy", "grpo_kl_loss", "cispo/clipfrac"]:
+        for key in [
+            "loss", "policy_loss", "ppo_ratio", "ppo_ratio_clamped", "scaled_entropy",
+            "grpo_kl_loss", "cispo/clipfrac"
+        ]:
             assert key in metrics, f"missing metric: {key}"
 
     @patch(_REDUCE_METRICS_PATH)
@@ -103,10 +108,120 @@ class TestCispoBasic:
         assert loss_input.curr_log_probs.grad is not None
         assert loss_input.curr_log_probs.grad.abs().sum() > 0
 
+    @patch(_REDUCE_METRICS_PATH)
+    def test_thd_backward_is_pack_partition_invariant(self, mock_reduce):
+        """Uneven THD packs must accumulate the same CISPO numerator."""
+        torch.manual_seed(7)
+        lengths = [3, 5, 2]
+        total = sum(lengths)
+        curr = torch.randn(1, total, requires_grad=True)
+        prev = curr.detach() + 0.1 * torch.randn(1, total)
+        advantages = torch.randn(1, total)
+        mask = torch.ones(1, total)
+        entropy = torch.zeros(1, total)
+        config = _make_config(grpo_kl_loss_beta=0.0)
+
+        def run(start, end, boundaries):
+            loss_input = PolicyLossInput(
+                advantages=advantages[:, start:end],
+                prev_log_probs=prev[:, start:end],
+                ref_log_probs=None,
+                curr_log_probs=curr[:, start:end],
+                response_mask=mask[:, start:end],
+                scaled_entropy=torch.tensor(0.0),
+                per_token_entropy=entropy[:, start:end],
+                cu_seqlens_padded=torch.tensor(boundaries),
+            )
+            return cispo_loss_func(config, loss_input)[0]
+
+        full = run(0, total, [0, 3, 8, 10])
+        first = run(0, 3, [0, 3])
+        second = run(3, total, [0, 5, 7])
+        assert torch.allclose(full, first + second, atol=1e-6)
+
+    @patch(_REDUCE_METRICS_PATH)
+    def test_per_token_mode_returns_token_sum(self, mock_reduce):
+        curr = torch.tensor([[0.2, -0.3, 0.7]], requires_grad=True)
+        loss_input = PolicyLossInput(
+            advantages=torch.ones_like(curr),
+            prev_log_probs=curr.detach().clone(),
+            ref_log_probs=None,
+            curr_log_probs=curr,
+            response_mask=torch.ones_like(curr),
+            scaled_entropy=torch.tensor(0.0),
+            per_token_entropy=torch.zeros_like(curr),
+            calculate_per_token_loss=True,
+        )
+
+        bwd_loss, _ = cispo_loss_func(_make_config(grpo_kl_loss_beta=0.0), loss_input)
+
+        assert torch.allclose(bwd_loss, -curr.sum())
+
+    @patch(_REDUCE_METRICS_PATH)
+    def test_bshd_and_thd_have_equal_loss_and_valid_token_gradients(self, mock_reduce):
+        config = _make_config(grpo_kl_loss_beta=0.0)
+        bshd_curr = torch.tensor(
+            [[-0.2, -0.4, 0.0], [-0.1, -0.3, -0.5]],
+            requires_grad=True,
+        )
+        bshd_prev = torch.tensor([[-0.3, -0.35, 0.0], [-0.2, -0.25, -0.6]])
+        bshd_advantages = torch.tensor([[1.0, -0.5, 0.0], [0.0, 0.25, 0.75]])
+        bshd_mask = torch.tensor([[1.0, 1.0, 0.0], [0.0, 1.0, 1.0]])
+        bshd_input = PolicyLossInput(
+            advantages=bshd_advantages,
+            prev_log_probs=bshd_prev,
+            ref_log_probs=None,
+            curr_log_probs=bshd_curr,
+            response_mask=bshd_mask,
+            scaled_entropy=torch.tensor(0.0),
+            per_token_entropy=torch.zeros_like(bshd_curr),
+        )
+
+        thd_curr = torch.zeros(1, 8)
+        thd_prev = torch.zeros(1, 8)
+        thd_advantages = torch.zeros(1, 8)
+        thd_mask = torch.zeros(1, 8)
+        thd_curr[0, 0:2] = bshd_curr.detach()[0, 0:2]
+        thd_curr[0, 4:7] = bshd_curr.detach()[1, 0:3]
+        thd_curr.requires_grad_()
+        thd_prev[0, 0:2] = bshd_prev[0, 0:2]
+        thd_prev[0, 4:7] = bshd_prev[1, 0:3]
+        thd_advantages[0, 0:2] = bshd_advantages[0, 0:2]
+        thd_advantages[0, 4:7] = bshd_advantages[1, 0:3]
+        thd_mask[0, 0:2] = bshd_mask[0, 0:2]
+        thd_mask[0, 4:7] = bshd_mask[1, 0:3]
+        thd_input = PolicyLossInput(
+            advantages=thd_advantages,
+            prev_log_probs=thd_prev,
+            ref_log_probs=None,
+            curr_log_probs=thd_curr,
+            response_mask=thd_mask,
+            scaled_entropy=torch.tensor(0.0),
+            per_token_entropy=torch.zeros_like(thd_curr),
+            cu_seqlens_padded=torch.tensor([0, 4, 8]),
+        )
+
+        bshd_loss, _ = cispo_loss_func(config, bshd_input)
+        thd_loss, _ = cispo_loss_func(config, thd_input)
+        assert torch.allclose(thd_loss, bshd_loss, atol=1e-6)
+
+        bshd_loss.backward()
+        thd_loss.backward()
+        assert torch.allclose(
+            thd_curr.grad[0, 0:2],
+            bshd_curr.grad[0, 0:2],
+            atol=1e-6,
+        )
+        assert torch.allclose(
+            thd_curr.grad[0, 4:7],
+            bshd_curr.grad[1, 0:3],
+            atol=1e-6,
+        )
+        assert torch.count_nonzero(thd_curr.grad[0, [2, 3, 7]]) == 0
+
 
 class TestCispoVsGrpo:
     """CISPO preserves gradients for all tokens, unlike GRPO which drops clipped tokens."""
-
     @patch(_REDUCE_METRICS_PATH)
     def test_cispo_all_tokens_have_gradient(self, mock_reduce):
         # 用很大的 ratio 偏移确保部分 token 会被 clip
@@ -172,7 +287,6 @@ class TestCispoVsGrpo:
 
 
 class TestCispoSkipPrevLogps:
-
     @patch(_REDUCE_METRICS_PATH)
     def test_ratio_one_when_skip(self, mock_reduce):
         # skip_prev_logps → ratio = 1.0，等价于 REINFORCE
@@ -196,7 +310,6 @@ class TestCispoSkipPrevLogps:
 
 
 class TestCispoClipRatios:
-
     @patch(_REDUCE_METRICS_PATH)
     def test_asymmetric_clip(self, mock_reduce):
         # 论文推荐 eps_low=1.0（实质禁用下界）+ eps_high=0.2
@@ -236,7 +349,6 @@ class TestCispoClipRatios:
 
 
 class TestCispoNoRef:
-
     @patch(_REDUCE_METRICS_PATH)
     def test_no_kl_when_no_ref(self, mock_reduce):
         config = _make_config(grpo_kl_loss_beta=0.01)
@@ -251,7 +363,6 @@ class TestCispoNoRef:
 
 
 class TestCispoSampleMask:
-
     @patch(_REDUCE_METRICS_PATH)
     def test_sample_mask_metric(self, mock_reduce):
         config = _make_config()

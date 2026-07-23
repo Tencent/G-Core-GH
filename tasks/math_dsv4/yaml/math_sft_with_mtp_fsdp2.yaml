@@ -45,6 +45,7 @@ policy:
     expert_model_parallel_size: 4   # must divide world_size; opts into HpModule path
     context_parallel_size: 4
   model_arch: "deepseek_v4"
+  ppo_pack_seq: True
   attn_implementation: "fused"
   indexer_backend: "fused"
   fp8: false                      # TE FP8 block-scaling MoE grouped GEMM

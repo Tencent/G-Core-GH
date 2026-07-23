@@ -8,6 +8,7 @@ class TrainReporterSingleton:
     """Singleton managing TensorBoard and WandB writers for training metrics."""
     tb_writer = None
     wandb_writer = None
+    verl_metric_map = None
 
     @classmethod
     def get_tensorboard_writer(cls):
@@ -67,7 +68,37 @@ class TrainReporterSingleton:
             raise RuntimeError("WandB writer already initialized.")
 
     @classmethod
+    def _translate_to_verl(cls, metrics: dict) -> dict:
+        """Translate gcore metrics into verl-named metrics per ``verl_metric_map``.
+
+        Parameters
+        ----------
+        metrics : dict
+            Current gcore metrics for this step.
+
+        Returns
+        -------
+        dict
+            Newly produced ``{verl_key: value}`` entries. gcore keys absent from
+            this step or mapped to ``None`` are skipped; a list target fans the
+            same value out to multiple verl keys.
+        """
+        translated = {}
+        for gcore_key, verl_target in cls.verl_metric_map.items():
+            if verl_target is None or gcore_key not in metrics:
+                continue
+            targets = verl_target if isinstance(verl_target, list) else [verl_target]
+            for verl_key in targets:
+                translated[verl_key] = metrics[gcore_key]
+        return translated
+
+    @classmethod
     def log_and_report(cls, metrics: dict, step: int, log_prefix: str):
+        if cls.verl_metric_map is not None:
+            metrics = {**metrics, **cls._translate_to_verl(metrics)}
+            # gcore logs ppo_step 0-based; verl ("we start from step 1") is
+            # 1-based. Shift to verl's convention so curves overlay on the same x.
+            step = step + 1
         metrics = reorder_dict_keys_by_prefix(metrics, "policy")
         if cls.tb_writer is not None:
             for key, val in metrics.items():
@@ -102,6 +133,13 @@ def init_train_reporter_singleton(report_config, config):
         TrainReporterSingleton._set_tensorboard_writer(report_config)
     if report_config.report_to in ["wandb", "both"]:
         TrainReporterSingleton._set_wandb_writer(report_config, config)
+    if report_config.verl_metric_map_path is not None:
+        import yaml
+        map_path = report_config.verl_metric_map_path
+        assert os.path.exists(map_path), f"verl_metric_map_path not found: {map_path}"
+        with open(map_path) as f:
+            TrainReporterSingleton.verl_metric_map = yaml.safe_load(f)
+        log(f"loaded verl metric map from {map_path}")
 
 
 def _ensure_dir(path):

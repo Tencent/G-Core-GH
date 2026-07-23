@@ -1,0 +1,23 @@
+# @package _global_
+# Hybrid parallelism: single-node TP=PP=CP=2 (matches gcore topology/hybrid_parallelism).
+# Keeps thd packing on (use_remove_padding=True) so both sides feed varlen thd inputs.
+# WIP: step2 alignment is not yet validated. Launch with NGPUS_PER_NODE=8 (the env
+# feeds the multi-node ray bootstrap; trainer.n_gpus_per_node below feeds verl).
+trainer:
+  n_gpus_per_node: 8
+
+actor_rollout_ref:
+  model:
+    use_remove_padding: True
+  actor:
+    megatron:
+      tensor_model_parallel_size: 2
+      pipeline_model_parallel_size: 2
+      context_parallel_size: 2
+  rollout:
+    tensor_model_parallel_size: 2
+  ref:
+    megatron:
+      tensor_model_parallel_size: 2
+      pipeline_model_parallel_size: 2
+      context_parallel_size: 2

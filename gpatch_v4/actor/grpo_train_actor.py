@@ -49,6 +49,10 @@ from gpatch_v4.training_backend import (
     TrainingEngineFactory,
     register_custom_loss_fn,
 )
+from gpatch_v4.training_backend.loss import is_loss_registered
+from gpatch_v4.training_backend.loss import (
+    register_custom_loss_fn as register_backend_custom_loss_fn,
+)
 from gpatch_v4.utils import (
     BUILDIN_FILTER_SAMPLING_STRATEGIES,
     BroadcastUtils,
@@ -78,6 +82,10 @@ from gpatch_v4.utils import (
     sync_cuda_and_get_time,
 )
 from gpatch_v4.utils.common_utils import compress_ppo_save_train_data
+from gpatch_v4.utils.placement import (
+    is_partial_colocated,
+    validate_partial_colocated_config,
+)
 from gpatch_v4.utils.resumable_distributed_sampler import ResumableDistributedSampler
 from gpatch_v4.utils.test_utils import save_data
 from gpatch_v4.utils.training_utils import align_sampler_num_samples
@@ -161,6 +169,8 @@ class GrpoTrainActor(
                             rb["rollout_log_probs"].clone().detach().to(torch.bfloat16),
                         "pre_logprobs":
                             rb["logprobs"].clone().detach().to(torch.bfloat16),
+                        "response_mask":
+                            rb["mask"].clone().detach().to(torch.float32),
                         "advantages":
                             rb["advantages"].detach().to(torch.bfloat16),
                     }
@@ -206,6 +216,8 @@ class GrpoTrainActor(
                 f"colocate mode requires policy nnodes ({policy_nnodes}) "
                 f"== sampler nnodes ({sampler_nnodes})"
             )
+        if is_partial_colocated(self.config):
+            validate_partial_colocated_config(self.config)
         if self.config.training.auto_load_from_save_ckpt:
             if os.path.exists(
                 os.path.join(
@@ -224,7 +236,27 @@ class GrpoTrainActor(
                 training_config.ppo_filter_samplings_path,
                 training_config.ppo_filter_samplings_name,
             )
-        if self.config.ppo.loss_func not in BUILDIN_LOSS_FUNC:
+        not_use_legacy_loss = (
+            self.config.training.training_backend == "mcore" and not self.config.ppo.use_legacy_loss
+        )
+        if not_use_legacy_loss:
+            if not is_loss_registered("mcore", self.config.ppo.loss_func):
+                assert self.config.ppo.loss_func_py_path is not None, (
+                    f"Unregistered MCore loss '{self.config.ppo.loss_func}' requires "
+                    "ppo.loss_func_py_path"
+                )
+                assert self.config.ppo.loss_func_py_name is not None, (
+                    f"Unregistered MCore loss '{self.config.ppo.loss_func}' requires "
+                    "ppo.loss_func_py_name"
+                )
+                register_backend_custom_loss_fn(
+                    backend="mcore",
+                    loss_name=self.config.ppo.loss_func,
+                    py_path=self.config.ppo.loss_func_py_path,
+                    fn_name=self.config.ppo.loss_func_py_name,
+                )
+            #TODO: FSDP2 RL still resolves losses through loss_factory.py.
+        elif self.config.ppo.loss_func not in BUILDIN_LOSS_FUNC:
             assert self.config.ppo.loss_func_py_path is not None and self.config.ppo.loss_func_py_name is not None, "Custom loss function must be provided"
             register_custom_loss_fn(
                 self.config.ppo.loss_func,
@@ -309,10 +341,16 @@ class GrpoTrainActor(
             rollout_batches = rebalanced_batches
 
         skip_prev = self.config.ppo.skip_prev_logps
-        ref_logprobs, prev_logprobs = self.policy_engine.compute_log_probs(
+        logprobs_output = self.policy_engine.compute_log_probs(
             rollout_batches,
             compute_pre_logps=not skip_prev,
         )
+        if self.config.ppo.loss_func == "steer":
+            ref_logprobs, prev_logprobs, prev_per_token_entropies = logprobs_output
+        else:
+            ref_logprobs, prev_logprobs = logprobs_output
+            prev_per_token_entropies = None
+
         cpu_barrier()
 
         if not self.config.policy.without_ref:
@@ -326,6 +364,9 @@ class GrpoTrainActor(
         else:
             for rb, prev_logps in zip(rollout_batches, prev_logprobs, strict=True):
                 rb["logprobs"] = prev_logps
+            if prev_per_token_entropies is not None:
+                for rb, entropies in zip(rollout_batches, prev_per_token_entropies, strict=True):
+                    rb["prev_per_token_entropies"] = entropies
 
         if balance_dp_seqlen:
             rollout_batches = DPBalanceHelper.restore_log_probs_to_original_batches(
@@ -333,6 +374,8 @@ class GrpoTrainActor(
                 rollout_batches,
                 restore_info,
                 without_ref=self.config.policy.without_ref,
+                extra_keys=["prev_per_token_entropies"]
+                if prev_per_token_entropies is not None else None,
             )
 
         return rollout_batches
@@ -359,6 +402,10 @@ class GrpoTrainActor(
             data["src_dp"] = src_dp
 
         skip_prev = self.config.ppo.skip_prev_logps
+        # 暂时先 assert 掉
+        assert self.config.ppo.loss_func != "steer", (
+            "loss_func='steer' does not support dynamic_context_parallel."
+        )
         ref_logprobs, prev_logprobs = self.policy_engine.compute_log_probs_dynamic_cp(
             rollout_batches,
             compute_pre_logps=not skip_prev,

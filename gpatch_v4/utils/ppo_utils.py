@@ -80,6 +80,46 @@ def count_advantage_clip_samples(
     return n_lower, n_upper, len(original_advantages)
 
 
+def align_token_level_tensors_to_logprobs(
+    tensors: List[torch.Tensor],
+    logprobs: List[torch.Tensor],
+    sequence_lengths: List[Union[int, torch.Tensor]],
+    truncate_head: bool,
+) -> List[torch.Tensor]:
+    """Align full-token tensors to the log-probability axis.
+
+    Full-token tensors have one entry per token (length ``S``), while
+    next-token log probabilities have length ``S - 1``. Inputs are shifted
+    according to ``truncate_head`` and then right-padded to the corresponding
+    log-probability length.
+    """
+    assert len(tensors) == len(logprobs) == len(sequence_lengths)
+
+    aligned = []
+    for tensor, logps, sequence_length in zip(tensors, logprobs, sequence_lengths, strict=True):
+        assert tensor.ndim == 1, f"expected a 1D token-level tensor, got {tensor.ndim}D"
+        assert logps.ndim == 1, f"expected 1D logprobs, got {logps.ndim}D"
+
+        sequence_length = int(sequence_length)
+        tensor_length = tensor.size(-1)
+        logprobs_length = logps.size(-1)
+
+        assert tensor_length == sequence_length, (
+            "token-level tensor must use the full, unpadded token axis: "
+            f"{tensor_length=} != {sequence_length=}"
+        )
+        tensor = tensor[1:] if truncate_head else tensor[:-1]
+
+        aligned.append(
+            torch.nn.functional.pad(
+                tensor,
+                (0, logprobs_length - tensor.size(-1)),
+                value=0,
+            ).contiguous()
+        )
+    return aligned
+
+
 def create_response_mask(
     values: List[torch.Tensor],
     prompt_lengths: List[torch.Tensor],

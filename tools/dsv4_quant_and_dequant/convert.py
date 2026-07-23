@@ -38,7 +38,6 @@ from typing import Any
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import save_file
 from tqdm import tqdm
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -56,6 +55,8 @@ from tools.dsv4_quant_and_dequant.kernels import (  # noqa: E402
     sgl_expert_to_official,
     sgl_wo_a_to_official,
 )
+
+from gpatch_v4.utils.safetensor_io import save_file  # noqa: E402
 
 DIRECTIONS = ("official2sgl", "sgl2official")
 _LAYER_RE = re.compile(r"^(layers\.\d+|mtp\.\d+)")
@@ -128,7 +129,6 @@ def _layer_of(name: str) -> str:
 
 class _ShardReader:
     """Lazy per-worker safetensors handle cache."""
-
     def __init__(self, root: str, weight_map: dict[str, str]):
         self.root = root
         self.weight_map = weight_map
@@ -245,7 +245,9 @@ def _convert_one_weight(
     return out
 
 
-def _op_label(name: str, weight: torch.Tensor, scale: torch.Tensor | None, direction: str) -> str | None:
+def _op_label(
+    name: str, weight: torch.Tensor, scale: torch.Tensor | None, direction: str
+) -> str | None:
     """Return a short op description if this weight needs quant/dequant; else None."""
     if direction == "official2sgl":
         if is_expert_weight(name):
@@ -502,8 +504,7 @@ def convert_checkpoint(
     print(f"  sum save          : {sum_save:.1f}s", flush=True)
     print(f"  sum shard total   : {sum_total:.1f}s", flush=True)
     print(
-        "  per-rank wall     : "
-        + ", ".join(f"r{i}={w:.1f}s" for i, w in enumerate(rank_walls)),
+        "  per-rank wall     : " + ", ".join(f"r{i}={w:.1f}s" for i, w in enumerate(rank_walls)),
         flush=True,
     )
     if slowest is not None and fastest is not None:

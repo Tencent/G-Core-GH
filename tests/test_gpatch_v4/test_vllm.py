@@ -1,7 +1,6 @@
 import asyncio
 import unittest
 
-import lipsum
 import pytest
 import ray
 import torch
@@ -13,6 +12,8 @@ vllm = pytest.importorskip("vllm")
 from transformers import AutoTokenizer
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
+
+from random_text import generate_words
 
 
 async def drain_generator(gen):
@@ -117,7 +118,7 @@ class VllmTestActor:
         await llm.sleep()
         await llm.wake_up()
 
-        prompt = lipsum.generate_words(4 * 1024)
+        prompt = generate_words(4 * 1024)
 
         repeat = 16
         sampling_params = vllm.SamplingParams(

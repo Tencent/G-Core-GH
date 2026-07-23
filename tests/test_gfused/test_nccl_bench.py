@@ -3,7 +3,7 @@
 # nrwu@tencent.com
 """Measure NCCL all2all launch overhead and large allgather latency.
 
-Case A sends 100 million float32 values once per rank. Case B sends the same
+Case A sends 100 million bf16 values once per rank. Case B sends the same
 per-rank total in ``NUM_ALL_TO_ALL_CALLS`` equal all2all calls.
 
 Usage::
@@ -35,9 +35,36 @@ from test_gpatch_v4.gpatch_v4_test_helper import kill_all_actors_and_shutdown_ra
 
 from gpatch_v4.orches.placement_group import _create_placement_group
 
-WORLD_SIZE = 32
-NUM_FLOATS_PER_RANK = 128 * 128 * 512 * 20
-NUM_ALL_TO_ALL_CALLS = 20
+'''
+8 gpu 的情况，多次 launch overhead 很小，但 32 gpu 就会比较高。
+
+[world=8, per-rank payload=1,073,741,824 bfloat16]
+  case A: 1 x all2all(1,073,741,824)  mean=6.813 ms  max=6.816 ms
+  case B: 16 x all2all(67,108,864)  mean=7.086 ms  max=7.087 ms
+  multi/single=1.040x  overhead=0.273 ms
+
+[world=32, per-rank payload=268,435,456 bfloat16]
+  case A: 1 x all2all(268,435,456)  mean=10.221 ms  max=10.255 ms
+  case B: 16 x all2all(16,777,216)  mean=17.373 ms  max=17.383 ms
+  multi/single=1.700x  overhead=7.152 ms
+
+在 H20，CP=8， rank 7 计算 256k 的 CSA indexer FWD 耗时约 312ms，如果做了均衡估计 160ms；<15ms 的通信应该算还能接受。
+'''
+
+'''
+[world=8, allgather output=[1, 1,000,000, 1024] bf16]
+  per-rank input=[1, 125,000, 1024] (244.1 MiB)
+  gathered=1.91 GiB  mean=5.321 ms  max=5.322 ms
+
+[world=32, allgather output=[1, 1,000,000, 1024] bf16]
+  per-rank input=[1, 31,250, 1024] (61.0 MiB)
+  gathered=1.91 GiB  mean=6.291 ms  max=6.302 ms
+'''
+
+WORLD_SIZE = 8
+# 模拟 indexer qr 的情况
+NUM_FLOATS_PER_RANK = (1024 * 1024 // WORLD_SIZE) * (64 * 128)
+NUM_ALL_TO_ALL_CALLS = 16
 WARMUP_ITERS = 2
 BENCH_ITERS = 10
 ALL_GATHER_BATCH_SIZE = 1
@@ -88,10 +115,10 @@ class _AllToAllBenchWorker:
 
         try:
             device = torch.device("cuda:0")
-            send_one = torch.empty(num_floats_per_rank, dtype=torch.float32, device=device)
+            send_one = torch.empty(num_floats_per_rank, dtype=torch.bfloat16, device=device)
             recv_one = torch.empty_like(send_one)
             floats_per_call = num_floats_per_rank // num_all_to_all_calls
-            send_small = torch.empty(floats_per_call, dtype=torch.float32, device=device)
+            send_small = torch.empty(floats_per_call, dtype=torch.bfloat16, device=device)
             recv_small = torch.empty_like(send_small)
 
             def one_call() -> None:
@@ -268,7 +295,7 @@ class AllToAllOverheadTest(unittest.TestCase):
         ratio = statistics.mean(multi_call_ms) / statistics.mean(one_call_ms)
         overhead_ms = statistics.mean(multi_call_ms) - statistics.mean(one_call_ms)
 
-        print(f"\n[world={WORLD_SIZE}, per-rank payload={NUM_FLOATS_PER_RANK:,} float32]")
+        print(f"\n[world={WORLD_SIZE}, per-rank payload={NUM_FLOATS_PER_RANK:,} bfloat16]")
         print(
             f"  case A: 1 x all2all({NUM_FLOATS_PER_RANK:,})"
             f"  mean={statistics.mean(one_call_ms):.3f} ms"

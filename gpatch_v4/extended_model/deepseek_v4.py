@@ -1,33 +1,33 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.distributed as dist
 from transformers import DeepseekV4Config
 from typing_extensions import override
-from contextlib import nullcontext
 
 from megatron.core import mpu
 
+from gpatch_v4.configs.config import FinetuneConfig, RlConfig
 from gpatch_v4.extended_model.base import (
-    PostInitModel,
     CheckpointContextFn,
+    PostInitModel,
     ResetRouterCorrectionBiasAccum,
     UpdateRouterCorrectionBias,
 )
 from gpatch_v4.extended_model.llm import DpoPrepareDataForwardLLM, PrepareDataForwardLLM
 from gpatch_v4.models.deepseek_v4.cp import cp_chunk_data
-from gpatch_v4.models.deepseek_v4.thd import pack_sequences
 from gpatch_v4.models.deepseek_v4.freeze_update_router import (
+    checkpoint_context_fn,
     freeze_router_weights,
     init_router_correction_bias_accumulators,
     register_router_correction_bias_accum_tracking_hook,
-    checkpoint_context_fn,
     reset_router_correction_bias_accum,
     update_router_correction_bias,
 )
-from gpatch_v4.configs.config import FinetuneConfig, RlConfig
+from gpatch_v4.models.deepseek_v4.thd import pack_sequences
 
 
 class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
@@ -62,6 +62,211 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
 
             # TODO 设计在这里不太合理，如果后续有需求再调整。
             self._pad_each_doc_to_multi_of = max(self._model_config.compress_rates.values())
+
+    def _grpo_fsdp2_train_thd(
+        self,
+        batches: List[Dict[str, Any]],
+        seq_len: int,
+        pad_token_id: int,
+        *,
+        include_rl_fields: bool,
+        pad_with_random_token: bool = False,
+        vocab_size: int = 0,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Pack pre-shifted GRPO tensors into one DSV4 THD sequence.
+
+        GRPO token-level tensors already live on the next-token ``S-1`` axis.
+        Shift every sample before packing so targets never roll across segment
+        boundaries, then place every RL field at the same padded segment offset.
+        """
+        cp_size = dist.get_world_size(mpu.get_context_parallel_group())
+        cp_rank = mpu.get_context_parallel_rank() if cp_size > 1 else 0
+
+        ids_list: list[torch.Tensor] = []
+        targets_list: list[torch.Tensor] = []
+        actual_lens: list[int] = []
+        for batch in batches:
+            tokens = batch["tokens"]
+            if not isinstance(tokens, torch.Tensor):
+                tokens = torch.tensor(tokens, dtype=torch.long)
+            tokens = tokens.reshape(-1)
+            current_seq_len = int(batch["sequence_lengths"].item())
+            assert current_seq_len == tokens.numel(
+            ), (f"{current_seq_len=} != tokens.numel()={tokens.numel()}")
+            assert current_seq_len <= seq_len, (
+                f"sample sequence length {current_seq_len} exceeds configured "
+                f"sequence length {seq_len}"
+            )
+            assert current_seq_len >= 2, "GRPO samples need at least two tokens"
+
+            shifted_input = tokens[:-1].cuda(non_blocking=True)
+            shifted_target = tokens[1:].cuda(non_blocking=True)
+            ids_list.append(shifted_input)
+            targets_list.append(shifted_target)
+            actual_lens.append(shifted_input.numel())
+
+        packed_ids, packed_pos, _, full_psp = pack_sequences(
+            ids_list,
+            None,
+            config=self._model_config,
+            pad_to_multiple_of=self._pad_each_doc_to_multi_of,
+            cp_size=cp_size,
+            pad_token_id=pad_token_id,
+        )
+        # 暂时先不做 random pad
+        # if pad_with_random_token:
+        #     assert vocab_size > 0, "vocab_size must be positive for random THD padding"
+        #     pad_mask = full_psp.layout.pad_token_mask
+        #     packed_ids.view(-1)[pad_mask] = torch.randint(
+        #         0,
+        #         vocab_size,
+        #         (int(pad_mask.sum().item()),),
+        #         dtype=packed_ids.dtype,
+        #         device=packed_ids.device,
+        #     )
+
+        total_tokens = full_psp.total_seqlen
+        packed_target = torch.zeros((1, total_tokens), dtype=torch.long, device=packed_ids.device)
+        rl_key_map = (
+            ("advantages", "advantages"),
+            ("mask", "mask"),
+            ("logprobs", "prev_log_probs"),
+            ("ref_logprobs", "ref_log_probs"),
+            ("rollout_log_probs", "rollout_log_probs"),
+        )
+        present_rl_keys = [(src, dst) for src, dst in rl_key_map
+                           if src in batches[0]] if include_rl_fields else []
+        if include_rl_fields:
+            for required in ("advantages", "mask", "logprobs"):
+                assert required in batches[0], f"THD GRPO batch is missing {required}"
+
+        packed_rl = {
+            dst: torch.zeros((1, total_tokens), dtype=torch.float32, device=packed_ids.device)
+            for _, dst in present_rl_keys
+        }
+        cu_padded = full_psp.cu_seqlens_q_padded
+        for sample_idx, (batch, target, actual_len) in enumerate(
+            zip(batches, targets_list, actual_lens, strict=True)
+        ):
+            offset = int(cu_padded[sample_idx].item())
+            packed_target[0, offset:offset + actual_len] = target
+            for src, dst in present_rl_keys:
+                assert src in batch, f"sample {sample_idx} is missing {src}"
+                value = batch[src]
+                if not isinstance(value, torch.Tensor):
+                    value = torch.tensor(value)
+                assert value.dim() <= 1, (
+                    f"sample {sample_idx} {src} has shape {tuple(value.shape)}; "
+                    "FSDP2 DSV4 THD GRPO only supports 1D token-level fields "
+                    "(e.g. 3D topk advantages are not supported yet)"
+                )
+                value = value.reshape(-1)
+                # Rollout stores one trailing dummy slot on the original
+                # S-token axis; policy loss lives on the shifted S-1 axis.
+                if src == "rollout_log_probs" and value.numel() == actual_len + 1:
+                    value = value[:actual_len]
+                assert value.numel() == actual_len, (
+                    f"sample {sample_idx} {src} length {value.numel()} "
+                    f"!= shifted token length {actual_len}"
+                )
+                packed_rl[dst][0, offset:offset + actual_len] = value.to(
+                    device=packed_ids.device, dtype=torch.float32
+                )
+        assert int(cu_padded[-1].item()) == total_tokens
+
+        if cp_size > 1:
+            local_ids, _, _, local_pos, local_psp = cp_chunk_data(
+                cp_rank,
+                cp_size,
+                tokens=packed_ids,
+                position_ids=packed_pos,
+                packed_seq_params=full_psp,
+            )
+        else:
+            local_ids = packed_ids
+            local_pos = packed_pos
+            local_psp = full_psp
+
+        batch_out: Dict[str, Any] = {
+            "packed_token_ids": packed_ids,
+            "target": packed_target,
+            "full_packed_seq_params": full_psp,
+            "cu_seqlens": full_psp.cu_seqlens_q,
+            "cu_seqlens_padded": full_psp.cu_seqlens_q_padded,
+            **packed_rl,
+        }
+        for key in [
+            "entropy_aux_figures",
+        ]:
+            if include_rl_fields and key in batches[0]:
+                batch_out[key] = torch.as_tensor(batches[0][key]).to(device=packed_ids.device)
+
+        fwd_kwargs: Dict[str, Any] = {
+            "input_ids": local_ids,
+            "position_ids": local_pos,
+            "attention_mask": None,
+            "labels": None,
+            "packed_seq_params": local_psp,
+        }
+        return batch_out, fwd_kwargs
+
+    @override
+    def model_forward_only(
+        self,
+        batches: List[Dict[str, Any]],
+        seqlen: int,
+        pad_token_id: int,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        if not self.config.policy.ppo_pack_seq:
+            return super().model_forward_only(
+                batches,
+                seqlen,
+                pad_token_id,
+                pad_with_random_token=pad_with_random_token,
+                **kwargs,
+            )
+        batch, fwd_kwargs = self._grpo_fsdp2_train_thd(
+            batches,
+            seqlen,
+            pad_token_id,
+            include_rl_fields=False,
+            pad_with_random_token=pad_with_random_token,
+            vocab_size=kwargs.get("vocab_size", 0),
+        )
+        fwd_kwargs["target"] = batch["target"]
+        fwd_kwargs["full_packed_seq_params"] = batch["full_packed_seq_params"]
+        return fwd_kwargs
+
+    @override
+    def grpo_train(
+        self,
+        batches: List[Dict[str, Any]],
+        seqlen: int,
+        pad_token_id: int,
+        ppo_pack_seq: bool,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        if not ppo_pack_seq:
+            return super().grpo_train(
+                batches,
+                seqlen,
+                pad_token_id,
+                ppo_pack_seq=False,
+                pad_with_random_token=pad_with_random_token,
+                **kwargs,
+            )
+        assert self.config.policy.ppo_pack_seq
+        return self._grpo_fsdp2_train_thd(
+            batches,
+            seqlen,
+            pad_token_id,
+            include_rl_fields=True,
+            pad_with_random_token=pad_with_random_token,
+            vocab_size=kwargs.get("vocab_size", 0),
+        )
 
     @override
     def sft_train(

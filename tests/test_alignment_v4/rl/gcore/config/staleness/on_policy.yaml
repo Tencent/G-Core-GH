@@ -1,0 +1,11 @@
+# @package _global_
+# Strictly on-policy: rollout_gbs=1 prompt x sampling_repeat_n=8 = 8 samples,
+# train_gbs=8 -> 8//8 = 1 optimizer step/rollout (prev_logp == curr_logp,
+# importance ratio == 1). The on-policy condition (ppo_config.py) is
+# train_gbs == rollout_gbs * sampling_keep_n and ppo_max_epochs_2 == 1.
+training:
+  rollout_gbs: 4
+  train_gbs: 32
+  sampling_repeat_n: 8
+  sampling_keep_n: 8
+  ppo_max_epochs_2: 1

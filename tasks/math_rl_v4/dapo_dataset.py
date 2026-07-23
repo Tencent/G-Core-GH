@@ -112,10 +112,14 @@ class DapoMathDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         example = self.dataset[idx]
         assert "prompt" in example, f"missing 'prompt' field at idx={idx}"
-        assert "label" in example, f"missing 'label' field at idx={idx}"
 
         question = example["prompt"]
-        target = str(example["label"])
+        if "label" in example:
+            target = str(example["label"])
+        elif "reward_model" in example:
+            target = str(example["reward_model"]["ground_truth"])
+        else:
+            raise AssertionError(f"missing 'label' or 'reward_model' field at idx={idx}")
 
         prompt, _ = self._apply_chat_template(question)
         input_ids, prompt_len = tokenize_text(
@@ -193,7 +197,7 @@ def get_dataset_and_dataloader(
         train_dataset,
         rank=dp_rank,
         num_replicas=dp_size,
-        shuffle=True,
+        shuffle=config.data.shuffle,
         seed=config.data.sampler_seed,
         drop_last=True,
     )

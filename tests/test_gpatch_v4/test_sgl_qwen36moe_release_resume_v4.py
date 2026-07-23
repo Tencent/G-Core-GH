@@ -67,11 +67,12 @@ import unittest
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
-import lipsum
 import pynvml
 import pytest
 import torch
 from transformers import AutoTokenizer
+
+from random_text import generate_words
 
 sgl = pytest.importorskip("sglang")
 
@@ -212,11 +213,11 @@ class Qwen36MoEReleaseResumeMemoryLeakTest(unittest.TestCase):
 
         tokenizer = AutoTokenizer.from_pretrained(self.REPO_ID, trust_remote_code=True)
 
-        words = lipsum.generate_words(128 * 1024)
+        words = generate_words(128 * 1024)
         ids = tokenizer(words, add_special_tokens=False)["input_ids"]
         assert len(ids) >= prompt_tokens, (
-            f"lipsum produced only {len(ids)} tokens; need {prompt_tokens}. "
-            f"Increase the lipsum word count."
+            f"generate_words produced only {len(ids)} tokens; need {prompt_tokens}. "
+            f"Increase the word count."
         )
         prompt_ids: List[int] = ids[:prompt_tokens]
         sampling_params: Dict = {

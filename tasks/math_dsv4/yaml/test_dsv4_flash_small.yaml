@@ -66,7 +66,8 @@ policy:
     expert_model_parallel_size: 4
     context_parallel_size: 2
   model_arch: "deepseek_v4"
-  attn_implementation: "eager"
+  attn_implementation: "fused"
+  indexer_backend: "fused"
   without_ref: True
   hf_model_path: "hf-hub/sgl-project/DeepSeek-V4-Flash-FP8_small"
   hf_tokenizer_path: "hf-hub/sgl-project/DeepSeek-V4-Flash-FP8_small"

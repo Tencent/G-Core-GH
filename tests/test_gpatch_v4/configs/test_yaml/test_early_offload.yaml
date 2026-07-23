@@ -1,0 +1,105 @@
+# @package _global_
+# One-GPU colocated smoke config for the early model-offload path.
+# The test overrides training_backend and early_swap_model to cover:
+#   {mcore, fsdp2} x {disabled, enabled}.
+
+training:
+  training_backend: mcore
+  early_swap_model: False
+  use_gen_rm_reward: False
+  use_bt_rm_reward: False
+  use_fast_tokenizer: True
+  rollout_gbs: 1
+  rollout_mbs: 1
+  sampling_repeat_n: 1
+  sampling_keep_n: 1
+  train_gbs: 1
+  train_mbs: 1
+  data_parallel_random_init: False
+  save_interval: 100
+  build_from_mbridge: True
+  num_train_epoches: 1
+  ppo_max_epochs_2: 1
+  metrics_report: []
+
+checkpoint:
+  load_ckpt_path: test_early_offload_ckpt
+  save_ckpt_path: test_early_offload_ckpt
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 5.0e-7
+  lr_warmup_steps: 0
+  lr_decay_steps: 1
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "/mnt/ceph-hz1-csp/mm-base-plt2/nrwu/hf-hub/openai/gsm8k-jsonl/train/"
+  py_path: "tests/test_gpatch_v4/custom_py/simple_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+policy:
+  dist_config:
+    nnodes: 1
+    num_gpus_per_node: 1
+    tensor_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+  model_arch: "qwen2"
+  without_ref: True
+  hf_model_path: "/mnt/ceph-hz1-csp/mm-base-plt2/nrwu/hf-hub/Qwen/Qwen2.5-Math-1.5B"
+  hf_tokenizer_path: "/mnt/ceph-hz1-csp/mm-base-plt2/nrwu/hf-hub/Qwen/Qwen2.5-Math-1.5B"
+  sampler_client:
+    rpc_type: ray
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+
+sampler:
+  backend: sglang
+  dist_config:
+    nnodes: 1
+    num_gpus_per_node: 1
+  model_info:
+    - model_arch: "qwen2"
+      hf_model_path: "/mnt/ceph-hz1-csp/mm-base-plt2/nrwu/hf-hub/Qwen/Qwen2.5-Math-1.5B"
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 1
+        num_gpus_per_node: 1
+        tensor_model_parallel_size: 1
+      use_fast_tokenizer: True
+      load_format: "dummy"
+      gpu_memory_utilization: 0.5
+      max_running_requests: 1
+      temperature: 1.0
+      top_p: 0.9
+      generate_max_tokens: 8
+      disable_cuda_graph: True
+
+bt_rm:
+  dist_config:
+    nnodes: 0
+
+gen_rm:
+  dist_config:
+    nnodes: 0
+
+ppo:
+  grpo_advantage_epsilon: 1.0e-4
+  ppo_ratio_eps: 0.2
+
+debug:
+  save_first_rollout_data: False
+  debug_engine_update_weight: True
+  debug_engine_save_path: "tests/test_gpatch_v4/_tmp_early_offload"
+  trainer_return_ppo_step_metrics: False

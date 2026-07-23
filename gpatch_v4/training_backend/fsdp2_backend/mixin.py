@@ -45,14 +45,10 @@ from gpatch_v4.training_backend.fsdp2_backend.checkpoint import (
     save_checkpoint,
     save_hf_checkpoint,
 )
-from gpatch_v4.training_backend.fsdp2_backend.mtp_loss import (
-    calculate_mtp_loss,
-    mtp_per_depth_valid_count,
-)
-from gpatch_v4.training_backend.loss_factory import (
-    compute_dpo_loss_core,
-    load_balancing_loss_func,
-)
+from gpatch_v4.training_backend.fsdp2_backend.linear_ce import linear_ce_forward_context
+from gpatch_v4.training_backend.fsdp2_backend.mtp_loss import mtp_per_depth_valid_count
+from gpatch_v4.training_backend.loss import Fsdp2FinetuneLossInput, get_loss_fn
+from gpatch_v4.training_backend.loss_factory import load_balancing_loss_func
 from gpatch_v4.utils import (
     clear_memory,
     get_batches_max_seqlen,
@@ -61,26 +57,34 @@ from gpatch_v4.utils import (
     get_max_seqlen_within_ep,
     log,
 )
-
-
-# reference from slime
-def selective_log_softmax_raw(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-    """Fused ``log_softmax → gather``.
-
-    Avoids the memory overhead of allocating a full logprobs tensor.
-
-    Parameters:
-        logits: ``[..., V]``.
-        input_ids: ``[...]`` token indices.
-
-    Returns:
-        ``[...]`` log-probs at ``input_ids``.
-    """
-    logprobs = logits.log_softmax(dim=-1)
-    return torch.gather(logprobs, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
-
+from gpatch_v4.utils.training_utils import selective_log_softmax_raw
 
 selective_log_softmax_compiled = torch.compile(dynamic=True)(selective_log_softmax_raw)
+
+
+def unpack_thd_log_probs(
+    packed_log_probs: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Restore per-sample logprobs from a ``[1, T]`` padded THD axis."""
+    assert packed_log_probs.dim() == 2 and packed_log_probs.shape[0] == 1
+    cu = cu_seqlens.detach().cpu().tolist()
+    cu_padded = cu_seqlens_padded.detach().cpu().tolist()
+    assert len(cu) == len(cu_padded) and len(cu) >= 2
+    restored = []
+    flat = packed_log_probs.squeeze(0)
+    assert cu[0] == 0 and cu_padded[0] == 0
+    assert cu_padded[-1] == flat.numel(
+    ), (f"padded THD boundary {cu_padded[-1]} must match packed logprob "
+        f"length {flat.numel()}")
+    for sample_idx in range(len(cu) - 1):
+        actual_len = cu[sample_idx + 1] - cu[sample_idx]
+        start = cu_padded[sample_idx]
+        padded_len = cu_padded[sample_idx + 1] - start
+        assert 0 <= actual_len <= padded_len
+        restored.append(flat[start:start + actual_len].contiguous())
+    return restored
 
 
 class Fsdp2EngineMixin:
@@ -329,6 +333,9 @@ class Fsdp2EngineMixin:
                 fp8_qat=self.policy_config.fp8_qat,
                 fp4_qat=self.policy_config.fp4_qat,
                 fp8=self.policy_config.fp8,
+                moe_router_force_load_balancing=(
+                    self.policy_config.moe_router_force_load_balancing
+                ),
             )
             model.load_checkpoint_hp(hf_model_path)
             if not model_only_inference:
@@ -386,6 +393,7 @@ class RouterReplayMixin:
         self,
         batches: List[Dict[str, Any]],
         seq_length: int,
+        packed_seq_params=None,
     ) -> Optional[list[torch.Tensor]]:
         """Build per-TopKRouter-layer replay indices from a micro-batch.
 
@@ -414,6 +422,34 @@ class RouterReplayMixin:
 
         per_layer_accum: list[list[torch.Tensor]] = [[] for _ in topk_indices]
 
+        if packed_seq_params is not None:
+            padded_boundaries = packed_seq_params.cu_seqlens_q_padded.detach().cpu().tolist()
+            assert len(padded_boundaries) == len(batches) + 1
+            for sample_idx, batch in enumerate(batches):
+                re = batch["routed_experts"]
+                seq_batch = re.shape[0] - 1
+                padded_len = padded_boundaries[sample_idx + 1] - padded_boundaries[sample_idx]
+                assert seq_batch > 0 and padded_len >= seq_batch
+                full_index = torch.arange(padded_len, device=re.device)
+                index = (full_index + (full_index // seq_batch) * 6 * dp_rank) % seq_batch
+                padded = re[index]
+                for out_i, layer_i in enumerate(topk_indices):
+                    per_layer_accum[out_i].append(padded[:, layer_i, :])
+
+            packed_per_layer = [
+                torch.cat(chunks, dim=0).contiguous().long() for chunks in per_layer_accum
+            ]
+            total_tokens = packed_seq_params.total_seqlen
+            assert all(rows.shape[0] == total_tokens for rows in packed_per_layer)
+            if cp_size > 1:
+                assert total_tokens % cp_size == 0
+                local_tokens = total_tokens // cp_size
+                start = cp_rank * local_tokens
+                packed_per_layer = [
+                    rows[start:start + local_tokens].contiguous() for rows in packed_per_layer
+                ]
+            return packed_per_layer
+
         for batch in batches:
             re = batch["routed_experts"]
             seq_batch = re.shape[0] - 1
@@ -422,7 +458,6 @@ class RouterReplayMixin:
             index = (full_index + (full_index // seq_batch) * 6 * dp_rank) % seq_batch
 
             if cp_size > 1:
-                # todo zz: shard replay rows with the same CP token index map
                 s_local = seq_length // cp_size
                 start = cp_rank * s_local
                 index = index[start:start + s_local]
@@ -440,6 +475,7 @@ class RouterReplayMixin:
         model,
         batches: List[Dict[str, Any]],
         seq_length: int,
+        packed_seq_params=None,
     ):
         """Scope router replay for one micro-batch forward **and** backward.
 
@@ -452,7 +488,9 @@ class RouterReplayMixin:
             yield
             return
 
-        indices = self._prepare_replay_indices(batches, seq_length)
+        indices = self._prepare_replay_indices(
+            batches, seq_length, packed_seq_params=packed_seq_params
+        )
         if indices is None:
             yield
             return
@@ -471,12 +509,28 @@ class ForwardStepMixin(RouterReplayMixin):
         enable_r3: bool = False,
     ) -> torch.Tensor:
         total_samples = len(batches_list)
-        seq_length = get_batches_max_seqlen(batches_list, self.training_config.pad_to_mulitiple_of)
-        seq_length = get_max_seqlen_within_ep(seq_length)
-        num_microbatches = divide(total_samples, self.forward_only_mbs)
-        batch_iter = get_k_split_list(batches_list, num_microbatches)
-
-        logprobs_list = []
+        pack_seq = self.policy_config.ppo_pack_seq
+        if pack_seq:
+            assert isinstance(self.prepare_data, DeepseekV4PrepareDataForwardLLM
+                             ), ("FSDP2 packed RL forward currently supports only deepseek_v4")
+            seq_length = self.training_config.seq_length
+            batch_iter = convert_mbs_for_pack_seq(
+                batches_list,
+                max_token_len=seq_length,
+                pad_each_doc_to_multi_of=self.prepare_data._pad_each_doc_to_multi_of,
+                dp_group=mpu.get_data_parallel_group(),
+                cp_size=mpu.get_context_parallel_world_size(),
+            )
+            sample_order = {id(sample): idx for idx, sample in enumerate(batches_list)}
+            logprobs_list = [None] * total_samples
+        else:
+            seq_length = get_batches_max_seqlen(
+                batches_list, self.training_config.pad_to_mulitiple_of
+            )
+            seq_length = get_max_seqlen_within_ep(seq_length)
+            num_microbatches = divide(total_samples, self.forward_only_mbs)
+            batch_iter = get_k_split_list(batches_list, num_microbatches)
+            logprobs_list = []
 
         for batches in tqdm(batch_iter, desc=batch_log_str, disable=dist.get_rank() != 0):
             model_fwd_args = self.prepare_data.model_forward_only(
@@ -487,27 +541,162 @@ class ForwardStepMixin(RouterReplayMixin):
                 vocab_size=self._get_vocab_size(),
             )
             target = model_fwd_args.pop("target")
+            full_psp = model_fwd_args.pop("full_packed_seq_params", None)
             replay_ctx = (
-                self._maybe_router_replay(model, batches, seq_length)
-                if enable_r3 else nullcontext()
+                self._maybe_router_replay(
+                    model,
+                    batches,
+                    seq_length,
+                    packed_seq_params=full_psp,
+                ) if enable_r3 else nullcontext()
             )
             with replay_ctx:
-                logits = model(**model_fwd_args).logits.float()
+                pre_shifted = full_psp is not None
+                with self._maybe_rl_linear_ce_context(
+                    model,
+                    target,
+                    pre_shifted=pre_shifted,
+                    return_entropy=False,
+                ):
+                    head_out = model(**model_fwd_args).logits
+                logprobs = self._rl_logprobs_from_head_output(
+                    head_out,
+                    target,
+                    pre_shifted=pre_shifted,
+                    allow_compile=False,
+                )
+            if full_psp is None:
+                logprobs_list.append(logprobs)
+                continue
 
-            logprobs, _ = self.get_logprob_and_entropy(
-                logits=logits,
-                target_tokens=target,
-                allow_compile=False,
-                temperature=None,
-                return_entropy=False,
+            restored_logprobs = unpack_thd_log_probs(
+                logprobs.cpu(),
+                full_psp.cu_seqlens_q,
+                full_psp.cu_seqlens_q_padded,
             )
-            logprobs_list.append(logprobs)
+            assert len(restored_logprobs) == len(batches)
+            for sample, restored in zip(batches, restored_logprobs, strict=True):
+                logprobs_list[sample_order[id(sample)]] = restored
 
-        logprobs = torch.cat(logprobs_list) if len(logprobs_list) > 0 else None
-        assert logprobs.shape[0] == total_samples
-        logprobs = [logprob.squeeze(0) for logprob in logprobs.cpu().chunk(total_samples)]
+        if pack_seq:
+            assert all(logprob is not None for logprob in logprobs_list)
+            logprobs = logprobs_list
+        else:
+            logprobs = torch.cat(logprobs_list) if len(logprobs_list) > 0 else None
+            assert logprobs.shape[0] == total_samples
+            logprobs = [logprob.squeeze(0) for logprob in logprobs.cpu().chunk(total_samples)]
         clear_memory()
         return logprobs
+
+    def _maybe_rl_linear_ce_context(
+        self,
+        model,
+        target: torch.Tensor,
+        *,
+        pre_shifted: bool,
+        return_entropy: bool,
+    ):
+        if not self.training_config.use_linear_ce:
+            return nullcontext()
+        local_labels = self._prepare_rl_linear_ce_labels(target, pre_shifted=pre_shifted)
+        return linear_ce_forward_context(
+            model,
+            local_labels,
+            self.training_config.linear_ce_backend,
+            return_entropy=return_entropy,
+        )
+
+    def _rl_logprobs_from_head_output(
+        self,
+        head_output: torch.Tensor,
+        targets: torch.Tensor,
+        *,
+        pre_shifted: bool,
+        allow_compile: bool,
+    ) -> torch.Tensor:
+        """Map lm_head output to policy-axis log-probs (fused or dense gather)."""
+        if self.training_config.use_linear_ce:
+            assert isinstance(head_output, torch.Tensor)
+            return self._finalize_rl_linear_ce_log_probs(head_output, pre_shifted=pre_shifted)
+        return self.gather_log_probs_packed(
+            head_output.float(),
+            targets,
+            allow_compile=allow_compile,
+            pre_shifted=pre_shifted,
+        )
+
+    def _rl_logprobs_and_entropy_from_head_output(
+        self,
+        head_output: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        targets: torch.Tensor,
+        response_mask: torch.Tensor,
+        *,
+        pre_shifted: bool,
+        allow_compile: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map lm_head output to policy-axis log-probs and entropy."""
+        if self.training_config.use_linear_ce:
+            assert (
+                isinstance(head_output, tuple) and len(head_output) == 2
+            ), f"expected (log_probs, entropy), got {type(head_output)}"
+            local_log_probs, local_entropy = head_output
+        else:
+            assert isinstance(head_output, torch.Tensor)
+            local_log_probs = head_output
+            logits = head_output.float()
+            local_entropy = -(logits.softmax(dim=-1) * logits.log_softmax(dim=-1)).sum(dim=-1)
+
+        log_probs = self._rl_logprobs_from_head_output(
+            local_log_probs,
+            targets,
+            pre_shifted=pre_shifted,
+            allow_compile=allow_compile,
+        )
+        entropy = self._finalize_rl_policy_entropy(
+            local_entropy,
+            response_mask,
+            pre_shifted=pre_shifted,
+        )
+        return log_probs, entropy
+
+    def _prepare_rl_linear_ce_labels(
+        self,
+        targets: torch.Tensor,
+        *,
+        pre_shifted: bool,
+    ) -> torch.Tensor:
+        """Build CP-local next-token labels aligned with lm_head hidden states."""
+        shifted = targets if pre_shifted else targets.roll(shifts=-1, dims=-1)
+        return self.prepare_data.rl_train_cp_chunk_single_data(shifted)
+
+    def _finalize_rl_linear_ce_log_probs(
+        self,
+        local_log_probs: torch.Tensor,
+        *,
+        pre_shifted: bool,
+    ) -> torch.Tensor:
+        """CP all-gather fused log-probs and align to the policy-loss token axis."""
+        log_probs = self._all_gather_cp_aware(local_log_probs)
+        if pre_shifted:
+            return log_probs.contiguous()
+        return log_probs[:, :-1].contiguous()
+
+    def _finalize_rl_policy_entropy(
+        self,
+        local_entropy: torch.Tensor,
+        response_mask: torch.Tensor,
+        *,
+        pre_shifted: bool,
+    ) -> torch.Tensor:
+        """CP all-gather per-token entropy and align to the policy-loss token axis."""
+        entropy = self._all_gather_cp_aware(local_entropy)
+        if not pre_shifted:
+            entropy = entropy[:, :-1]
+        assert entropy.shape == response_mask.shape, (
+            f"entropy shape {tuple(entropy.shape)} must match response mask "
+            f"shape {tuple(response_mask.shape)}"
+        )
+        return entropy
 
     def _all_gather_cp_aware(self, local_tensor: torch.Tensor, gather_dim: int = 1) -> torch.Tensor:
         """All-gather across CP ranks, dispatching the correct pattern.
@@ -522,7 +711,6 @@ class ForwardStepMixin(RouterReplayMixin):
             self.prepare_data,
             (DeepseekV4PrepareDataForwardLLM, DeepseekV4DpoPrepareDataForwardLLM)
         ):
-            # todo zz: invert DSV4 zigzag order, including per-segment THD
             return all_gather_from_context_parallel_region_no_zigzag(local_tensor, gather_dim)
         else:
             return all_gather_from_context_parallel_region(local_tensor, gather_dim)
@@ -530,33 +718,35 @@ class ForwardStepMixin(RouterReplayMixin):
     def gather_log_probs_packed(
         self,
         logits: torch.Tensor,
-        input_ids: torch.Tensor,
+        targets: torch.Tensor,
         allow_compile: bool,
         cu_seqlens: torch.Tensor | float | None = None,
         temperature: torch.Tensor | None = None,
+        pre_shifted: bool = False,
     ) -> torch.Tensor:
         """Gather next-token log probs for packed sequences.
 
         Parameters:
             logits: ``[B, S, V]``.
-            input_ids: ``[B, S]``.
-            cu_seqlens: unused (kept for API compat).
+            targets: ``[B, S]`` input tokens in BSHD mode, or already shifted
+                target tokens in THD mode.
+            cu_seqlens: when provided, marks ``targets`` as pre-shifted.
+            pre_shifted: skip the cross-sample ``roll(-1)`` shift.
 
         Returns:
-            ``[B, S-1]`` target log-probs.
+            ``[B, S-1]`` in BSHD mode, or ``[B, S]`` in pre-shifted THD mode.
         """
         # Handle batch dimension - logits should be [batch_size, seq_len, vocab_size]
         assert logits.dim() == 3
-        assert input_ids.dim() == 2
-        # todo zz: thread THD boundaries into segment-aware CP reconstruction
-        assert cu_seqlens is None, "cu_seqlens is not supported"
+        assert targets.dim() == 2
+        if cu_seqlens is not None:
+            pre_shifted = True
 
         if temperature is not None:
             logits = logits.div(temperature)
 
-        targets = input_ids.roll(shifts=-1, dims=-1)
-        local_targets = self.prepare_data.rl_train_cp_chunk_single_data(targets)
-        # targets = input_ids[:, 1:].to(device=shifted_logits.device)
+        shifted_targets = targets if pre_shifted else targets.roll(shifts=-1, dims=-1)
+        local_targets = self.prepare_data.rl_train_cp_chunk_single_data(shifted_targets)
 
         assert logits.shape[:2] == local_targets.shape, f"{logits.shape=} {local_targets.shape=}"
 
@@ -565,6 +755,8 @@ class ForwardStepMixin(RouterReplayMixin):
         curr_log_probs = selective_log_softmax(logits, local_targets)
         curr_log_probs = self._all_gather_cp_aware(curr_log_probs)
 
+        if pre_shifted:
+            return curr_log_probs.contiguous()
         return curr_log_probs[:, :-1].contiguous()
 
     def get_logprob_and_entropy(
@@ -616,6 +808,13 @@ class ForwardStepMixin(RouterReplayMixin):
         dp_size = mpu.get_data_parallel_world_size()
 
         is_dpo = training_config.loss_func == "dpo"
+        use_linear_ce = training_config.use_linear_ce
+        if use_linear_ce:
+            assert not is_dpo, "FSDP2 linear CE currently supports SFT only"
+            assert training_config.loss_func == "cross_entropy", (
+                "FSDP2 linear CE requires loss_func='cross_entropy'"
+            )
+        loss_fn = get_loss_fn("fsdp2", training_config.loss_func)
         gbs_factor = 2 if is_dpo else 1
         assert training_config.train_gbs * gbs_factor == len(
             batch
@@ -633,12 +832,12 @@ class ForwardStepMixin(RouterReplayMixin):
                 "(pack-seq does its own token-budget micro-batch splitting)"
             )
             dp_group = mpu.get_data_parallel_group()
-            # todo zz: budget with the effective per-segment zigzag alignment
             data_iter = convert_mbs_for_pack_seq(
                 batch,
                 max_token_len=training_config.seq_length,
                 pad_each_doc_to_multi_of=self.prepare_data._pad_each_doc_to_multi_of,
                 dp_group=dp_group,
+                cp_size=mpu.get_context_parallel_world_size(),
             )
             num_microbatches = len(data_iter)
             max_seq_length = training_config.seq_length
@@ -713,12 +912,7 @@ class ForwardStepMixin(RouterReplayMixin):
             dist.all_reduce(global_n_for_mtp)
             global_n_for_mtp = global_n_for_mtp.clamp_min(1.0)
 
-        if is_dpo:
-            dpo_beta = training_config.dpo_beta
-            dpo_label_smoothing = training_config.dpo_label_smoothing
-            dpo_ftx_gamma = training_config.dpo_ftx_gamma
-            total_dpo_pairs = training_config.train_gbs
-            dpo_metric_sums = {}
+        dpo_metric_sums = {} if is_dpo else None
 
         report_loss = 0.
         report_main_loss = 0.
@@ -738,154 +932,105 @@ class ForwardStepMixin(RouterReplayMixin):
 
             loss_mask = batch["loss_mask"]
             labels = batch["labels"]
+            if use_linear_ce:
+                fwd_kwargs["labels"] = None
             if enable_balance_loss:
                 fwd_kwargs["output_router_logits"] = True
             train_forward_context = (
                 nullcontext() if self.training_config.recompute else self.checkpoint_context_fn()[0]
             )
-            with train_forward_context:
-                outputs = self.model(**fwd_kwargs)
-            # Cast to fp32 for numerically stable cross entropy (log-sum-exp in
-            # bf16/fp16 is lossy); consistent with logprob path above.
-            logits = outputs.logits.float()
-            labels_2d = labels
-            loss_mask_2d = loss_mask
-
-            if is_dpo:
-                ref_logprobs = batch["ref_logprobs"]
-                safe_labels = labels_2d.clamp(min=0)
-                policy_logps = selective_log_softmax_raw(logits, safe_labels)
-
-                policy_logps = self._all_gather_cp_aware(policy_logps)
-                full_loss_mask = batch["full_loss_mask"].float()
-
-                ref_len = ref_logprobs.shape[1]
-                policy_logps = policy_logps[:, :ref_len]
-                dpo_loss_mask = full_loss_mask[:, :ref_len].float()
-
-                policy_seq_logps = (policy_logps * dpo_loss_mask).sum(-1)
-                ref_seq_logps = (ref_logprobs.to(policy_logps.device) * dpo_loss_mask).sum(-1)
-
-                B = policy_seq_logps.shape[0]
-                assert B % 2 == 0, f"DPO microbatch must have even size, got {B}"
-                rbs = B // 2
-                policy_chosen_logps, policy_rejected_logps = policy_seq_logps.split(rbs)
-                ref_chosen_logps, ref_rejected_logps = ref_seq_logps.split(rbs)
-
-                losses, chosen_rewards, rejected_rewards = compute_dpo_loss_core(
-                    policy_chosen_logps,
-                    policy_rejected_logps,
-                    ref_chosen_logps,
-                    ref_rejected_logps,
-                    beta=dpo_beta,
-                    label_smoothing=dpo_label_smoothing,
-                    loss_type=training_config.dpo_loss_type,
-                )
-
-                if dpo_ftx_gamma > 1e-6:
-                    chosen_mask_sum = dpo_loss_mask[:rbs].sum(-1).clamp_min(1.0)
-                    losses = losses - dpo_ftx_gamma * policy_chosen_logps / chosen_mask_sum
-
-                main_loss = losses.sum() / total_dpo_pairs * dp_size
-                loss = main_loss
-
-                with torch.no_grad():
-                    reward_acc = (chosen_rewards > rejected_rewards).float().mean()
-                    _m = {
-                        "rewards-accuracies": reward_acc,
-                        "rewards-chosen": chosen_rewards.mean(),
-                        "rewards-rejected": rejected_rewards.mean(),
-                        "rewards-margins": (chosen_rewards - rejected_rewards).mean(),
-                        "logps-chosen": policy_chosen_logps.mean(),
-                        "logps-rejected": policy_rejected_logps.mean(),
-                        "ref-logps-chosen": ref_chosen_logps.mean(),
-                        "ref-logps-rejected": ref_rejected_logps.mean(),
-                    }
-                    for k, v in _m.items():
-                        dpo_metric_sums[k] = dpo_metric_sums.get(k, 0.0) + v.item()
-            else:
-                # tokens 和 logits 都在 sft_train 时候 shift 过了
-                logits = logits.view(-1, self._get_vocab_size())
-                labels = labels_2d.view(-1)
-                loss_mask = loss_mask_2d.view(-1)
-
-                # Enable model parallelism
-                labels = labels.to(logits.device)
-                loss = loss_fct(logits, labels)
-                loss = loss * loss_mask.to(loss.device)
-
-                # Q: 为什么 `* dp_size`？
-                # A: 因为在 dp rank 之间 reduce 缩小了尺度。
-                # Q: 为什么不需要 `/ num_microbatches`？
-                # A: 因为在 micro batch 之间 reduce 已经缩小了尺度。
-                main_loss = torch.sum(loss) / global_n
-                main_loss = main_loss * self.dp_size
-
-                mtp_loss = None
-                mtp_depth_losses = None
-                if training_config.enable_mtp:
-                    mtp_per_depth_h = getattr(outputs, "mtp_per_depth_h", None)
-                    assert mtp_per_depth_h is not None, (
-                        "enable_mtp=True but model forward returned no mtp_per_depth_h"
-                    )
-                    model_cp_group = self.model._cp_group if self.cp_size > 1 else None
-                    mtp_scale = float(
-                        getattr(
-                            outputs,
-                            "mtp_loss_scaling_factor",
-                            getattr(training_config, "mtp_loss_scaling_factor", 0.1),
-                        )
-                    )
-                    mtp_depth_nums = calculate_mtp_loss(
-                        mtp_per_depth_h=mtp_per_depth_h,
-                        labels=labels_2d.to(logits.device),
-                        lm_head=self.model.lm_head,
-                        loss_fct=loss_fct,
-                        loss_mask=loss_mask_2d.to(logits.device),
-                        cp_group=model_cp_group,
-                        packed_seq_params=fwd_kwargs.get("packed_seq_params"),
-                    )
-                    assert len(mtp_depth_nums) == global_n_for_mtp.numel(
-                    ), (f"{len(mtp_depth_nums)=} != {global_n_for_mtp.numel()=}")
-                    mtp_depth_losses = []
-                    mtp_depth_loss_metrics = []
-                    for depth, d_loss_local in enumerate(mtp_depth_nums):
-                        den = global_n_for_mtp[depth]
-                        mtp_depth_losses.append(d_loss_local / den * self.dp_size)
-                        n_global_metric = d_loss_local.detach().clone()
-                        dist.all_reduce(n_global_metric)
-                        mtp_depth_loss_metrics.append(n_global_metric / den * self.dp_size)
-                    mtp_loss = torch.stack(mtp_depth_losses
-                                          ).sum() * (mtp_scale / max(len(mtp_depth_losses), 1))
-                    loss = main_loss + mtp_loss
+            linear_ce_context = (
+                linear_ce_forward_context(
+                    self.model,
+                    labels,
+                    training_config.linear_ce_backend,
+                    return_entropy=False,
+                ) if use_linear_ce else nullcontext()
+            )
+            # Keep linear_ce context through loss.backward so recomputed lm_head
+            # (if ever checkpointed) still sees labels; MTP nests rolled labels.
+            with linear_ce_context:
+                with train_forward_context:
+                    outputs = self.model(**fwd_kwargs)
+                if use_linear_ce:
+                    # SFT uses return_entropy=False → logits is log_probs tensor.
+                    log_probs = outputs.logits
+                    assert isinstance(log_probs, torch.Tensor) and log_probs.dim() >= 2
+                    per_token_linear_ce_loss = -log_probs.float()
+                    logits = None
                 else:
-                    loss = main_loss
+                    # Cast to fp32 for numerically stable cross entropy (log-sum-exp in
+                    # bf16/fp16 is lossy); consistent with logprob path above.
+                    logits = outputs.logits.float()
+                    per_token_linear_ce_loss = None
 
-            balance_loss = None
-            if enable_balance_loss:
-                balance_loss = load_balancing_loss_func(
-                    gate_logits=outputs.router_logits,
-                    num_experts=self.model.num_experts,
-                    top_k=self.model.num_experts_per_tok,
-                    cp_group=self.model._cp_group if self.cp_size > 1 else None,
+                mtp_scale = float(
+                    getattr(
+                        outputs,
+                        "mtp_loss_scaling_factor",
+                        training_config.mtp_loss_scaling_factor,
+                    )
                 )
+                loss_input = Fsdp2FinetuneLossInput(
+                    labels_2d=labels,
+                    loss_mask_2d=loss_mask,
+                    batch=batch,
+                    dp_size=self.dp_size,
+                    logits=logits,
+                    use_linear_ce=use_linear_ce,
+                    per_token_linear_ce_loss=per_token_linear_ce_loss,
+                    linear_ce_backend=(
+                        training_config.linear_ce_backend if use_linear_ce else None
+                    ),
+                    global_n=global_n,
+                    vocab_size=self._get_vocab_size(),
+                    loss_fct=loss_fct,
+                    enable_mtp=enable_mtp,
+                    mtp_per_depth_h=getattr(outputs, "mtp_per_depth_h", None)
+                    if enable_mtp else None,
+                    lm_head=self.model.lm_head if enable_mtp else None,
+                    cp_group=(self.model._cp_group if self.cp_size > 1 else None)
+                    if enable_mtp else None,
+                    packed_seq_params=fwd_kwargs.get("packed_seq_params") if enable_mtp else None,
+                    global_n_for_mtp=global_n_for_mtp,
+                    mtp_loss_scaling_factor=mtp_scale,
+                    all_gather_fn=self._all_gather_cp_aware if is_dpo else None,
+                )
+                result = loss_fn(self.config, loss_input)
+                loss = result.loss
+                main_loss = result.main_loss
+                mtp_loss = result.mtp_loss
+                mtp_depth_losses = result.mtp_depth_losses
+                mtp_depth_loss_metrics = result.mtp_depth_loss_metrics
+                if is_dpo:
+                    for k, v in result.metrics.items():
+                        dpo_metric_sums[k] = dpo_metric_sums.get(k, 0.0) + v
 
-                # The current computation method follows HF.transformers, which introduces a bias due to varying sequence lengths.
-                # For example:
-                # ```
-                # s1 = [
-                #   [1, 2, ..., 10000],
-                #   [1],
-                # ]
-                # ```
-                # will produce a different result compared to
-                # ```
-                # s2 = [[1, 2, ...., 10000, 1]]
-                # ```
-                loss = loss + training_config.moe_balance_loss_coef * balance_loss / num_microbatches
+                balance_loss = None
+                if enable_balance_loss:
+                    balance_loss = load_balancing_loss_func(
+                        gate_logits=outputs.router_logits,
+                        num_experts=self.model.num_experts,
+                        top_k=self.model.num_experts_per_tok,
+                        cp_group=self.model._cp_group if self.cp_size > 1 else None,
+                    )
 
-            if not forward_only:
-                loss.backward()
+                    # The current computation method follows HF.transformers, which introduces a bias due to varying sequence lengths.
+                    # For example:
+                    # ```
+                    # s1 = [
+                    #   [1, 2, ..., 10000],
+                    #   [1],
+                    # ]
+                    # ```
+                    # will produce a different result compared to
+                    # ```
+                    # s2 = [[1, 2, ...., 10000, 1]]
+                    # ```
+                    loss = loss + training_config.moe_balance_loss_coef * balance_loss / num_microbatches
+
+                if not forward_only:
+                    loss.backward()
 
             tmp = loss.detach().clone()
             tmp_main = main_loss.detach().clone()

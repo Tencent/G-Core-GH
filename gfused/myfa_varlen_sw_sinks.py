@@ -659,7 +659,6 @@ def myfa_varlen_sw_sinks_backward(
     return dQ, dK, dV, dsinks
 
 
-
 class MyfaVarlenSwSinks(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -726,3 +725,29 @@ class MyfaVarlenSwSinks(torch.autograd.Function):
 
         return dQ, dK, dV, dsinks, None, None, None, None, None, None
 
+
+def myfa_varlen_sw_sinks(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen,
+    sinks=None,
+    is_causal=True,
+    window_size=None,
+    scaling=None,
+):
+    """Autograd-aware entry used by tests / callers."""
+    return MyfaVarlenSwSinks.apply(
+        q,
+        k,
+        v,
+        sinks,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen,
+        is_causal,
+        window_size,
+        scaling,
+    )

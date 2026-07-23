@@ -24,7 +24,7 @@ training:
   comput_attn_mask: False
   sort_batched: False
   auto_load_from_save_ckpt: True
-  exit_step: 5                     # smoke
+  exit_step: 20                     # smoke
   recompute: True
   enable_mtp: False
   # For FSDP2 DeepSeek-V4 TopKRouter

@@ -37,6 +37,7 @@ from gpatch_v4.extended_model.qwen3_vl import (
 )
 from gpatch_v4.extended_model.rollout_attr_hook import ApplySamplingRolloutAttrLLM
 from gpatch_v4.extended_model.wemm3_embedding import Wemm3EmbeddingPrepareDataForward
+from gpatch_v4.extended_model.wemm_video import WemmVideoPrepareDataForward
 
 try:
     from gpatch_v4.extended_model.welm_v4 import (
@@ -53,16 +54,16 @@ except ImportError:
     WelmOmniV45PrepareDataForward = None
 
 from gpatch_v4.extended_model.base import (
-    PostInitModel,
     CheckpointContextFn,
+    PostInitModel,
     ResetRouterCorrectionBiasAccum,
     UpdateRouterCorrectionBias,
 )
 
 try:
     from gpatch_v4.extended_model.deepseek_v4 import (
-        DeepseekV4PostInitModel,
         DeepseekV4CheckpointContextFn,
+        DeepseekV4PostInitModel,
         DeepseekV4ResetRouterCorrectionBiasAccum,
         DeepseekV4UpdateRouterCorrectionBias,
     )
@@ -121,11 +122,11 @@ REGISTER_RL_PREPARE_DATA_FORWARD = {
     MODEL_ARCH.QWEN3_OMNI_MOE:
         Qwen3VLPrepareDataForward,
     MODEL_ARCH.QWEN3_5_WEMM:
-        Qwen3VLPrepareDataForward,
+        WemmVideoPrepareDataForward,
     MODEL_ARCH.QWEN3_5_MOE_WEMM:
-        Qwen3VLPrepareDataForward,
+        WemmVideoPrepareDataForward,
     MODEL_ARCH.QWEN3_VL_WEMM:
-        Qwen3VLPrepareDataForward,
+        WemmVideoPrepareDataForward,
     MODEL_ARCH.GEMMA4:
         Gemma4PrepareDataForward,
 }
@@ -152,11 +153,11 @@ REGISTER_SFT_PREPARE_DATA_FORWARD = {
     MODEL_ARCH.QWEN3_OMNI_MOE:
         Qwen3VLPrepareDataForward,
     MODEL_ARCH.QWEN3_5_WEMM:
-        Qwen3VLPrepareDataForward,
+        WemmVideoPrepareDataForward,
     MODEL_ARCH.QWEN3_5_MOE_WEMM:
-        Qwen3VLPrepareDataForward,
+        WemmVideoPrepareDataForward,
     MODEL_ARCH.QWEN3_VL_WEMM:
-        Qwen3VLPrepareDataForward,
+        WemmVideoPrepareDataForward,
     MODEL_ARCH.GEMMA4:
         Gemma4PrepareDataForward,
     MODEL_ARCH.WEMM3_EMBEDDING:
@@ -205,13 +206,10 @@ REGISTER_DPO_PREPARE_DATA_FORWARD = {
 }
 
 REGISTER_POST_INIT_MODEL = {
-    DEFAULT:
-        PostInitModel,
-    **(
-        {
-            MODEL_ARCH.DEEPSEEK_V4: DeepseekV4PostInitModel,
-        } if DeepseekV4PostInitModel else {}
-    )
+    DEFAULT: PostInitModel,
+    **({
+        MODEL_ARCH.DEEPSEEK_V4: DeepseekV4PostInitModel,
+    } if DeepseekV4PostInitModel else {})
 }
 
 REGISTER_CHECKPOINT_CONTEXT_FN = {
@@ -293,7 +291,7 @@ class SamplerGenerateFuncFactory:
 class PrepareDataForwardFactory:
     """Factory for data-preparation-and-forward handlers."""
     @staticmethod
-    def get_prepare_data_fwd(config):
+    def get_prepare_data_fwd(config, model_arch=None):
         """Return the appropriate data preparation handler.
 
         Parameters
@@ -319,8 +317,10 @@ class PrepareDataForwardFactory:
         else:
             raise ValueError(f"Unknown config type: {type(config)}")
 
-        if config.policy.model_arch in register_clss:
-            return register_clss[config.policy.model_arch](config)
+        if model_arch is None:
+            model_arch = config.policy.model_arch
+        if model_arch in register_clss:
+            return register_clss[model_arch](config)
 
         return register_clss[DEFAULT](config)
 

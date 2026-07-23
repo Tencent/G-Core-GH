@@ -261,7 +261,6 @@ def all_gather_from_context_parallel_region(
     return _AllGatherToContextParallelRegion.apply(local_tensor, gather_dim, bwd_op)
 
 
-# todo zz: invert the shared CP partition map, including per-segment THD
 class _NoZigzagAllGatherToCPRegion(torch.autograd.Function):
     """All-gather across CP ranks with contiguous rank-order concat (dsv4 / non-zigzag).
 

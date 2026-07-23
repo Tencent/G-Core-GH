@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 import socket
 import traceback
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,10 +26,50 @@ try:
 
     with patch_ctypes_for_cudart_stub():
         from sglang.srt.utils import MultiprocessingSerializer as SglSerializer
-        from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket as SglFlatTensorBucket
+        from sglang.srt.weight_sync.tensor_bucket import (
+            FlattenedTensorBucket as SglFlatTensorBucket,
+        )
 except Exception:
     SglSerializer = None
     SglFlatTensorBucket = None
+
+_ROUTED_EXPERT_WEIGHT_RE = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w([123])\.weight$")
+_TRACE_EXPERT_IDS = frozenset((0, 1, 2, 255))
+
+
+def _dsv4_update_trace_enabled() -> bool:
+    return os.getenv("GCORE_DSV4_UPDATE_TRACE", "0") == "1"
+
+
+def _dsv4_trace_tensor_signature(tensor: torch.Tensor) -> tuple[int, ...]:
+    """Small raw-byte fingerprint without copying an entire weight to CPU."""
+    raw = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+    if raw.numel() == 0:
+        return ()
+    indices = torch.tensor(
+        (0, raw.numel() // 3, (2 * raw.numel()) // 3, raw.numel() - 1),
+        device=raw.device,
+        dtype=torch.long,
+    )
+    return tuple(int(x) for x in raw.index_select(0, indices).cpu().tolist())
+
+
+def _dsv4_trace_bucket_probes(named_tensors: Any) -> tuple[tuple[Any, ...], ...]:
+    """Return selected routed-expert entries for cross-sender IPC auditing."""
+    probes = []
+    for name, tensor in named_tensors:
+        match = _ROUTED_EXPERT_WEIGHT_RE.match(name)
+        if match is None or int(match.group(2)) not in _TRACE_EXPERT_IDS:
+            continue
+        probes.append(
+            (
+                name,
+                tuple(tensor.shape),
+                str(tensor.dtype),
+                _dsv4_trace_tensor_signature(tensor),
+            )
+        )
+    return tuple(probes)
 
 
 @dataclass
@@ -102,9 +145,9 @@ class UpdateWeightFactory(ABC):
                     f"sglang weight update failed ({context}, endpoint={i}): {message}"
                 )
 
-    async def init_distributed_weight_group(
-        self, group_name: str = "weight_update_group"
-    ) -> tuple[Any, str]:
+    async def init_distributed_weight_group(self,
+                                            group_name: str = "weight_update_group"
+                                           ) -> tuple[Any, str]:
         """Create the backend weight-update group.
 
         Returns
@@ -150,7 +193,9 @@ class UpdateWeightFactory(ABC):
                                              ep_idx).init_weights_update_group.remote(req_data)
                 )
             if backend == "vllm":
-                from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+                from vllm.distributed.weight_transfer.nccl_engine import (
+                    NCCLWeightTransferEngine,
+                )
                 dist_weight_group = NCCLWeightTransferEngine.trainer_init(
                     {
                         "master_address": master_address,
@@ -226,6 +271,7 @@ class SglangUpdateWeightFactory(UpdateWeightFactory):
         self, sampler_idx: int, model_engine: Any, replace_zeros: bool = False
     ) -> bool:
         rank = dist.get_rank()
+        participates_in_ipc = self.context.ipc_gather_group is not None
 
         update_weight_max_size_bytes = self.context.update_weight_max_size_bytes
         large_tensor_cleanup_threshold_bytes = 10 * update_weight_max_size_bytes
@@ -239,31 +285,41 @@ class SglangUpdateWeightFactory(UpdateWeightFactory):
                     converted_buffer_size_by_dtypes = {}
                     for name, param in weight_generator:
                         is_gathered_tensor = bool(getattr(param, "is_gathered_tensor", False))
-                        if replace_zeros:
-                            weight_tensor = torch.zeros_like(param)
-                        elif is_gathered_tensor:
-                            weight_tensor = param
+                        if participates_in_ipc:
+                            if replace_zeros:
+                                weight_tensor = torch.zeros_like(param)
+                            elif is_gathered_tensor:
+                                weight_tensor = param
+                            else:
+                                weight_tensor = param.detach().clone()
+                            dtype = weight_tensor.dtype
+                            tensor_bytes = weight_tensor.element_size() * weight_tensor.numel()
                         else:
-                            weight_tensor = param.detach().clone()
+                            weight_tensor = None
+                            dtype = param.dtype
+                            tensor_bytes = param.element_size() * param.numel()
 
-                        dtype = weight_tensor.dtype
                         if dtype not in converted_named_tensors_by_dtypes:
                             converted_named_tensors_by_dtypes[dtype] = []
                             converted_buffer_size_by_dtypes[dtype] = 0
-                        converted_named_tensors_by_dtypes[dtype].append((name, weight_tensor))
-                        converted_buffer_size_by_dtypes[dtype] += weight_tensor.element_size(
-                        ) * weight_tensor.numel()
+                        if participates_in_ipc:
+                            converted_named_tensors_by_dtypes[dtype].append((name, weight_tensor))
+                        converted_buffer_size_by_dtypes[dtype] += tensor_bytes
 
                         if converted_buffer_size_by_dtypes[dtype] >= update_weight_max_size_bytes:
                             torch.cuda.synchronize()
                             named_tensors = converted_named_tensors_by_dtypes[dtype]
                             bucket_bytes = converted_buffer_size_by_dtypes[dtype]
-                            serialized_named_tensors = self.flattened_and_get_ipc_handle(
-                                named_tensors
-                            )
+                            if participates_in_ipc:
+                                serialized_named_tensors = self.flattened_and_get_ipc_handle(
+                                    named_tensors
+                                )
+                            else:
+                                serialized_named_tensors = None
 
                             count_packed_bucket_num += 1
-                            if dist.get_rank() == self.context.ipc_gather_dst_rank:
+                            if participates_in_ipc and dist.get_rank(
+                            ) == self.context.ipc_gather_dst_rank:
                                 update_data = {
                                     "serialized_named_tensors": serialized_named_tensors,
                                     "load_format": "flattened_bucket",
@@ -280,7 +336,8 @@ class SglangUpdateWeightFactory(UpdateWeightFactory):
                             if bucket_bytes >= large_tensor_cleanup_threshold_bytes:
                                 del named_tensors
                                 del serialized_named_tensors
-                                del weight_tensor
+                                if weight_tensor is not None:
+                                    del weight_tensor
                                 del param
                                 clear_memory()
                                 torch.cuda.ipc_collect()
@@ -472,10 +529,14 @@ class DeepSeekV4SglangUpdateWeightFactory(SglangUpdateWeightFactory):
             iter_sglang_dsv4_weight_buckets,
         )
 
+        model = model_engine.model
+        fp4_qat = getattr(model.config, "fp4_qat", False)
+        log(f"iter_dsv4_update_buckets with fp4_qat={fp4_qat}", rank=0)
         return iter_sglang_dsv4_weight_buckets(
             model_engine.export_weights(),
             max_bucket_bytes,
             moe_deepgemm=self._moe_deepgemm(),
+            fp4_qat=fp4_qat,
         )
 
     @staticmethod
@@ -683,6 +744,7 @@ class VllmUpdateWeightFactory(UpdateWeightFactory):
 
     async def _update_native_ipc(self, sampler_idx, model_engine, replace_zeros):
         from torch.multiprocessing.reductions import reduce_tensor
+
         from gpatch_v4.generation_backend.bucketed_ipc_transfer import gcore_gpu_uuid
         world_size, rank = dist.get_world_size(), dist.get_rank()
         gpu_uuid = gcore_gpu_uuid(torch.device("cuda", torch.cuda.current_device()))
@@ -739,7 +801,10 @@ class VllmUpdateWeightFactory(UpdateWeightFactory):
         return True
 
     async def _update_bucketed_ipc(self, sampler_idx, model_engine, replace_zeros):
-        from gpatch_v4.generation_backend.bucketed_ipc_transfer import FlatIpcBucketBuilder, gcore_gpu_uuid
+        from gpatch_v4.generation_backend.bucketed_ipc_transfer import (
+            FlatIpcBucketBuilder,
+            gcore_gpu_uuid,
+        )
         max_bytes = self.context.update_weight_max_size_bytes
         assert max_bytes > 0, f"update_weight_max_size_bytes must be > 0, got {max_bytes}"
         builder = FlatIpcBucketBuilder(max_bucket_bytes=max_bytes)
@@ -791,10 +856,10 @@ class VllmUpdateWeightFactory(UpdateWeightFactory):
                         "bucket_idx": bucket_index
                     }
                     obj_refs = [
-                            self.get_target_endpoint(sampler_idx,
-                                                     ep).update_weights_bucketed.remote(request)
-                            for ep in range(self.num_clusters(sampler_idx))
-                        ]
+                        self.get_target_endpoint(sampler_idx,
+                                                 ep).update_weights_bucketed.remote(request)
+                        for ep in range(self.num_clusters(sampler_idx))
+                    ]
                     ray.get(obj_refs)
             del local
             cpu_barrier()

@@ -1,0 +1,76 @@
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index d6b195d4..05e94ec9 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -542,14 +542,26 @@ class AgentLoopWorker:
+         trajectory_info = await get_trajectory_info(
+             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
+         )
++        # Override the locally-recomputed rollout_n with the globally-precomputed
++        # one (set by the manager before chunking); the local value is wrong when
++        # a GRPO group spans worker chunk boundaries.
++        precomputed_rollout_n = batch.non_tensor_batch.get("rollout_n")
++        if precomputed_rollout_n is not None:
++            for i, info in enumerate(trajectory_info):
++                info["rollout_n"] = int(precomputed_rollout_n[i])
+ 
+         # NOTE: __do_sample__ is an internal per-sample override used by REMAX combined rollout.
+-        # Do not forward it to concrete agent loops, which may reject unknown kwargs.
++        # rollout_n is an internal within-group index precomputed by the manager.
++        # Do not forward either to concrete agent loops, which may reject unknown kwargs.
+         per_sample_do_sample = batch.non_tensor_batch.get("__do_sample__")
+         tasks = []
+         for i in range(len(batch)):
+             trace_this_sample = i in traced_indices
+-            kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
++            kwargs = {
++                k: v[i]
++                for k, v in batch.non_tensor_batch.items()
++                if k != "__do_sample__" and k != "rollout_n"
++            }
+             sample_sampling_params = dict(sampling_params)
+             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
+                 apply_greedy_sampling_params(sample_sampling_params)
+@@ -560,6 +572,10 @@ class AgentLoopWorker:
+             )
+         outputs = await asyncio.gather(*tasks)
+ 
++        # rollout_n is rollout-internal metadata; don't let it leak into the
++        # training batch via _postprocess's non_tensor_batch passthrough.
++        batch.non_tensor_batch.pop("rollout_n", None)
++
+         output = self._postprocess(
+             outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+         )
+@@ -574,6 +590,8 @@ class AgentLoopWorker:
+         trace: bool = True,
+         **kwargs,
+     ) -> _InternalAgentLoopOutput:
++        seed_key = "sampling_seed" if self.rollout_config.name == "sglang" else "seed"
++        sampling_params[seed_key] = 42 + trajectory["rollout_n"]
+         with rollout_trace_attr(
+             step=trajectory["step"],
+             sample_index=trajectory["sample_index"],
+@@ -1119,6 +1137,22 @@ class AgentLoopManager:
+         Returns:
+             DataProto: Output batch.
+         """
++        # Precompute the within-group rollout index (``rollout_n``) over the full
++        # batch BEFORE chunking, and carry it as a non-tensor field. Each worker
++        # then receives the globally-correct index for every trajectory. Without
++        # this, workers recompute ``rollout_n`` from their local chunk and reset
++        # it at chunk boundaries, so a GRPO group split across two workers would
++        # reuse the same seeds (``42 + rollout_n``) on both sides.
++        if "rollout_n" not in prompts.non_tensor_batch:
++            index = prompts.non_tensor_batch.get("index")
++            if index is None:
++                index = np.arange(len(prompts))
++            rollout_n = np.zeros(len(prompts), dtype=np.int32)
++            for i in range(1, len(prompts)):
++                if index[i - 1] == index[i]:
++                    rollout_n[i] = rollout_n[i - 1] + 1
++            prompts.non_tensor_batch["rollout_n"] = rollout_n
++
+         chunkes = prompts.chunk(len(self.agent_loop_workers))
+         outputs = await asyncio.gather(
+             *[

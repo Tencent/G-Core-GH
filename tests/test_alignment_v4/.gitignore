@@ -1,0 +1,11 @@
+# regenerable verl parquets (rebuild via common/verl/data/prepare_gsm8k_data.py)
+*.parquet
+# run artifacts
+dump_*/
+logs/
+wandb/
+wandb_local/
+save_*/
+ckpt_*/
+__pycache__/
+*.pyc

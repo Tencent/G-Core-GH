@@ -1,0 +1,15 @@
+# @package _global_
+# Hybrid parallelism: single-node TP=PP=CP=2. Keeps thd packing on
+# (ppo_pack_seq=True) so the alignment exercises the thd + CP gating path.
+# Only training (policy) parallelism lives here; the sampler/bt_rm engine lives in
+# the rollout backend group (rollout/sglang, single-GPU default). A multi-GPU
+# sampler for this case needs a sampler/bt_rm dist override (CLI or future work).
+# WIP: step2 alignment (vs verl parallelism/hybrid_parallelism) is not yet validated.
+# dist_config.nnodes=-1 means "applies to all nodes".
+policy:
+  ppo_pack_seq: True
+  dist_config:
+    nnodes: -1
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 2

@@ -526,6 +526,11 @@ def _myfa_attention_packed_thd_forward(
 
     padded_lens = packed_seq_params._myfa_padded_lens_cache
     assert padded_lens, "packed THD MyFA requires at least one packed sequence"
+    for padded_len in padded_lens:
+        assert padded_len % (2 * max(cp_size, 1)) == 0, (
+            f"padded seq len {padded_len} must be divisible by 2*cp_size={2 * cp_size} "
+            f"for zigzag THD MyFA"
+        )
 
     # No CP communication is needed; run varlen attention over packed sequences directly.
     if cp_size == 1:
@@ -675,6 +680,11 @@ def _myfa_attention_packed_thd_backward(
 
     padded_lens = packed_seq_params._myfa_padded_lens_cache
     assert padded_lens, "packed THD MyFA backward requires at least one packed sequence"
+    for padded_len in padded_lens:
+        assert padded_len % (2 * max(cp_size, 1)) == 0, (
+            f"padded seq len {padded_len} must be divisible by 2*cp_size={2 * cp_size} "
+            f"for zigzag THD MyFA"
+        )
 
     # Single-rank path mirrors forward: split by sequence, run varlen bwd, concatenate.
     if cp_size == 1:

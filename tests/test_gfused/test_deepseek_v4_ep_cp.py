@@ -24,7 +24,7 @@ from contextlib import nullcontext
 import ray
 import torch
 import torch.nn.functional as F
-from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.placement_group import remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from torch import distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -890,10 +890,7 @@ class TestFsdpVsEpCp(unittest.TestCase):
                 assert world_size % cp_size == 0
                 assert world_size % ep_size == 0
 
-                pg = placement_group(
-                    [{"GPU": 1, "CPU": 1}] * world_size, strategy="PACK",
-                )
-                ray.get(pg.ready())
+                pg = _create_placement_group(world_size)
 
                 print("=" * 60)
                 print(
@@ -910,7 +907,7 @@ class TestFsdpVsEpCp(unittest.TestCase):
                     input_mode=input_mode,
                 )
 
-                remove_placement_group(pg)
+                remove_placement_group(pg[0])
 
                 peaks = [r["mem_peak_fwd_bwd_gib"] for r in results]
                 after_shard = [r["mem_after_shard_gib"] for r in results]

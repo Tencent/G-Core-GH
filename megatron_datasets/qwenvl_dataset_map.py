@@ -21,6 +21,7 @@ from transformers import (
     Qwen3VLVideoProcessor,
     WhisperFeatureExtractor,
 )
+from transformers.image_utils import is_valid_image
 from transformers.models.auto.processing_auto import AutoProcessor
 from transformers.utils.import_utils import is_torchcodec_available
 from transformers.video_utils import VideoMetadata
@@ -288,11 +289,20 @@ class UserQwen2VLImageProcessorFast(Qwen2VLImageProcessorFast):
 
     @override
     def fetch_images(self, image_url_or_urls: Union[str, list[str], list[list[str]]]):
+        # Newer transformers call fetch_images twice: once for index/URL strings,
+        # then again inside Fast image processor __call__ with already-loaded PIL.
         if isinstance(image_url_or_urls, list):
             return [self.fetch_images(x) for x in image_url_or_urls]
         if isinstance(image_url_or_urls, str):
+            assert self.tmp_images is not None, "tmp_images is not set before fetch_images"
             idx = int(image_url_or_urls)
             return self.tmp_images[idx]
+        if is_valid_image(image_url_or_urls):
+            return image_url_or_urls
+        raise TypeError(
+            "only a single or a list of entries is supported but got "
+            f"type={type(image_url_or_urls)}"
+        )
 
 
 class QwenVlDatasetMap(MultiModalDatasetMap):

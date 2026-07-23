@@ -1,0 +1,15 @@
+# @package _global_
+# Strictly on-policy: train_batch_size=1 prompt x rollout.n=8 = 8 samples,
+# ppo_mini_batch_size=1 prompt x 8 = 8 samples/step -> 1 optimizer step/rollout.
+# rollout.n (= gcore sampling_repeat_n) and ppo_epochs (= gcore ppo_max_epochs_2)
+# are part of the policy regime. Start from HF base weights, never resume a prior
+# run's checkpoint, and disable checkpoint saving so nothing is auto-resumed later.
+data:
+  train_batch_size: 4
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 4
+    ppo_epochs: 1
+  rollout:
+    n: 8

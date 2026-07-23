@@ -21,18 +21,45 @@ from copy import deepcopy
 from typing import Literal, Optional
 
 import safetensors
-from safetensors import safe_open
-import safetensors.torch as st_torch
 import torch
 import torch.nn as nn
+from safetensors import safe_open
 from torch import distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
 from gpatch_v4.utils import log_debug
+from gpatch_v4.utils.safetensor_io import save_file
 
 from .weight_export import _classify_for_save  # re-export for tests
 from .weight_export import _model_key_to_disk_key  # re-export for tests
 from .weight_export import iter_disk_checkpoint_tensors, resolve_dsv4_export_dtypes
+
+# ---------------------------------------------------------------------------
+# Checkpoint key ordering
+# ---------------------------------------------------------------------------
+
+_ROUTED_EXPERT_DISK_KEY_RE = re.compile(
+    r"^(?:(layers)\.(\d+)|(mtp)\.(\d+))\.ffn\.experts\.(\d+)\."
+    r"(w[123])\.(weight|scale)$"
+)
+_EXPERT_WEIGHT_PART_ORDER = {"w1": 0, "w2": 1, "w3": 2}
+_EXPERT_TENSOR_KIND_ORDER = {"weight": 0, "scale": 1}
+
+
+def routed_expert_disk_key_order(disk_key: str) -> tuple[int, int, int, int, int]:
+    """
+    Return a numeric ordering key for routed MoE checkpoint entries.
+    """
+    match = _ROUTED_EXPERT_DISK_KEY_RE.match(disk_key)
+    if match is None:
+        raise ValueError(f"not a routed-expert disk key: {disk_key}")
+    namespace = 0 if match.group(1) == "layers" else 1
+    layer = int(match.group(2) or match.group(4))
+    expert = int(match.group(5))
+    weight_part = _EXPERT_WEIGHT_PART_ORDER[match.group(6)]
+    tensor_kind = _EXPERT_TENSOR_KIND_ORDER[match.group(7)]
+    return namespace, layer, expert, weight_part, tensor_kind
+
 
 # ---------------------------------------------------------------------------
 # Meta-buffer materialization (RoPE only; other persistent buffers come from ckpt)
@@ -274,6 +301,19 @@ def _load_checkpoint_hp(
     for disk_key, shard_file in weight_map.items():
         by_shard[shard_file].append(disk_key)
 
+    # Keep ordinary keys in their existing shard-local order.
+    regular_entries: list[tuple[str, str]] = []
+    routed_expert_entries: list[tuple[str, str]] = []
+    for shard_file in sorted(by_shard):
+        for disk_key in by_shard[shard_file]:
+            entry = (shard_file, disk_key)
+            if _ROUTED_EXPERT_DISK_KEY_RE.match(disk_key):
+                routed_expert_entries.append(entry)
+            else:
+                regular_entries.append(entry)
+    routed_expert_entries.sort(key=lambda entry: routed_expert_disk_key_order(entry[1]))
+    ordered_entries = regular_entries + routed_expert_entries
+
     # ``fqn_to_mapping[target_fqn] = mapping`` whose ``collected_tensors`` holds
     # lazy readers (each re-opens its shard on call — safetensors mmap is cheap
     # and the OS dedupes shared pages across reads).
@@ -311,87 +351,82 @@ def _load_checkpoint_hp(
     # 3) Single pass: route each raw key into the right converter bucket with a
     # lazy reader. We do NOT keep safe_open contexts open across the loop —
     # each reader re-opens its shard at materialization time.
-    for shard_file in sorted(by_shard):
+    for shard_file, disk_key in ordered_entries:
         shard_path = os.path.join(hf_path, shard_file)
-        for disk_key in by_shard[shard_file]:
-            # Dequantized-variant only: strictly skip the phantom wo_a.scale keys
-            if is_sgl_ckpt_fmt and _WO_A_SCALE_RE.match(disk_key):
-                phantom_keys.append(disk_key)
-                continue
-            logical_disk_key = disk_key
-            _is_mtp_key = (num_mtp_layers > 0 and disk_key.startswith("mtp."))
-            if _is_mtp_key:
-                mtp_m = re.match(r"^mtp\.(\d+)\.(.+)$", disk_key)
-                if mtp_m is not None:
-                    mtp_depth = int(mtp_m.group(1))
-                    if mtp_depth < num_mtp_layers:
-                        logical_disk_key = (
-                            f"layers.{num_base_layers + mtp_depth}.{mtp_m.group(2)}"
-                        )
-                        # MTP-only top-level attributes that HF conversion
-                        # mapping doesn't handle (no renaming/converter rule):
-                        # disk "hc_head_fn" → model "hc_head.hc_fn", etc.
-                        # These exist as direct layer attrs on disk but as
-                        # nested submodule attrs in the model (DeepseekV4HyperHead).
-                        logical_disk_key = re.sub(
-                            r"\.hc_head_(fn|base|scale)$",
-                            r".hc_head.hc_\1",
-                            logical_disk_key,
-                        )
-                    else:
-                        _is_mtp_key = False  # out-of-range depth, treat as non-MTP
+        # Dequantized-variant only: strictly skip the phantom wo_a.scale keys
+        if is_sgl_ckpt_fmt and _WO_A_SCALE_RE.match(disk_key):
+            phantom_keys.append(disk_key)
+            continue
+        logical_disk_key = disk_key
+        _is_mtp_key = (num_mtp_layers > 0 and disk_key.startswith("mtp."))
+        if _is_mtp_key:
+            mtp_m = re.match(r"^mtp\.(\d+)\.(.+)$", disk_key)
+            if mtp_m is not None:
+                mtp_depth = int(mtp_m.group(1))
+                if mtp_depth < num_mtp_layers:
+                    logical_disk_key = (f"layers.{num_base_layers + mtp_depth}.{mtp_m.group(2)}")
+                    # MTP-only top-level attributes that HF conversion
+                    # mapping doesn't handle (no renaming/converter rule):
+                    # disk "hc_head_fn" → model "hc_head.hc_fn", etc.
+                    # These exist as direct layer attrs on disk but as
+                    # nested submodule attrs in the model (DeepseekV4HyperHead).
+                    logical_disk_key = re.sub(
+                        r"\.hc_head_(fn|base|scale)$",
+                        r".hc_head.hc_\1",
+                        logical_disk_key,
+                    )
+                else:
+                    _is_mtp_key = False  # out-of-range depth, treat as non-MTP
 
-            # For MTP disk keys, pass prefix=None to skip rename_source_key's
-            # step 3 "meta_sd prefix heuristic" — that logic fails when the
-            # model is truncated (meta_sd has no model.layers.{base+d}.*
-            # entries). We manually add the prefix + do MTP remap below.
-            renamed_key, source_pattern = rename_source_key(
-                logical_disk_key,
-                renamings,
-                converters,
-                None if _is_mtp_key else prefix,
-                None if _is_mtp_key else meta_sd,
-            )
+        # For MTP disk keys, pass prefix=None to skip rename_source_key's
+        # step 3 "meta_sd prefix heuristic" — that logic fails when the
+        # model is truncated (meta_sd has no model.layers.{base+d}.*
+        # entries). We manually add the prefix + do MTP remap below.
+        renamed_key, source_pattern = rename_source_key(
+            logical_disk_key,
+            renamings,
+            converters,
+            None if _is_mtp_key else prefix,
+            None if _is_mtp_key else meta_sd,
+        )
 
-            if _is_mtp_key:
-                # Manual prefix + MTP remap: renamed_key is e.g.
-                # "layers.4.self_attn.kv_proj.weight" (no "model." prefix).
-                # Strip any leading "layers." (the converter may or may not
-                # output it), normalise to "layers.{N}.X", then remap.
-                _mtp_check = renamed_key
-                if _mtp_check.startswith("model."):
-                    _mtp_check = _mtp_check[len("model."):]
-                layer_m = re.match(r"^layers\.(\d+)\.(.+)$", _mtp_check)
-                if layer_m is not None:
-                    layer_idx = int(layer_m.group(1))
-                    if num_base_layers <= layer_idx < (num_base_layers + num_mtp_layers):
-                        renamed_key = (
-                            f"mtp.layers.{layer_idx - num_base_layers}.{layer_m.group(2)}"
-                        )
+        if _is_mtp_key:
+            # Manual prefix + MTP remap: renamed_key is e.g.
+            # "layers.4.self_attn.kv_proj.weight" (no "model." prefix).
+            # Strip any leading "layers." (the converter may or may not
+            # output it), normalise to "layers.{N}.X", then remap.
+            _mtp_check = renamed_key
+            if _mtp_check.startswith("model."):
+                _mtp_check = _mtp_check[len("model."):]
+            layer_m = re.match(r"^layers\.(\d+)\.(.+)$", _mtp_check)
+            if layer_m is not None:
+                layer_idx = int(layer_m.group(1))
+                if num_base_layers <= layer_idx < (num_base_layers + num_mtp_layers):
+                    renamed_key = (f"mtp.layers.{layer_idx - num_base_layers}.{layer_m.group(2)}")
 
-            if renamed_key not in meta_sd:
-                skipped_keys.append(disk_key)
-                continue
+        if renamed_key not in meta_sd:
+            skipped_keys.append(disk_key)
+            continue
 
-            if source_pattern is not None:
-                # Clone the converter per target so collected_tensors stays scoped.
-                mapping = fqn_to_mapping.setdefault(
-                    renamed_key,
-                    deepcopy(pattern_to_converter[source_pattern]),
-                )
-            else:
-                mapping = fqn_to_mapping.setdefault(
-                    renamed_key,
-                    WeightRenaming(logical_disk_key, renamed_key),
-                )
-                source_pattern = logical_disk_key
-
-            mapping.add_tensor(
+        if source_pattern is not None:
+            # Clone the converter per target so collected_tensors stays scoped.
+            mapping = fqn_to_mapping.setdefault(
                 renamed_key,
-                disk_key,
-                source_pattern,
-                _make_reader(shard_path, disk_key),
+                deepcopy(pattern_to_converter[source_pattern]),
             )
+        else:
+            mapping = fqn_to_mapping.setdefault(
+                renamed_key,
+                WeightRenaming(logical_disk_key, renamed_key),
+            )
+            source_pattern = logical_disk_key
+
+        mapping.add_tensor(
+            renamed_key,
+            disk_key,
+            source_pattern,
+            _make_reader(shard_path, disk_key),
+        )
     '''
     [load_checkpoint_hp] phase 1 (build pipeline): 0.02s
     [load_checkpoint_hp] phase 2-3 (discover shards + route keys): 5.00s (69187 raw keys → 29 targets, 67616 skipped)
@@ -837,6 +872,7 @@ def _discover_safetensor_shards(hf_path: str, ) -> tuple[dict[str, str], list[st
 # Checkpoint saver: streaming gather + FP4/FP8 re-quantize → DSV4-Flash format
 # ---------------------------------------------------------------------------
 
+
 def _rank0_finalize(
     self: nn.Module,
     save_path: str,
@@ -913,7 +949,7 @@ def _rank0_finalize(
                         return
                     global_idx += 1
                     shard_name = f"model-{global_idx:05d}-{_INTERMEDIATE_SUFFIX}"
-                    st_torch.save_file(mtp_pending, os.path.join(save_path, shard_name))
+                    save_file(mtp_pending, os.path.join(save_path, shard_name))
                     for k in mtp_pending:
                         tensor_to_filename[k] = shard_name
                     mtp_pending = {}
@@ -970,7 +1006,7 @@ def _rank0_finalize(
                     if mtp_pending_size >= max_shard_size:
                         global_idx += 1
                         shard_name = f"model-{global_idx:05d}-{_INTERMEDIATE_SUFFIX}"
-                        st_torch.save_file(mtp_pending, os.path.join(save_path, shard_name))
+                        save_file(mtp_pending, os.path.join(save_path, shard_name))
                         for k in mtp_pending:
                             tensor_to_filename[k] = shard_name
                         mtp_pending = {}
@@ -978,7 +1014,7 @@ def _rank0_finalize(
             if mtp_pending:
                 global_idx += 1
                 shard_name = f"model-{global_idx:05d}-{_INTERMEDIATE_SUFFIX}"
-                st_torch.save_file(mtp_pending, os.path.join(save_path, shard_name))
+                save_file(mtp_pending, os.path.join(save_path, shard_name))
                 for k in mtp_pending:
                     tensor_to_filename[k] = shard_name
             if mtp_total_bytes > 0:
@@ -1238,8 +1274,6 @@ def _save_checkpoint_hp(
     """
     import time as _time
 
-    import safetensors.torch
-
     assert dtype_format in ("quantized", "bf16"), dtype_format
 
     rank = dist.get_rank()
@@ -1297,7 +1331,7 @@ def _save_checkpoint_hp(
         local_shard_idx += 1
         shard_name = (f"model-rank{rank:02d}-{local_shard_idx:05d}-{placeholder_shard_suffix}")
         shard_path = os.path.join(save_path, shard_name)
-        safetensors.torch.save_file(pending, shard_path)
+        save_file(pending, shard_path)
         for key, tensor in pending.items():
             local_tensor_to_filename[key] = shard_name
             local_total_size_bytes += tensor.element_size() * tensor.nelement()

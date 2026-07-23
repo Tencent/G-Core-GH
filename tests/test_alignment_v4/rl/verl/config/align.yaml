@@ -1,0 +1,13 @@
+# verl RL alignment entry. The default group selection reproduces step1 (single
+# GPU, all parallelism off, strictly on-policy, GRPO), matching the gcore align.yaml
+# defaults. Override groups on the CLI, e.g.:
+#   ... --config-name align parallelism=hybrid_parallelism staleness=off_policy
+# (hydra.searchpath="[pkg://verl.trainer.config]" is injected by scripts/run.sh.)
+defaults:
+  - base
+  - loss: grpo
+  - model: dense
+  - parallelism: hybrid_parallelism
+  - staleness: on_policy
+  - rollout: sglang
+  - _self_

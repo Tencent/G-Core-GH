@@ -118,6 +118,10 @@ class ReportConfig(MappingProtocol):
                 '      executed numerous times during each iteration. '
         }
     )
+    verl_metric_map_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "DEBUG: gcore->verl 指标映射 yaml 路径；提供时额外翻译并上报 verl 命名的对齐指标。"},
+    )
     profile: ProfileConfig = field(default_factory=ProfileConfig)
 
     def __post_init__(self):

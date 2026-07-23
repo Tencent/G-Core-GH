@@ -118,16 +118,27 @@ class EnvAgentLoopActor(AgentLoopActor):
             return await asyncio.to_thread(mgr.run, seed, ppo_step, cleaned_data)
 
     @staticmethod
-    def _merge_env_results(results: list, cleaned_data: dict, repeat_n: int) -> dict:
-        """Merge ``repeat_n`` env trajectory results into one rollout batch."""
+    def _merge_env_results(results: list, cleaned_data: dict, repeat_n: int, group_id: int) -> dict:
+        """Merge ``repeat_n`` env trajectory results into one rollout batch.
+
+        Layout is traj-major: traj_0 segments, then traj_1, ...
+        Assigns ``group_id`` / ``traj_id`` / ``segment_id`` for each segment.
+        """
+        assert len(results) == repeat_n, f"len(results) expect {repeat_n}, but get {len(results)}"
         merged: dict = {}
+        first_key = list(results[0].keys())[0]
+        unique_id = cleaned_data.get("unique_id", [group_id])[0]
+        for traj_id in range(len(results)):
+            num_segments = len(results[traj_id][first_key])
+            assert num_segments > 0, f"traj {traj_id} has zero segments"
+            results[traj_id]["unique_id"] = [unique_id] * num_segments
+            results[traj_id]["group_id"] = [unique_id] * num_segments
+            results[traj_id]["traj_id"] = [traj_id] * num_segments
+            results[traj_id]["segment_id"] = list(range(num_segments))
         for key in results[0]:
             merged[key] = []
             for r in results:
                 merged[key].extend(r[key])
-        if "unique_id" in cleaned_data:
-            uid = cleaned_data["unique_id"][0]
-            merged["unique_id"] = [uid] * repeat_n
         return merged
 
     async def generate_batches(
@@ -160,10 +171,14 @@ class EnvAgentLoopActor(AgentLoopActor):
                         for j, mgr in enumerate(managers)
                     ]
                 )
-                all_merged.append(self._merge_env_results(results, cd, repeat_n))
+                merged = self._merge_env_results(results, cd, repeat_n, group_seed)
+                all_merged.append(merged)
                 log(
                     f"[env_rollout] END worker_id={self.worker_id} "
                     f"ppo_step={ppo_step} sample_idx={sidx} repeat_n={repeat_n} "
-                    f"elapsed_s={time.time() - _t0:.3f}"
+                    f"elapsed_s={time.time() - _t0:.3f} "
+                    f"num_segments={len(merged['tokens'])} "
+                    f"traj_id={merged['traj_id']} segment_id={merged['segment_id']} "
+                    f"group_id={merged['group_id']}"
                 )
         return all_merged

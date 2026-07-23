@@ -68,7 +68,13 @@ from einops import rearrange
 from gpatch_v4.models.hp_module import HpModule
 
 from .a2a import all_to_all_uneven
-from .cp import build_cp_causal_mask, compressor_cp_ag, compressor_cp_ring, swa_ring_kv
+from .cp import (
+    build_cp_causal_mask,
+    compressor_cp_ag,
+    compressor_cp_ring,
+    indexer_zigzag_all_to_all,
+    swa_ring_kv,
+)
 from .deepep_a2a import fused_combine, fused_dispatch
 from .kernel.tilelang_indexer_fwd import _make_causal_cu_seqlens, batched_indexer_fwd
 from .kernel.tilelang_sparse_mla import sparse_attn_tilelang
@@ -163,7 +169,6 @@ class DeepseekV4HCACompressor(nn.Module):
         else:
             cp_rank = torch.distributed.get_rank(cp_group)
             m = self.compress_rate
-            # todo zz: validate chunks and derive folded HCA positions
             assert s_local % m == 0
             first_window_position = cp_rank * s_local
             n_local_windows = s_local // m
@@ -212,7 +217,6 @@ class DeepseekV4HCACompressor(nn.Module):
         # sequence in absolute-position order.
         if cp_group is not None:
             assert n_local_windows is not None
-            # todo zz: restore global HCA window order
             compressed_kv = compressor_cp_ag(
                 compressed_kv, cp_group, 0, n_local_windows,
             )
@@ -340,11 +344,9 @@ class DeepseekV4Indexer(nn.Module):
         else:
             cp_rank = torch.distributed.get_rank(cp_group)
             m = self.compress_rate
-            # todo zz: validate every folded chunk is m-aligned
             assert s_local % m == 0
             l_prefix = 0 if cp_rank == 0 else m
 
-            # todo zz: represent interleaved per-piece prefixes; one leading trim is invalid
             first_window_position = cp_rank * s_local - l_prefix
             n_local_windows = s_local // m
             n_prefix_windows = l_prefix // m
@@ -399,7 +401,6 @@ class DeepseekV4Indexer(nn.Module):
             # position ids compat with THD format
             if packed_seq_params is None:
                 positions = torch.arange(n_windows, device=compressed.device)
-                # todo zz: derive Indexer window positions from folded prefix layout
                 positions = positions * self.compress_rate + first_window_position
             else:
                 positions = packed_seq_params.layout.per_m[self.compress_rate].wnd_pos_ids_with_prefix
@@ -422,25 +423,31 @@ class DeepseekV4Indexer(nn.Module):
         if cp_group is not None:
             assert n_local_windows is not None
             # compressor_cp_post operates on a [B, 1, T, D] layout
-            # todo zz: trim all folded prefixes and restore global Indexer window order
             compressed_kv = compressor_cp_ag(
                 compressed_kv.unsqueeze(1), cp_group, n_prefix_windows, n_local_windows,
             ).squeeze(1)
 
-        # todo zz: keep query-local states separate from interleaved prefix states
+        # todo 加多一个 position_ids_zz，预先计算完成。
         cos_q, sin_q = self.rotary_emb(local_hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
+        # todo 这里提前交换 q_r
         q = self.q_b_proj(q_residual).view(batch, s_local, -1, self.head_dim).transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
         if self.config.fp8_qat:
-            # indexer q torch.Size([1, 128, 64, 128])
+            # indexer q torch.Size([1, s/p, 64, 128])
             idx_nope = self.head_dim - self.config.qk_rope_head_dim
             q = torch.cat([fp8_simulate_qat(q[..., :idx_nope], 64), q[..., idx_nope:]], dim=-1)
 
         # ReLU(q·kᵀ) * weights, then top-k
+        b_rebalance_zz = (
+            cp_group is not None
+            and dist.get_world_size(cp_group) > 1
+            and packed_seq_params is not None
+            and self.config.indexer_backend == 'fused'
+        )
         if self.config.indexer_backend == 'fused':
             weights = self.weights_proj(local_hidden_states).float() * self.weights_scaling
-            q_sbhd = rearrange(q, 'b s h d -> s b h d').contiguous().to(torch.bfloat16)
-            k_sbd = rearrange(compressed_kv, 'b t d -> t b d').contiguous().to(torch.bfloat16)
+            q_sbhd = rearrange(q, 'b s h d -> s b h d').contiguous()
+            k_sbd = rearrange(compressed_kv, 'b t d -> t b d').contiguous()
             w_sbh = rearrange(weights, 'b s h -> s b h').contiguous()
             if packed_seq_params is None:
                 positions = position_ids[0].to(torch.int32)
@@ -448,11 +455,28 @@ class DeepseekV4Indexer(nn.Module):
                     s_local, compressed_kv.shape[1], self.compress_rate, device, positions=positions,
                 )
             else:
-                per_m = packed_seq_params.layout.per_m[self.compress_rate]
+                layout = packed_seq_params.layout
+                per_m = layout.per_m[self.compress_rate]
                 seg_starts = (packed_seq_params.cu_seqlens_q_padded[:-1] // self.compress_rate).to(device)
-                cu_ks = seg_starts[packed_seq_params.layout.seg_id_per_token].to(torch.int32)
-                cu_ke = per_m.causal_threshold_per_token.to(device=device, dtype=torch.int32)
+                if b_rebalance_zz:
+                    assert layout.seg_id_per_token_zz is not None
+                    assert per_m.causal_threshold_per_token_zz is not None
+                    cu_ks = seg_starts[layout.seg_id_per_token_zz].to(torch.int32)
+                    cu_ke = per_m.causal_threshold_per_token_zz.to(device=device, dtype=torch.int32)
+                else:
+                    cu_ks = seg_starts[layout.seg_id_per_token].to(torch.int32)
+                    cu_ke = per_m.causal_threshold_per_token.to(device=device, dtype=torch.int32)
+
+            if b_rebalance_zz:
+                q_sbhd, w_sbh = indexer_zigzag_all_to_all(
+                    (q_sbhd, w_sbh),
+                    packed_seq_params,
+                    cp_group,
+                    seq_dim=0,
+                    cont_to_zz=True,
+                )
             index_scores = batched_indexer_fwd(q_sbhd, k_sbd, w_sbh, cu_ks, cu_ke)  # [B, S, T]
+
         else:
             scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))  # [B, S, H, T]
             scores = F.relu(scores) * self.softmax_scale
@@ -468,35 +492,55 @@ class DeepseekV4Indexer(nn.Module):
         # 12 to 16. Thus we need to make sure that top_k does not land in that range.
         # Picks that still point past `causal_threshold` (early queries with too few ready
         # blocks) are replaced with a `-1` sentinel that the compresser treats as invalid.
-        if compressed_len > 0:
-            if packed_seq_params is None:
-                causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
-                entry_indices = torch.arange(compressed_len, device=index_scores.device)
-                future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)  # [B, S, T]
-                index_scores = index_scores.masked_fill(future_mask, float("-inf"))
-                top_k_indices = index_scores.topk(top_k, dim=-1).indices  # [B, S, k]
-                invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
-            else:
-                # [b=1, s_local, n_windows]
-                wnd_idx = torch.arange(compressed_len, device=device)
-                per_m = packed_seq_params.layout.per_m[self.compress_rate]
-                future_mask = wnd_idx.view(1, 1, -1) >= per_m.causal_threshold_per_token.view(1, -1, 1)
+        assert compressed_len > 0
 
-                # [s_local, n_windows] bool mask, True if the token's seg is different from the window's seg
-                cross_seg_mask = packed_seq_params.layout.seg_id_per_token.unsqueeze(-1) != per_m.seg_id_per_wnd.unsqueeze(0)
-                future_mask = future_mask | cross_seg_mask.view(1, s_local, compressed_len)
-                index_scores = index_scores.masked_fill(future_mask, float("-inf"))
-                top_k_indices = index_scores.topk(top_k, dim=-1).indices  # [B, S, k]
-
-                # invalid: top-k landed on a future window OR a window from a different seg.
-                future_invalid = top_k_indices >= per_m.causal_threshold_per_token.view(1, -1, 1)
-                # gather seg id at each picked window: [B=1, s_local, k]
-                seg_id_at_topk = per_m.seg_id_per_wnd[top_k_indices]
-                cross_seg_invalid = seg_id_at_topk != packed_seq_params.layout.seg_id_per_token.view(1, -1, 1)
-                invalid = future_invalid | cross_seg_invalid
-
+        if packed_seq_params is None:
+            causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
+            entry_indices = torch.arange(compressed_len, device=index_scores.device)
+            future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)  # [B, S, T]
+            index_scores = index_scores.masked_fill(future_mask, float("-inf"))
+            top_k_indices = index_scores.topk(top_k, dim=-1).indices  # [B, S, k]
+            invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
             return torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
-        return index_scores.topk(top_k, dim=-1).indices
+
+        layout = packed_seq_params.layout
+        per_m = layout.per_m[self.compress_rate]
+        if b_rebalance_zz:
+            assert layout.seg_id_per_token_zz is not None
+            assert per_m.causal_threshold_per_token_zz is not None
+            causal_threshold = per_m.causal_threshold_per_token_zz
+            seg_id_per_token = layout.seg_id_per_token_zz
+        else:
+            causal_threshold = per_m.causal_threshold_per_token
+            seg_id_per_token = layout.seg_id_per_token
+
+        # [b=1, s_local, n_windows]
+        wnd_idx = torch.arange(compressed_len, device=device)
+        future_mask = wnd_idx.view(1, 1, -1) >= causal_threshold.view(1, -1, 1)
+
+        # [s_local, n_windows] bool mask, True if the token's seg is different from the window's seg
+        cross_seg_mask = seg_id_per_token.unsqueeze(-1) != per_m.seg_id_per_wnd.unsqueeze(0)
+        future_mask = future_mask | cross_seg_mask.view(1, s_local, compressed_len)
+        index_scores = index_scores.masked_fill(future_mask, float("-inf"))
+        top_k_indices = index_scores.topk(top_k, dim=-1).indices  # [B, S, k]
+
+        # invalid: top-k landed on a future window OR a window from a different seg.
+        future_invalid = top_k_indices >= causal_threshold.view(1, -1, 1)
+        # gather seg id at each picked window: [B=1, s_local, k]
+        seg_id_at_topk = per_m.seg_id_per_wnd[top_k_indices]
+        cross_seg_invalid = seg_id_at_topk != seg_id_per_token.view(1, -1, 1)
+        invalid = future_invalid | cross_seg_invalid
+        top_k_indices = torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
+
+        if b_rebalance_zz:
+            (top_k_indices,) = indexer_zigzag_all_to_all(
+                (top_k_indices,),
+                packed_seq_params,
+                cp_group,
+                seq_dim=1,
+                cont_to_zz=False,
+            )
+        return top_k_indices
 
 
 class DeepseekV4CSACompressor(nn.Module):
@@ -559,12 +603,10 @@ class DeepseekV4CSACompressor(nn.Module):
         else:
             cp_rank = torch.distributed.get_rank(cp_group)
             m = self.compress_rate
-            # todo zz: validate every folded chunk is m-aligned
             assert s_local % m == 0
 
             # Stage 1: send last m hidden_states to next rank, recv from prev.
             # NOTE: l_prefix is always 0 for rank 0, and m for rank > 0.
-            # todo zz: build per-segment folded compressor prefix views
             hs_with_prefix, l_prefix = compressor_cp_ring(hidden_states, m, cp_group)
             hidden_states = hs_with_prefix
 
@@ -626,7 +668,6 @@ class DeepseekV4CSACompressor(nn.Module):
             # position ids compat with THD format
             if packed_seq_params is None:
                 positions = torch.arange(n_windows, device=compressed.device)
-                # todo zz: derive CSA window positions from folded prefix layout
                 positions = positions * self.compress_rate + first_window_position
             else:
                 positions = packed_seq_params.layout.per_m[self.compress_rate].wnd_pos_ids_with_prefix
@@ -648,7 +689,6 @@ class DeepseekV4CSACompressor(nn.Module):
         # ---- CP stage-2: trim duplicate prefix windows + all-gather ----
         if cp_group is not None:
             assert n_local_windows is not None
-            # todo zz: trim all folded prefixes and restore global CSA window order
             compressed_kv = compressor_cp_ag(
                 compressed_kv, cp_group, n_prefix_windows, n_local_windows,
             )
@@ -662,7 +702,6 @@ class DeepseekV4CSACompressor(nn.Module):
         # at the valid top-k entries and leaves `-inf` everywhere else (the
         # scatter sentinel `compressed_len` falls into a one-wider tail column
         # that we drop afterwards).
-        # todo zz: pass unprefixed query states separately to Indexer
         top_k_indices = self.indexer(
             hidden_states, q_residual, position_ids, past_key_values, layer_idx,
             cp_group=cp_group,
@@ -815,7 +854,6 @@ class DeepseekV4Attention(nn.Module):
             cp_group = self.cp_group
 
             # SWA ring: prepend prev-rank's last sliding_window-1 KVs.
-            # todo zz: build per-segment folded SWA KV prefix views
             kv = swa_ring_kv(kv, cp_group, self.sliding_window)
             swa_kv_len = kv.shape[2]
 
@@ -955,7 +993,6 @@ class DeepseekV4Experts(nn.Module):
         self.ep_rank = 0
         self.ep_group: Optional[dist.ProcessGroup] = None
         self.num_local_experts = self.num_experts
-        self.ep_backend = "eager"
 
     def forward(
         self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
@@ -985,11 +1022,11 @@ class DeepseekV4Experts(nn.Module):
             "DeepseekV4Experts.forward requires ep_group; "
             "did you forget to call apply_hp(model, ep_2d_mesh)?"
         )
-        if self.ep_backend == "eager":
+        if self.config.ep_backend == "eager":
             return self._forward_eager(hidden_states, top_k_index, top_k_weights)
-        if self.ep_backend == "deepep":
+        if self.config.ep_backend == "deepep":
             return self._forward_deepep(hidden_states, top_k_index, top_k_weights)
-        raise ValueError(f"unknown ep_backend: {self.ep_backend}")
+        raise ValueError(f"unknown ep_backend: {self.config.ep_backend}")
 
     def _forward_eager(
         self,
@@ -1175,6 +1212,7 @@ class DeepseekV4Experts(nn.Module):
 class DeepseekV4TopKRouter(nn.Module):
     def __init__(self, config: DeepseekV4Config):
         super().__init__()
+        self.config = config
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_local_experts
         self.hidden_dim = config.hidden_size
@@ -1190,7 +1228,18 @@ class DeepseekV4TopKRouter(nn.Module):
         logits = F.linear(flat, self.weight)
         scores = self.score_fn(logits)
         rr = self.router_replay
-        if rr is None:
+        if self.config.moe_router_force_load_balancing:
+            # Benchmark-only: uniform-ish expert load via random unique top-k.
+            assert rr is None, (
+                "moe_router_force_load_balancing and router_replay are mutually exclusive"
+            )
+            indices = torch.topk(
+                torch.randn(scores.shape, device=scores.device, dtype=scores.dtype),
+                self.top_k,
+                dim=-1,
+                sorted=False,
+            ).indices
+        elif rr is None:
             indices = torch.topk(
                 scores + self.e_score_correction_bias, self.top_k, dim=-1, sorted=False
             ).indices
@@ -1396,7 +1445,6 @@ def _build_swa_topk(
     Handles both BSHD (``packed_seq_params=None``) and THD
     (cross-seg positions masked to ``-1``).
     """
-    # todo zz: index folded q rows against interleaved SWA KV slots
     assert sliding_window <= s_local
     ta = torch.arange(s_local, device=device).view(1, -1, 1)
     tb = torch.arange(sliding_window, device=device).view(1, 1, -1)
@@ -1438,7 +1486,6 @@ def _build_attn_mask_or_swa_topk(
         if cp_active:
             s_local = inputs_embeds.shape[1]
             assert config.sliding_window <= s_local
-            # todo zz: build eager mask from folded q and KV position maps
             swa_prefix_len = 0 if cp_rank == 0 else config.sliding_window - 1
             causal_mask = build_cp_causal_mask(
                 s_local, cp_rank, swa_prefix_len, config.sliding_window,
@@ -1551,7 +1598,6 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             # `create_masks_for_generate`; all V4 layer types use the same sliding-window
             # mask, so use the prebuilt one directly. Otherwise build it here.
 
-        # todo zz: pass cp_size and folded metadata to mask/top-k builder
         causal_mask, swa_topk = _build_attn_mask_or_swa_topk(
             config=self.config,
             inputs_embeds=inputs_embeds,

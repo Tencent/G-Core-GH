@@ -4,7 +4,7 @@ import torch
 from gpatch.core.smart_pad_helper import postprocess_packed_seqs, preprocess_packed_seqs
 
 
-def gptmodel_pack_foward(model, batch, fwd_kwargs):
+def gptmodel_pack_foward(model, batch, fwd_kwargs, config):
     # If a pre-built packed_seq_params is already present (e.g. DSv4 mcore CP THD
     # built by _sft_train_mcore_cp_thd), pass it through directly without
     # reconstructing a new PSP from the pad-mask.  The model receives the correct
@@ -20,6 +20,10 @@ def gptmodel_pack_foward(model, batch, fwd_kwargs):
 
     #TODO(hessianiu)
     # add support for contiguous cp_partition_mode
+    assert config.debug.debug_align_mode, (
+        "If you do not provide packed_seq_params, debug.debug_align_mode must be True"
+    )
+    assert not config.training.enable_mtp, ("internal packing path does not support MTP training")
 
     # pack seq len
     assert not (
@@ -40,7 +44,7 @@ def gptmodel_pack_foward(model, batch, fwd_kwargs):
     input_ids_rmpad = input_ids_rmpad.contiguous()
     output_rmpad = model(
         input_ids=input_ids_rmpad,
-        position_ids=fwd_kwargs['position_ids'],
+        position_ids=None,
         attention_mask=None,
         labels=None,
         packed_seq_params=packed_seq_params,

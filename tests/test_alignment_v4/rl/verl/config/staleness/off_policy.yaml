@@ -1,0 +1,15 @@
+# @package _global_
+# Off-policy: train_batch_size=8 prompts x rollout.n=8 = 64 samples,
+# ppo_mini_batch_size=1 prompt x 8 = 8 samples/step -> 8 optimizer steps/rollout
+# (verl multiplies ppo_mini_batch_size by rollout.n internally). rollout.n
+# (= gcore sampling_repeat_n) and ppo_epochs (= gcore ppo_max_epochs_2) are part
+# of the policy regime.
+data:
+  train_batch_size: 4
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 1
+    ppo_epochs: 1
+  rollout:
+    n: 8

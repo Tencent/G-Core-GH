@@ -3,8 +3,11 @@
 
 import inspect
 
-import torch
 import pytest
+
+pytest.importorskip("vllm")
+
+import torch
 from torch import nn
 from types import SimpleNamespace
 

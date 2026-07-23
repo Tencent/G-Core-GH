@@ -44,7 +44,6 @@ VOCAB = 16
 @ray.remote(num_gpus=1)
 class CpMappingsWorker:
     """Single-GPU worker for CP all_gather correctness tests."""
-
     def get_master_addr_and_port(self) -> Tuple[str, int]:
         ip = socket.gethostbyname(socket.gethostname())
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -57,7 +56,9 @@ class CpMappingsWorker:
         os.environ["NCCL_CUMEM_ENABLE"] = "0"
         torch.cuda.set_device(0)
         torch.distributed.init_process_group(
-            backend="nccl", rank=rank, world_size=world_size,
+            backend="nccl",
+            rank=rank,
+            world_size=world_size,
         )
         self.rank = rank
         self.world_size = world_size
@@ -108,7 +109,8 @@ class CpMappingsWorker:
         from gpatch_v4.core.mappings import all_gather_from_context_parallel_region_no_zigzag
 
         # Deterministic tensor, identical on every rank.
-        full_src = torch.arange(BATCH * SEQ, dtype=torch.float32, device=self.device).view(BATCH, SEQ)
+        full_src = torch.arange(BATCH * SEQ, dtype=torch.float32,
+                                device=self.device).view(BATCH, SEQ)
         local = self._cp_chunk_non_zigzag(full_src).clone().requires_grad_(True)
 
         with torch.enable_grad():
@@ -153,9 +155,7 @@ class CpMappingsWorker:
         probs = logits_local.softmax(dim=-1)
         entropy_local = -(probs * logits_local.log_softmax(dim=-1)).sum(dim=-1)
         if self.cp_size > 1:
-            entropy = all_gather_from_context_parallel_region_no_zigzag(
-                entropy_local, gather_dim=1
-            )
+            entropy = all_gather_from_context_parallel_region_no_zigzag(entropy_local, gather_dim=1)
         else:
             entropy = entropy_local
         entropy = entropy[:, :-1]
@@ -217,12 +217,48 @@ class CpMappingsWorker:
         local_logits = self._cp_chunk_non_zigzag(logits_full)
         probs_local = local_logits.softmax(dim=-1)
         entropy_local = -(probs_local * local_logits.log_softmax(dim=-1)).sum(dim=-1)
-        cp_entropy = all_gather_from_context_parallel_region_no_zigzag(
-            entropy_local, gather_dim=1
-        )
+        cp_entropy = all_gather_from_context_parallel_region_no_zigzag(entropy_local, gather_dim=1)
         cp_entropy = cp_entropy[:, :-1]
 
         torch.cuda.synchronize()
+        max_diff = (cp_entropy - gt_entropy).abs().max().item()
+        return [max_diff]
+
+    def test_logprobs_thd_pre_shifted_full_vs_cp(self) -> List[float]:
+        """Pre-shifted THD targets keep the full axis after contiguous CP gather."""
+        from gpatch_v4.core.mappings import all_gather_from_context_parallel_region_no_zigzag
+        from gpatch_v4.training_backend.fsdp2_backend.mixin import selective_log_softmax_raw
+
+        logits_full, target_full = self._make_full_data()
+        gt_logprobs = selective_log_softmax_raw(logits_full, target_full)
+
+        local_logits = self._cp_chunk_non_zigzag(logits_full)
+        local_targets = self._cp_chunk_non_zigzag(target_full)
+        local_logprobs = selective_log_softmax_raw(local_logits, local_targets)
+        cp_logprobs = all_gather_from_context_parallel_region_no_zigzag(
+            local_logprobs, gather_dim=1
+        )
+
+        torch.cuda.synchronize()
+        assert cp_logprobs.shape == (BATCH, SEQ)
+        max_diff = (cp_logprobs - gt_logprobs).abs().max().item()
+        return [max_diff]
+
+    def test_entropy_thd_full_vs_cp(self) -> List[float]:
+        """THD entropy keeps all pre-shifted positions after contiguous CP gather."""
+        from gpatch_v4.core.mappings import all_gather_from_context_parallel_region_no_zigzag
+
+        logits_full, _ = self._make_full_data()
+        probs_full = logits_full.softmax(dim=-1)
+        gt_entropy = -(probs_full * logits_full.log_softmax(dim=-1)).sum(dim=-1)
+
+        local_logits = self._cp_chunk_non_zigzag(logits_full)
+        probs_local = local_logits.softmax(dim=-1)
+        local_entropy = -(probs_local * local_logits.log_softmax(dim=-1)).sum(dim=-1)
+        cp_entropy = all_gather_from_context_parallel_region_no_zigzag(local_entropy, gather_dim=1)
+
+        torch.cuda.synchronize()
+        assert cp_entropy.shape == (BATCH, SEQ)
         max_diff = (cp_entropy - gt_entropy).abs().max().item()
         return [max_diff]
 
@@ -259,9 +295,7 @@ class CpMappingsTest(unittest.TestCase):
         total_gpus = int(ray.cluster_resources().get("GPU", 0))
         if total_gpus < WORLD_SIZE:
             kill_all_actors_and_shutdown_ray()
-            raise unittest.SkipTest(
-                f"Need >= {WORLD_SIZE} GPUs, only {total_gpus} available"
-            )
+            raise unittest.SkipTest(f"Need >= {WORLD_SIZE} GPUs, only {total_gpus} available")
         cls.workers = _create_and_init_workers(WORLD_SIZE)
 
     @classmethod
@@ -274,13 +308,13 @@ class CpMappingsTest(unittest.TestCase):
     def test_non_zigzag_roundtrip(self):
         refs = [w.test_non_zigzag_roundtrip.remote() for w in self.workers]
         results = ray.get(refs)
-        for rank, (max_diff,) in enumerate(results):
+        for rank, (max_diff, ) in enumerate(results):
             self.assertLess(max_diff, 1e-4, f"rank {rank}: max_diff={max_diff}")
 
     def test_non_zigzag_backward(self):
         refs = [w.test_non_zigzag_backward.remote() for w in self.workers]
         results = ray.get(refs)
-        for rank, (max_diff,) in enumerate(results):
+        for rank, (max_diff, ) in enumerate(results):
             self.assertLess(max_diff, 1e-4, f"rank {rank}: max_diff={max_diff}")
 
     # -- logprob + entropy shapes -------------------------------------------
@@ -288,7 +322,7 @@ class CpMappingsTest(unittest.TestCase):
     def test_logprob_entropy_shapes(self):
         refs = [w.test_logprob_entropy_shapes.remote() for w in self.workers]
         results = ray.get(refs)
-        for rank, (ok,) in enumerate(results):
+        for rank, (ok, ) in enumerate(results):
             self.assertGreater(ok, 0.5, f"rank {rank}: shape mismatch")
 
     # -- full vs CP numerical equivalence ---------------------------------
@@ -296,11 +330,23 @@ class CpMappingsTest(unittest.TestCase):
     def test_logprobs_full_vs_cp(self):
         refs = [w.test_logprobs_full_vs_cp.remote() for w in self.workers]
         results = ray.get(refs)
-        for rank, (max_diff,) in enumerate(results):
+        for rank, (max_diff, ) in enumerate(results):
             self.assertLess(max_diff, 1e-5, f"rank {rank}: max_diff={max_diff}")
 
     def test_entropy_full_vs_cp(self):
         refs = [w.test_entropy_full_vs_cp.remote() for w in self.workers]
         results = ray.get(refs)
-        for rank, (max_diff,) in enumerate(results):
+        for rank, (max_diff, ) in enumerate(results):
+            self.assertLess(max_diff, 1e-5, f"rank {rank}: max_diff={max_diff}")
+
+    def test_logprobs_thd_pre_shifted_full_vs_cp(self):
+        refs = [w.test_logprobs_thd_pre_shifted_full_vs_cp.remote() for w in self.workers]
+        results = ray.get(refs)
+        for rank, (max_diff, ) in enumerate(results):
+            self.assertLess(max_diff, 1e-5, f"rank {rank}: max_diff={max_diff}")
+
+    def test_entropy_thd_full_vs_cp(self):
+        refs = [w.test_entropy_thd_full_vs_cp.remote() for w in self.workers]
+        results = ray.get(refs)
+        for rank, (max_diff, ) in enumerate(results):
             self.assertLess(max_diff, 1e-5, f"rank {rank}: max_diff={max_diff}")

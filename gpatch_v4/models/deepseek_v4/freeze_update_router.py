@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import contextvars
 from contextlib import contextmanager, nullcontext
-from typing import Iterator, Tuple, Literal, Optional
+from typing import Iterator, Literal, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -119,7 +119,9 @@ def checkpoint_context_fn():
 
 @torch.no_grad()
 def update_router_correction_bias(
-    model: nn.Module, update_speed: float, use_abs_update: bool = True
+    model: nn.Module,
+    update_speed: float,
+    use_abs_update: bool = True
 ) -> Tuple[Optional[float], Optional[float]]:
     """Apply the loss-free load-balancing update to every TopKRouter correction bias.
     See https://arxiv.org/abs/2408.15664 §3 for more details.
@@ -137,17 +139,18 @@ def update_router_correction_bias(
     dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
 
     avg = counts.mean(dim=-1)  # [L]
-    assert (avg == avg[0]).all(), (
-        f"avg load should be the same for all routers, S * K / E, but got {avg}"
-    )
+    assert (avg == avg[0]
+           ).all(), (f"avg load should be the same for all routers, S * K / E, but got {avg}")
 
     for i, router in enumerate(routers):
         if use_abs_update:
             router.e_score_correction_bias.add_(torch.sign(avg[i] - counts[i]) * update_speed)
         else:
             eps = 1.0
-            router.e_score_correction_bias.add_(torch.log((avg[i] + eps) / (counts[i] + eps)) * update_speed)
+            router.e_score_correction_bias.add_(
+                torch.log((avg[i] + eps) / (counts[i] + eps)) * update_speed
+            )
 
     # maximal violation, see https://arxiv.org/abs/2408.15664 §4.1 for more details.
-    maxvio = (counts.max(dim=-1).values - avg) / avg.clamp_min(1e-12)   # [L]
+    maxvio = (counts.max(dim=-1).values - avg) / avg.clamp_min(1e-12)  # [L]
     return maxvio.max(), maxvio.mean()

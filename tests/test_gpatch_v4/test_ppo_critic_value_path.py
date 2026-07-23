@@ -100,8 +100,9 @@ class PpoCriticValuePathTest(unittest.TestCase):
             patch.object(mcore_swap_impl, "onload_megatron_copy_params"), \
             patch.object(mcore_swap_impl, "offload_tensor_to_cpu", side_effect=offloaded.append), \
             patch.object(mcore_swap_impl, "onload_tensor_to_gpu", side_effect=onloaded.append):
-            mcore_swap_impl.McoreSwapImpl.offload_optimizer(optimizer)
-            mcore_swap_impl.McoreSwapImpl.onload_optimizer(optimizer)
+            swap_impl = mcore_swap_impl.McoreSwapImpl()
+            swap_impl.offload_optimizer(optimizer)
+            swap_impl.onload_optimizer(optimizer)
 
         self.assertEqual(offloaded, [exp_avg, exp_avg_sq, None, None])
         self.assertEqual(onloaded, [exp_avg, exp_avg_sq, None, None])

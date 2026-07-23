@@ -1,8 +1,13 @@
 import os
 import shutil
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
 
 from gpatch_v4.configs.config import RlConfig
+from gpatch_v4.training_backend.fsdp2_backend.mixin import ForwardStepMixin
 from gpatch_v4.trainer import GrpoTrainer
 from gpatch_v4_test_helper import (
     kill_all_actors_and_shutdown_ray,
@@ -12,6 +17,79 @@ from gpatch_v4_test_helper import (
 )
 
 
+class PackedRouterReplayUnitTest(unittest.TestCase):
+    @patch("gpatch_v4.training_backend.fsdp2_backend.mixin.mpu")
+    def test_thd_replay_indices_follow_packed_cp_slice(self, mock_mpu):
+        mock_mpu.get_context_parallel_world_size.return_value = 2
+        mock_mpu.get_context_parallel_rank.return_value = 1
+        mock_mpu.get_data_parallel_rank.return_value = 0
+
+        mixin = ForwardStepMixin.__new__(ForwardStepMixin)
+        mixin._topk_layer_indices = [0, 2]
+        routed0 = torch.arange(3 * 3 * 2).view(3, 3, 2)
+        routed1 = 100 + torch.arange(3 * 3 * 2).view(3, 3, 2)
+        batches = [
+            {
+                "routed_experts": routed0
+            },
+            {
+                "routed_experts": routed1
+            },
+        ]
+        psp = SimpleNamespace(
+            cu_seqlens_q_padded=torch.tensor([0, 4, 8]),
+            total_seqlen=8,
+        )
+
+        per_layer = mixin._prepare_replay_indices(
+            batches,
+            seq_length=8,
+            packed_seq_params=psp,
+        )
+
+        self.assertEqual(len(per_layer), 2)
+        # CP rank 1 owns packed positions [4:8], i.e. the second segment.
+        expected_rows = torch.tensor([0, 1, 0, 1])
+        self.assertTrue(torch.equal(per_layer[0], routed1[expected_rows, 0, :].long()))
+        self.assertTrue(torch.equal(per_layer[1], routed1[expected_rows, 2, :].long()))
+
+    @patch("gpatch_v4.training_backend.fsdp2_backend.mixin.mpu")
+    def test_thd_replay_cp_slice_can_start_inside_segment(self, mock_mpu):
+        mock_mpu.get_context_parallel_world_size.return_value = 2
+        mock_mpu.get_context_parallel_rank.return_value = 1
+        mock_mpu.get_data_parallel_rank.return_value = 0
+
+        mixin = ForwardStepMixin.__new__(ForwardStepMixin)
+        mixin._topk_layer_indices = [0]
+        routed0 = torch.arange(4 * 2).view(4, 1, 2)
+        routed1 = 100 + torch.arange(6 * 2).view(6, 1, 2)
+        batches = [
+            {
+                "routed_experts": routed0
+            },
+            {
+                "routed_experts": routed1
+            },
+        ]
+        psp = SimpleNamespace(
+            cu_seqlens_q_padded=torch.tensor([0, 4, 16]),
+            total_seqlen=16,
+        )
+
+        per_layer = mixin._prepare_replay_indices(
+            batches,
+            seq_length=16,
+            packed_seq_params=psp,
+        )
+
+        # Segment 1 occupies packed [4:16]. Rank 1 owns global [8:16],
+        # i.e. offsets [4:12] within that segment. Its five real route rows
+        # are repeated only for the segment's padding rows.
+        expected_rows = torch.tensor([4, 0, 1, 2, 3, 4, 0, 1])
+        self.assertEqual(len(per_layer), 1)
+        self.assertTrue(torch.equal(per_layer[0], routed1[expected_rows, 0, :].long()))
+
+
 class RouterReplayR3Test(unittest.IsolatedAsyncioTestCase):
     """End-to-end R3 (router replay) tests for SGLang and vLLM backends.
 
@@ -19,7 +97,6 @@ class RouterReplayR3Test(unittest.IsolatedAsyncioTestCase):
     rollout → logprob → training pipeline without errors, and that
     the resulting training metrics are within expected ranges.
     """
-
     def tearDown(self):
         kill_all_actors_and_shutdown_ray()
 

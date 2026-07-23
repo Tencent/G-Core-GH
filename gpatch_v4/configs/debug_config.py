@@ -170,3 +170,7 @@ class DebugConfig(MappingProtocol):
         default="debug-tmp",
         metadata={"help": "DEBUG: directory for post-rollout batch dump/load."},
     )
+    debug_align_mode: bool = field(
+        default=False,
+        metadata={"help": "DEBUG: enable alignment debug mode."},
+    )

@@ -99,7 +99,6 @@ def postprocess(
 def bwd(
     H,
     D,
-    topk,
     sm_scale=None,
     block_size=32,
     num_stages=1,  # num_stages=0 produces NaN when NS>=2; likely shared memory race in pipelining.
@@ -108,7 +107,6 @@ def bwd(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
-    assert topk % block_size == 0, f"topk ({topk}) must be divisible by block_size ({block_size})"
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
 
@@ -119,6 +117,7 @@ def bwd(
     B = T.dynamic("B")
     S = T.dynamic("S")
     S_kv = T.dynamic("S_kv")
+    topk = T.dynamic("topk", torch.int32)
 
     q_shape = [B, S, H, D]
     kv_shape = [B, S_kv, D]
@@ -301,10 +300,9 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
             (B, S, padded_topk - topk), -1, device=topk_idxs.device, dtype=topk_idxs.dtype
         )
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
-        topk = padded_topk
 
     preprocess_kernel = preprocess(H, D, num_stages=2)
-    bwd_kernel = bwd(H, D, topk, sm_scale, block_size=block_size)
+    bwd_kernel = bwd(H, D, sm_scale, block_size=block_size)
     postprocess_kernel = postprocess(D)
 
     delta = preprocess_kernel(o, do)

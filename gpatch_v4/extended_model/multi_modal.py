@@ -284,6 +284,8 @@ class SamplerGenerateFuncMultiModal(SamplerGenerateFunc):
         tokens_from_dataset = prompt_data["tokens"]
         prompt_len_from_dataset = prompt_data["prompt_len"]
         json_data_list = batched_data["json_data_list"]
+        teacher_tokens_from_dataset = prompt_data.get("teacher_tokens", None)
+        teacher_prompt_len_from_dataset = prompt_data.get("teacher_prompt_len", None)
 
         # Audio sample rate must match what the training-side feature extractor uses;
         # this is fixed to 16kHz for Qwen3-Omni (Whisper extractor).
@@ -327,6 +329,9 @@ class SamplerGenerateFuncMultiModal(SamplerGenerateFunc):
         rollout_log_probs = []
         routed_experts_list = []
         pad_token_id = tokenizer.pad_token_id
+        teacher_tokens = []
+        teacher_squence_lengths = []
+        teacher_prompt_lengths = []
 
         hf_cfg = config.policy.hf_config
         # for qwen3-omni
@@ -384,6 +389,19 @@ class SamplerGenerateFuncMultiModal(SamplerGenerateFunc):
             routed_experts = process_routed_experts(one_output, num_layers, moe_router_topk)
             routed_experts_list.append(routed_experts)
 
+            # 组装 teacher tokens
+            if teacher_tokens_from_dataset is not None:
+                i = gi // sampling_repeat_n
+                teacher_prompt_len = teacher_prompt_len_from_dataset[i]
+                one_teacher_token_ids = teacher_tokens_from_dataset[i][:teacher_prompt_len].tolist()
+                token_ids = one_teacher_token_ids + output_token_ids
+                assert len(token_ids) <= config.training.seq_length
+                teacher_tokens.append(torch.tensor(token_ids, dtype=torch.long))
+                teacher_squence_lengths.append(torch.tensor(len(token_ids), dtype=torch.long))
+                teacher_prompt_lengths.append(
+                    torch.tensor(len(one_teacher_token_ids), dtype=torch.long)
+                )
+
         labels = [label for label in labels for _ in range(sampling_repeat_n)]
         rank_unique_ids = [
             unique_id for unique_id in rank_unique_ids for _ in range(sampling_repeat_n)
@@ -401,6 +419,14 @@ class SamplerGenerateFuncMultiModal(SamplerGenerateFunc):
             rollout_log_probs=rollout_log_probs,
             unique_id=rank_unique_ids,
         )
+
+        if teacher_tokens_from_dataset is not None:
+            assert len(labels) == len(teacher_tokens)
+            assert len(labels) == len(teacher_squence_lengths)
+            assert len(labels) == len(teacher_prompt_lengths)
+            rollout_batch["teacher_tokens"] = teacher_tokens
+            rollout_batch["teacher_sequence_lengths"] = teacher_squence_lengths
+            rollout_batch["teacher_prompt_lengths"] = teacher_prompt_lengths
 
         if config.training.moe_router_replay:
             rollout_batch["routed_experts"] = routed_experts_list

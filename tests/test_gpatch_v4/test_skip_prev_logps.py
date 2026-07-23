@@ -61,6 +61,7 @@ def _make_loss_input(
     mask = torch.ones(batch_size, seq_len)
     ref = torch.randn(batch_size, seq_len)
     entropy = torch.tensor(0.5)
+    per_token_entropy = torch.randn(batch_size, seq_len)
     rollout = torch.randn(batch_size, seq_len) if with_rollout_logprobs else None
 
     return PolicyLossInput(
@@ -70,6 +71,7 @@ def _make_loss_input(
         curr_log_probs=curr,
         response_mask=mask,
         scaled_entropy=entropy,
+        per_token_entropy=per_token_entropy,
         rollout_log_probs=rollout,
     )
 
@@ -153,6 +155,7 @@ class TestSkipFalseRegression:
             curr_log_probs=curr,
             response_mask=torch.ones(2, 8),
             scaled_entropy=torch.tensor(0.0),
+            per_token_entropy=torch.randn(2, 8),
         )
 
         _, metrics = grpo_loss_func(config, loss_input)

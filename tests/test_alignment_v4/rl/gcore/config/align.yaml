@@ -1,0 +1,17 @@
+# @package _global_
+# gcore RL alignment entry. The default group selection reproduces step1
+# (single GPU, all parallelism off, strictly on-policy, GRPO, dense Qwen3-0.6B).
+# Override groups on the CLI, e.g.:
+#   ... --config-name align parallelism=hybrid_parallelism staleness=off_policy
+# rollout selects the inference backend (sglang | vllm later).
+defaults:
+  - base
+  - loss: grpo
+  - model: dense
+  - parallelism: hybrid_parallelism
+  - staleness: on_policy
+  - rollout: sglang
+  - _self_
+
+# Per-experiment knobs (checkpoint paths, wandb project/exp name, log dir) are
+# injected by scripts/run.sh, since they change every run.

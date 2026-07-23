@@ -1,0 +1,15 @@
+# @package _global_
+# single GPU, all parallelism off (TP=PP=CP=1, DP=1, colocate sampler+actor).
+# thd sequence packing: TP=1/CP=1 -> align_size=1 -> zero per-seq padding, varlen
+# flash attention via cu_seqlens. Same pack impl as verl (use_remove_padding=True),
+# so packed input_ids_rmpad + cu_seqlens are bit-identical when per-sample tokens
+# match. Only training (policy) parallelism lives here; the sampler/bt_rm engine
+# (incl. its dist) lives in the rollout backend group (rollout/sglang).
+policy:
+  ppo_pack_seq: True
+  dist_config:
+    nnodes: 1
+    num_gpus_per_node: 1
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1

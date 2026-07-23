@@ -16,6 +16,7 @@ from gpatch_v4.client.mixin import TestFuncMixin, UpdateWeightMixin
 from gpatch_v4.configs.config import RlConfig
 from gpatch_v4.core.parallel_state import cpu_barrier
 from gpatch_v4.utils import log, logging_rank0, perf_time
+from gpatch_v4.utils.placement import is_partial_colocated, use_ipc_weight_update
 
 
 class SamplerClient(
@@ -109,7 +110,7 @@ class SamplerClient(
 
         self.infer_backend = getattr(self.config.sampler, "backend", "sglang")
         self.skip_init_ipc_meta = skip_init_ipc_meta
-        self._use_ipc_weight_update = self.config.placement_type != "disaggregated"
+        self._use_ipc_weight_update = use_ipc_weight_update(self.config)
         if self._use_ipc_weight_update and not self.skip_init_ipc_meta:
             self.build_update_from_tensor_meta()
         log(
@@ -142,6 +143,9 @@ class SamplerClient(
         first_dist_config = sampler_config.infer_engine_configs[0].dist_config
         first_sampler_mp_size = first_dist_config.tensor_model_parallel_size * first_dist_config.pipeline_model_parallel_size
         num_clusters, _, _ = self.get_engine_info(first_dist_config)
+        self._ipc_gather_dst_rank = None
+        self._ipc_gather_group = None
+        self._ipc_target = None
 
         for idx in range(num_clusters):
             start_rank = idx * first_sampler_mp_size
@@ -155,6 +159,10 @@ class SamplerClient(
                 self._ipc_gather_dst_rank = start_rank
                 self._ipc_gather_group = new_group
                 self._ipc_target = idx
+
+        assert is_partial_colocated(self.config) or self._ipc_gather_group is not None, (
+            "IPC weight update rank did not map to any sampler gather group"
+        )
 
     async def generate(
         self,

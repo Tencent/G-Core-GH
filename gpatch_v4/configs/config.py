@@ -41,6 +41,8 @@ from gpatch_v4.configs.training_config import (
 )
 from gpatch_v4.configs.utils import MappingProtocol
 
+RL_PLACEMENT_TYPES = ("colocate", "disaggregated", "partial_colocated")
+
 
 def _assert_deterministic_mode_constraints(training, checkpoint) -> None:
     if not training.apply_deterministic_mode:
@@ -107,6 +109,11 @@ class FinetuneConfig(MappingProtocol):
     def __post_init__(self):
         _assert_deterministic_mode_constraints(self.training, self.checkpoint)
         _assert_dynamic_cp_requires(self.training, self.policy)
+        #TODO(xiaotaoliu): 暂时先限制一下
+        if self.training.training_backend == "fsdp2" and self.training.use_linear_ce:
+            assert self.training.loss_func == "cross_entropy", (
+                "FSDP2 linear CE currently supports SFT cross_entropy only"
+            )
         if self.policy.dist_config.dynamic_context_parallel:
             assert self.policy.override_transformer_config.get(
                 "calculate_per_token_loss", False
@@ -155,14 +162,20 @@ class RlConfig(MappingProtocol):
     task: Any = field(default=None, metadata={'help': 'any task related config'})
 
     def __post_init__(self):
+        assert self.placement_type in RL_PLACEMENT_TYPES, (
+            f"unsupported RL placement_type={self.placement_type!r}"
+        )
         _assert_deterministic_mode_constraints(self.training, self.checkpoint)
         _assert_dynamic_cp_requires(self.training, self.policy, self.critic)
+        if self.ppo.loss_func in ("gspo", ):
+            assert not self.policy.override_transformer_config.get(
+                "calculate_per_token_loss", False
+            ), ("gspo requires seq-mean aggregation; calculate_per_token_loss must be False")
         if self.training.use_linear_ce:
             assert getattr(
                 self.ppo, 'log_prob_top_k', 0
             ) == 0, ("use_linear_ce 与 log_prob_top_k > 0 不兼容，"
                      "linear_ce 不生成完整 logits，无法计算 top-K")
-            assert not self.policy.ppo_pack_seq, ("use_linear_ce 与 ppo_pack_seq 不兼容")
             assert self.training.dump_metrics_logprobs_topk == 0, (
                 "use_linear_ce 与 dump_metrics_logprobs_topk > 0 不兼容，"
                 "linear_ce 不生成完整 logits，无法 dump top-K"
@@ -293,6 +306,10 @@ class OnPolicyDistillConfig(MappingProtocol):
         _assert_deterministic_mode_constraints(self.training, self.checkpoint)
         teachers = tuple(self.teachers.values()) if self.teachers else ()
         _assert_dynamic_cp_requires(self.training, self.policy, self.teacher, *teachers)
+        if self.ppo.loss_func == "gspo":
+            assert not self.policy.override_transformer_config.get(
+                "calculate_per_token_loss", False
+            ), ("gspo requires seq-mean aggregation; calculate_per_token_loss must be False")
         if self.training.use_linear_ce:
             assert getattr(
                 self.ppo, 'log_prob_top_k', 0
@@ -345,6 +362,9 @@ class DpoConfig(MappingProtocol):
         assert self.placement_type in ["colocate", "disaggregated"]
         _assert_deterministic_mode_constraints(self.training, self.checkpoint)
         _assert_dynamic_cp_requires(self.training, self.policy)
+        assert not (
+            self.training.training_backend == "fsdp2" and self.training.use_linear_ce
+        ), "FSDP2 linear CE currently supports SFT only, not DPO"
 
 
 @dataclass

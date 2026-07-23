@@ -175,14 +175,18 @@ def convert_mbs_for_pack_seq(
     max_token_len: int,
     pad_each_doc_to_multi_of: int = 128,
     dp_group=None,
+    cp_size: int = 1,
 ) -> list[list[dict]]:
     """Group variable-length samples into micro-batches by token budget.
 
     Each sample's padded length (rounded up to ``pad_each_doc_to_multi_of``) is
-    used to estimate the packed token count. Samples are partitioned into
-    ``num_mb = ceil(total_padded / max_token_len)`` groups using
-    Karmarkar-Karp balanced partitioning, then ``num_mb`` is aligned across
-    DP ranks via ``all_reduce(MAX)`` to prevent EP / CP collective deadlocks.
+    used to estimate the packed token count. Samples are partitioned with
+    Karmarkar-Karp so micro-batches on the same rank stay load-balanced.
+    ``num_mb`` starts at ``ceil(total_padded / max_token_len)`` and is raised
+    until every KK group fits the hard ceiling after the same CP tail pad that
+    ``pack_sequences`` applies (``T % (cp_size * pad) == 0``). ``num_mb`` is
+    then aligned across DP ranks via ``all_reduce(MAX)`` and KK is re-run so
+    EP / CP collectives stay in lockstep without dropping balance.
 
     Example::
 
@@ -194,6 +198,9 @@ def convert_mbs_for_pack_seq(
         #   group 0: [512, 256, 128]  → 896 tokens
         #   group 1: [512, 128, 128]  → 768 tokens
         #   group 2: [384, 384]       → 768 tokens
+
+        # Capacity-safe raise: [640, 640, 640] with budget 1024 needs num_mb=3
+        # because KK with k=2 can still place [640, 640] in one group.
 
     Parameters
     ----------
@@ -207,6 +214,9 @@ def convert_mbs_for_pack_seq(
         避免 pack seq 的时候估计不准确。
     dp_group : dist.ProcessGroup | None
         Data-parallel group for cross-rank alignment.
+    cp_size : int
+        Context-parallel world size. Matches ``pack_sequences`` alignment of
+        ``T`` to ``cp_size * pad_each_doc_to_multi_of``.
 
     Returns
     -------
@@ -215,8 +225,15 @@ def convert_mbs_for_pack_seq(
     """
     n = len(samples)
     assert n > 0, "samples must be non-empty"
+    assert cp_size >= 1, f"cp_size must be >= 1, got {cp_size}"
+    assert pad_each_doc_to_multi_of > 0, (
+        f"pad_each_doc_to_multi_of must be positive, got {pad_each_doc_to_multi_of}"
+    )
 
-    # todo zz: mirror pack_sequences' per-segment zigzag padding
+    # Mirror pack_sequences: per-doc pad, then round the packed total up to
+    # cp_size * pad_each_doc_to_multi_of (extra lands on the last segment).
+    total_align = cp_size * pad_each_doc_to_multi_of
+
     def _padded_len(s):
         raw = s["sequence_lengths"]
         raw = int(raw) if isinstance(raw, int) else raw.item()
@@ -224,26 +241,56 @@ def convert_mbs_for_pack_seq(
             (raw + pad_each_doc_to_multi_of - 1) // pad_each_doc_to_multi_of
         ) * pad_each_doc_to_multi_of
 
+    def _aligned_total(load: int) -> int:
+        rem = load % total_align
+        return load if rem == 0 else load + (total_align - rem)
+
+    def _kk_partitions_within_budget(k: int):
+        partitions = get_seqlen_balanced_partitions(
+            seqlen_list=padded_lens,
+            k_partitions=k,
+            equal_size=False,
+        )
+        for part in partitions:
+            load = sum(padded_lens[i] for i in part)
+            if _aligned_total(load) > max_token_len:
+                return None
+        return partitions
+
     padded_lens = [_padded_len(s) for s in samples]
     total_padded = sum(padded_lens)
 
-    assert max_token_len >= max(padded_lens), (
-        f"max_token_len ({max_token_len}) < longest padded sample "
-        f"({max(padded_lens)}); samples should be truncated to seq_length "
-        f"before grouping"
+    assert max_token_len >= max(_aligned_total(L) for L in padded_lens), (
+        f"max_token_len ({max_token_len}) < longest CP-aligned sample "
+        f"({max(_aligned_total(L) for L in padded_lens)}); samples should be "
+        f"truncated to seq_length before grouping"
     )
+
+    # Lower bound from average fill; raise k while KK still overflows the
+    # hard ceiling (balance does not imply capacity, e.g. [640, 640, 640]).
     num_mb = max(1, (total_padded + max_token_len - 1) // max_token_len)
+    partitions = None
+    while num_mb <= n:
+        partitions = _kk_partitions_within_budget(num_mb)
+        if partitions is not None:
+            break
+        num_mb += 1
+    assert partitions is not None, (
+        f"unable to KK-partition {n} samples into capacity-safe micro-batches "
+        f"(max_token_len={max_token_len}, cp_size={cp_size})"
+    )
 
     if dp_group is not None and dist.is_initialized():
         mb_t = torch.tensor([num_mb], dtype=torch.long, device="cuda")
         dist.all_reduce(mb_t, op=dist.ReduceOp.MAX, group=dp_group)
-        num_mb = int(mb_t.item())
+        target_num_mb = int(mb_t.item())
+        assert target_num_mb <= n, (
+            f"DP pack-seq alignment needs {target_num_mb} micro-batches, but this "
+            f"rank only has {n} samples; EP/CP would deadlock if ranks diverge"
+        )
+        if target_num_mb != num_mb:
+            num_mb = target_num_mb
+            partitions = _kk_partitions_within_budget(num_mb)
+            assert partitions is not None, ("unable to KK-partition after DP micro-batch alignment")
 
-    num_mb = min(num_mb, n)
-
-    partitions = get_seqlen_balanced_partitions(
-        seqlen_list=padded_lens,
-        k_partitions=num_mb,
-        equal_size=False,
-    )
     return [[samples[i] for i in part] for part in partitions]
