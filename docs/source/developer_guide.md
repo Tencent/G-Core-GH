@@ -244,7 +244,9 @@ bt_rm:
 
 ## 自定义 Loss 开发指南
 
-通过继承 `GptPpoActorModel` 并重写 `get_actor_grpo_forward_output_and_loss_func` 方法来实现自定义的 loss 计算逻辑，**无需修改原有代码**。
+**V4（推荐）**：`ppo.use_legacy_loss=false` 时通过 `ppo.loss_func` / `loss_func_py_path` / `loss_func_py_name` 注册自定义函数，输入输出约定见 [自定义 Policy Loss V4](custom_loss_v4.md)。
+
+以下为 **V3** 方式：通过继承 `GptPpoActorModel` 并重写 `get_actor_grpo_forward_output_and_loss_func` 方法来实现自定义的 loss 计算逻辑，**无需修改原有代码**。
 
 ### 文件结构
 

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from gpatch_v4.configs.utils import MappingProtocol
 
@@ -65,8 +65,20 @@ class EnvTemplateConfig(MappingProtocol):
     env_config: Dict = field(default_factory=dict, metadata={"help": "llm proxy config."})
     history_length: int = field(default=5, metadata={"help": ""})
     env_tool_config: EnvToolConfig = field(default_factory=EnvToolConfig)
-
-
+    env_weight: float = field(
+        default=1.0,
+        metadata={
+            "help":
+                (
+                    "Non-negative relative sampling weight for this env when multiple "
+                    "templates are listed in ``AgenticConfig.env_cfg_templates``. Each "
+                    "env is bound to "
+                    "``round(env_weight / sum(env_weights) * num_agent_loop_workers)`` "
+                    "agent-loop workers (each env gets at least one). Ignored for a "
+                    "single template."
+                )
+        },
+    )
 @dataclass
 class RewardNormalizationConfig(MappingProtocol):
     grouping: str = field(default="state", metadata={"help": "state / batch / inductive"})
@@ -88,6 +100,21 @@ class AgenticConfig(MappingProtocol):
         },
     )
     env_cfg_template: EnvTemplateConfig = field(default_factory=EnvTemplateConfig)
+    env_cfg_templates: Optional[List[EnvTemplateConfig]] = field(
+        default=None,
+        metadata={
+            "help":
+                (
+                    "Multi-env rollout: a list of env templates run simultaneously in one "
+                    "run. Each ``EnvAgentLoopActor`` worker is bound to exactly one template "
+                    "(distributed across workers by ``EnvTemplateConfig.env_weight``), so every "
+                    "rollout microbatch is single-env and its samples route to that env's "
+                    "routing metadata in ``env_config``. When None/empty, the run is "
+                    "single-env and uses "
+                    "``env_cfg_template`` (backward compatible). See ``resolved_env_templates``."
+                )
+        },
+    )
     train_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
     step_reward_gamma: float = field(
         default=0.95, metadata={"help": "Gamma parameter for step reward calculation"}
@@ -98,3 +125,15 @@ class AgenticConfig(MappingProtocol):
     reward_normalization: RewardNormalizationConfig = field(
         default_factory=RewardNormalizationConfig
     )
+
+    def resolved_env_templates(self) -> List[EnvTemplateConfig]:
+        """Return the active env templates as a list.
+
+        Single-env (backward compatible): ``[env_cfg_template]`` when
+        ``env_cfg_templates`` is unset/empty. Multi-env: the configured list.
+        Downstream code should iterate this instead of branching on the two
+        fields, so single- and multi-env share one code path.
+        """
+        if self.env_cfg_templates:
+            return list(self.env_cfg_templates)
+        return [self.env_cfg_template]

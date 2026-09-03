@@ -24,6 +24,7 @@ try:
     from mbridge.peft.canonical_lora import (
         CanonicalLoRA,
         LoRALinearSplitFC1UpGate,
+        LoRALinearSplitGDNInProj,
         LoRALinearSplitQKV,
     )
     from mbridge.peft.lora import LoRA
@@ -39,6 +40,7 @@ try:
 except ImportError:
     CanonicalLoRA = None
     LoRALinearSplitFC1UpGate = None
+    LoRALinearSplitGDNInProj = None
     LoRALinearSplitQKV = None
     LoRA = None
     LinearAdapter = None
@@ -109,6 +111,7 @@ def get_peft_cls(policy_config, bridge=None, provider=None, dtype=None, use_mbri
         lora_A_init_method=lora_cfg.lora_A_init_method,
         lora_B_init_method=lora_cfg.lora_B_init_method,
         exclude_modules=lora_cfg.exclude_modules,
+        share_expert_adapters=lora_cfg.share_expert_adapters,
     )
     if lora_type == "lora":
         kwargs = {
@@ -121,7 +124,24 @@ def get_peft_cls(policy_config, bridge=None, provider=None, dtype=None, use_mbri
     elif lora_type == "canonical_lora":
         if user_targets is not None:
             common_kwargs["target_modules"] = user_targets
+        # canonical_mapping 断言 exclude_modules 必须为空；改为应用层跳过
+        # （构造后包装 transform，见下），构造参数清空以绕过断言
+        _shim_excludes = list(common_kwargs.get("exclude_modules") or [])
+        if _shim_excludes:
+            common_kwargs["exclude_modules"] = []
         peft_cls = _CanonicalLoRA(**common_kwargs)
+        if _shim_excludes:
+            _rxs = [re.compile("^" + pt.replace("*", "(.*)") + "$") for pt in _shim_excludes]
+            _orig_transform = peft_cls.transform
+
+            def _transform_skip_excluded(module, name=None, prefix=None, *args, **kw):
+                full = f"{prefix}.{name}" if prefix else (name or "")
+                if full and any(r.match(full) for r in _rxs):
+                    return module
+                return _orig_transform(module, name=name, prefix=prefix, *args, **kw)
+
+            peft_cls.transform = _transform_skip_excluded
+            logging_rank0(f"canonical_lora exclude via transform-skip: {_shim_excludes}")
     else:
         raise ValueError(
             f"Unknown PEFT type {lora_type!r}; expected lora, vlm_lora, canonical_lora, or dora"
@@ -150,6 +170,7 @@ def _log_lora_coverage(model_chunks):
         TELinearAdapter,
         LoRALinearSplitQKV,
         LoRALinearSplitFC1UpGate,
+        LoRALinearSplitGDNInProj,
         LoRATopKRouter,
     )
     linear_types = (
@@ -288,6 +309,7 @@ def _verify_lora_weight_consistency(model_chunks, tag: str = "init"):
         TEFusedLoRALinear,
         LoRALinearSplitQKV,
         LoRALinearSplitFC1UpGate,
+        LoRALinearSplitGDNInProj,
     )
 
     if not dist.is_initialized():

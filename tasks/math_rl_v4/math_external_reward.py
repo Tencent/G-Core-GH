@@ -11,6 +11,8 @@ so it does **not** use ``BroadcastUtils`` or ``is_mp_and_cp_head``.
 
 import asyncio
 import json
+import logging
+import random
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -19,6 +21,10 @@ from tasks.math_rl_v4.bt_reward import cal_accuracy_reward, cal_format_reward
 
 from gpatch_v4.reward.base_external_reward import BaseExternalReward
 from gpatch_v4.utils.training_utils import list_of_tensor_to_list
+
+# Used when ``external_reward.eval_delay_s == -1`` (uniform sample).
+_EVAL_DELAY_RANDOM_MIN_S = 50.0
+_EVAL_DELAY_RANDOM_MAX_S = 200.0
 
 
 class MathRuleExternalReward(BaseExternalReward):
@@ -55,6 +61,25 @@ class MathRuleExternalReward(BaseExternalReward):
         # No async I/O here; signal readiness right away for interface compat.
         if _started_event is not None:
             _started_event.set()
+
+        external_reward_config = getattr(self.config, "external_reward", None)
+        eval_delay_s = getattr(external_reward_config, "eval_delay_s", 0.0)
+        if is_eval and eval_delay_s != 0:
+            if eval_delay_s == -1:
+                delay_s = random.uniform(_EVAL_DELAY_RANDOM_MIN_S, _EVAL_DELAY_RANDOM_MAX_S)
+                logging.info(
+                    "[external_reward] eval random delay=%.3fs (range=[%.1f, %.1f]s)",
+                    delay_s,
+                    _EVAL_DELAY_RANDOM_MIN_S,
+                    _EVAL_DELAY_RANDOM_MAX_S,
+                )
+            elif eval_delay_s > 0:
+                delay_s = float(eval_delay_s)
+            else:
+                raise ValueError(
+                    f"external_reward.eval_delay_s must be >= 0 or -1, got {eval_delay_s}"
+                )
+            await asyncio.sleep(delay_s)
 
         return [self._compute_update(batch) for batch in rollout_batches]
 

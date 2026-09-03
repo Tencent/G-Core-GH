@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 deep_gemm = pytest.importorskip("deep_gemm")
 
+
 FP8_MAX = 448.0  # e4m3 largest finite value
 GROUP = 128
 
@@ -120,6 +121,10 @@ def _run_once(num_experts, m_per_expert, k, n):
 
 
 def test_deep_gemm_grouped_gemm_fp8_correctness():
+    if not hasattr(deep_gemm, "m_grouped_gemm_fp8_fp8_bf16_nt_contiguous"):
+        pytest.skip(
+            "deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous not in this image"
+        )
     for num_experts, m_per_expert, k, n in [
         (8, 256, 512, 256),
         (16, 128, 1024, 512),

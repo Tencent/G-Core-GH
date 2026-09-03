@@ -36,6 +36,14 @@ def _make_bare_controller() -> RolloutController:
     rc._ready_queue = asyncio.Queue()
     rc._ordered_ready = {}
     rc._inflight_tasks = []
+    rc._abort_t0 = None
+    rc._last_inflight_done_at = None
+    rc._fire_metrics = {}
+    rc._tail_batching = False
+    rc._next_prompt_idx = 0
+    rc._ppo_step_per_epoch = 1000
+    rc._step_collected_rb = 0
+    rc._step_target_rb = 1_000_000
     rc.use_colocate = False
     rc.is_partial_colocated = False
     rc.rb_multiplier = 1
@@ -375,6 +383,16 @@ class FireBookkeepingTest(unittest.IsolatedAsyncioTestCase):
         # All 2 microbatches should be sitting in the ready queue.
         assert rc._ready_queue.qsize() == 2
         assert rc._inflight_tasks == []
+
+    async def test_resume_uses_full_epoch_size_for_boundary_check(self):
+        rc = _make_fire_controller(num_mb=2, num_actors=1)
+        rc._ppo_step_per_epoch = 29
+        rc.data_source.dataloader_length = 4
+
+        await rc.fire_generation_requests(epoch=0, ppo_step=25, num_ppo_steps=2)
+        await rc.wait_all_inflight()
+
+        assert rc._ready_queue.qsize() == 4
 
 
 class ColocateFireBookkeepingTest(unittest.IsolatedAsyncioTestCase):

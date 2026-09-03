@@ -98,6 +98,7 @@ class OpdTopkCpWorker:
             linear_ce_output=lce_out,
             target_ids=ids_full,
             ignore_cp=False,
+            temperature=1.0,
         )
 
     def _non_fused(self, hidden_shard_bsh, weight, ids_full):
@@ -109,6 +110,7 @@ class OpdTopkCpWorker:
             vocab_parallel_logits=logits_shard,
             target_ids=ids_full,
             ignore_cp=False,
+            temperature=1.0,
         )
 
     def test_forward(self) -> List[float]:

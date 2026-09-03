@@ -78,8 +78,11 @@ class OnPolicyDistillRolloutGenerator(BaseRolloutGenerator):
         # Only send keys that teacher actually needs to reduce RPC transfer size.
         if self.is_mp_and_cp_head:
             s_idx = self.sample_idx if sample_idx_base is None else sample_idx_base
+            # prompt_lengths is required by dyn-CP reroute
+            # (compute_dyn_cp_response_span); non-dyn-CP teacher fwd ignores it.
             teacher_keys = {
                 "tokens",
+                "prompt_lengths",
                 "sequence_lengths",
                 "stu_topk_ids",
                 "position_ids",
@@ -88,6 +91,7 @@ class OnPolicyDistillRolloutGenerator(BaseRolloutGenerator):
                 "vision_grid_thw",
                 "input_features",
                 "feature_attention_mask",
+                "audio_feature_lengths",
                 "audio_feature",
             }
             all_issue_cos = []

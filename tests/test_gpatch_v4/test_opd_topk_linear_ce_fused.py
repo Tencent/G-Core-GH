@@ -59,6 +59,7 @@ def _run_fused(hidden, weight, ids, ignore_cp=True):
             linear_ce_output=lce_out,
             target_ids=ids,
             ignore_cp=ignore_cp,
+            temperature=1.0,
         )
 
 
@@ -70,6 +71,7 @@ def _run_from_parallel(hidden, weight, ids, ignore_cp=True):
             vocab_parallel_logits=logits_bsv,
             target_ids=ids,
             ignore_cp=ignore_cp,
+            temperature=1.0,
         )
 
 

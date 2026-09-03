@@ -1,6 +1,6 @@
 # LoRA / PEFT 子系统
 
-> 上次更新: 2026-06-13  
+> 上次更新: 2026-08-16  
 > 关联对话: [LoRA ckpt 集成与测试](d262bbf1-c5cb-4a97-829a-7a13c22cf232), [Per-expert LoRA 实现](1582425f-f2f5-46d5-9f37-3e5ef58e5f34)
 
 ## 一、概述
@@ -45,15 +45,22 @@ gcore-dev 支持两种 LoRA 后端：
 ```yaml
 training:
   build_from_mbridge: True  # True=mbridge, False=Megatron-Bridge
+
+policy:
   lora:
     rank: 128           # LoRA rank; 0 = 禁用 PEFT
     alpha: 256
     type: "canonical_lora"  # lora / vlm_lora / canonical_lora
     dropout: 0.0
+    share_expert_adapters: false  # MoE: false=per-expert 独立，true=本地 experts 共享
     target_modules:       # 匹配规则见下文
       - "linear_q"        # canonical split targets
       - "linear_k"
       - "linear_v"
+      - "*.in_proj_qkv"   # Qwen3.5 GDN split targets
+      - "*.in_proj_z"
+      - "*.in_proj_b"
+      - "*.in_proj_a"
       - "*.linear_proj"
       - "*.linear_fc2"
       - "*.router"        # MoE router（可选）
@@ -66,7 +73,8 @@ training:
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `check_lora_all_coverage` | `True` | 检查 LoRA 是否覆盖所有线性层（排除 output_layer/router） |
-| `verify_weight_consistency` | `False` | 初始化时验证 LoRA 权重在 TP/DP/CP 维度的一致性 |
+| `verify_weight_consistency` | `True` | 初始化时验证 LoRA 权重在 TP/DP/CP 维度的一致性 |
+| `share_expert_adapters` | `False` | MoE routed experts 是否共享 adapter；默认每个 expert 独立 |
 
 ### 3.1 LoRA 类型对比
 
@@ -88,7 +96,8 @@ training:
 | ColumnParallel / RowParallel | `LoRALinear` | 标准 LoRA |
 | ColumnParallel (linear_qkv) | `LoRALinearSplitQKV` | canonical: Q/K/V 独立 adapter |
 | ColumnParallel (linear_fc1) | `LoRALinearSplitFC1UpGate` | canonical: gate/up 独立 adapter |
-| `TEGroupedLinear` (MoE experts) | `LoRAGroupedLinear` | **per-expert LoRA** |
+| Qwen3.5 GDN (in_proj) | `LoRALinearSplitGDNInProj` | canonical: QKV/Z/B/A 独立 adapter |
+| `TEGroupedLinear` (MoE experts) | `LoRALinear` + `GroupedExpertLinearAdapter` | **per-expert LoRA** |
 | `TopKRouter` | `LoRATopKRouter` | Router adapter |
 | `nn.Linear` (ViT/projector) | `LinearAdapter` | 非 Megatron 层 |
 
@@ -101,27 +110,30 @@ training:
           └── linear_out: ColumnParallelLinear(dim, out_features)  → lora_B
 
 Per-expert:
-  LoRAGroupedLinear
+  LoRALinear
     ├── to_wrap: TEGroupedLinear (原始层, 所有本地 experts)
-    └── adapter: nn.ModuleList[
-          ParallelLinearAdapter(expert_0),
-          ParallelLinearAdapter(expert_1),
-          ...,
-          ParallelLinearAdapter(expert_N-1)
-        ]
+    └── adapter: GroupedExpertLinearAdapter
+          ├── linear_in.weight:  [local_experts, rank, in]
+          └── linear_out.weight: [local_experts, out, rank]
 ```
 
 ### 4.2 Per-Expert LoRA（MoE 专用）
 
 针对 `TEGroupedLinear`（MoE routed experts），每个专家拥有独立的 LoRA adapter：
 
-- **创建**: `LoRA.transform()` / `CanonicalLoRA.transform()` 检测 `is_expert and num_gemms > 0` 时创建 `LoRAGroupedLinear`
+- **创建**: 检测 grouped expert linear 且 `share_expert_adapters=False` 时创建 `GroupedExpertLinearAdapter`
 - **前向**: base forward 仍走 grouped GEMM（性能不变），adapter 按 `tokens_per_expert` 逐专家 dispatch
-- **Merge**: `LoRAMerge.transform()` 对 `single_grouped_weight` 模式用 `w.data[i] += delta_i`
+- **Merge**: `LoRAMerge.transform()` 将 packed adapter 的每个 expert delta 合入对应 base expert
 - **导出**: `gather_lora_state_dict()` 通过 EP group `all_gather` 收集所有 rank 的 adapter 权重
 - **HF key**: `base_model.model.model.language_model.layers.X.mlp.experts.gate_up_proj.{expert_id}.lora_A.weight`
 
 性能开销：adapter FLOPs ≈ rank/ffn_hidden ≈ 1%，可忽略。
+
+`share_expert_adapters` 仅影响 MoE routed expert 的 grouped linear：
+- `false`（默认、推荐）：每个 local expert 有独立 A/B，使用
+  `GroupedExpertLinearAdapter` 的 grouped-mm 路径。
+- `true`：同一 EP rank 上的 local experts 共享一个 `ParallelLinearAdapter`，
+  参数更少，但会降低 expert-specific adapter 容量。
 
 ### 4.3 TP 分片（关键）
 
@@ -257,6 +269,10 @@ mbridge 路径的特殊处理（`save_checkpoint` / `load_checkpoint` in `checkp
 ```bash
 cd /mnt/ceph-hz1-csp/mm-base-plt2/user_guanyouhe/wepsdl/gcore-dev
 
+# GDN fused in_proj 的 QKV/Z/B/A split-LoRA 单测
+PYTHONPATH="$PWD:../Megatron-LM:../mbridge:${PYTHONPATH:-}" \
+python -m pytest -q tests/test_gpatch_v4/test_gdn_split_lora.py
+
 # 验证 adapter merge 正确性
 python tests/test_gpatch_v4/test_lora_mbridge.py \
      --original hf-hub/Qwen/Qwen3.5-35B-A3B \
@@ -303,11 +319,15 @@ HF PEFT 也支持 MoE per-expert LoRA（v0.17.0+），对比：
 ### Qwen3.5 MoE (canonical_lora，推荐)
 
 ```yaml
-training:
+policy:
+  dist_config:
+    tensor_model_parallel_size: 1
+    expert_model_parallel_size: 8
   lora:
     rank: 128
     alpha: 256
     type: "canonical_lora"
+    share_expert_adapters: false
     target_modules:
       - "linear_q"
       - "linear_k"
@@ -315,7 +335,10 @@ training:
       - "linear_fc1_up"
       - "linear_fc1_gate"
       - "*.linear_proj"
-      - "*.in_proj"
+      - "*.in_proj_qkv"
+      - "*.in_proj_z"
+      - "*.in_proj_b"
+      - "*.in_proj_a"
       - "*.out_proj"
       - "*.qkv"
       - "*.proj"
@@ -326,11 +349,6 @@ checkpoint:
   no_save_optim: True
   no_load_optim: True        # 模型结构变化后必需
   convert_mcore_to_hf_online: True
-
-policy:
-  dist_config:
-    tensor_model_parallel_size: 1
-    expert_model_parallel_size: 8
 ```
 
 脚本: `gcore-dev/tasks/multimodal_v4/finetune/scripts/finetune_qwen3_5_moe_lora.sh`

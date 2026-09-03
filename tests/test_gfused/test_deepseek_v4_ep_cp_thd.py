@@ -46,8 +46,8 @@ TODO:
 - [x] 特殊处理 fp32 mhc
 - [x] Add FA
 - [x] DeepEP
-- [ ] THD 的 CP 改成 zz
-- [ ] 优化 CSA 与 HCA 的 op
+- [x] THD 的 CP 改成 zz
+- [x] 优化 CSA 与 HCA 的 op
 - [ ] better use real data to test it
 """
 
@@ -78,6 +78,7 @@ from test_gpatch_v4.gpatch_v4_test_helper import kill_all_actors_and_shutdown_ra
 
 from gpatch_v4.models.deepseek_v4 import DeepseekV4ForCausalLM, apply_hp
 from gpatch_v4.models.deepseek_v4.cp import cp_chunk_data
+from gpatch_v4.models.deepseek_v4.fp8_tensor import Fp8TensorAg
 from gpatch_v4.models.deepseek_v4.router_replay import (
     capture_routing_decisions,
     router_replay_ctx,
@@ -584,6 +585,7 @@ def _pack_thd_worker(
     fake_seq_lens: list[int] | None = None,
     padded_seq_lens: list[int] | None = None,
     fp8: bool = False,
+    fsdp_fp8_gather: bool = False,
 ):
     """THD [1, T=512] packed，cp_size=4 切 [1, 128]/rank。
 
@@ -631,6 +633,8 @@ def _pack_thd_worker(
         tag += f"_{ep_backend}"
     if fp8:
         tag += "_fp8"
+    if fsdp_fp8_gather:
+        tag += "_fp8ag"
     print(f"[{tag}] rank {rank}: loading {hf_model_path} via meta-device ...", flush=True)
     _t_start = time.time()
     model = _build_fork_model(hf_model_path, tokenizer)
@@ -643,11 +647,23 @@ def _pack_thd_worker(
         indexer_backend=indexer_backend,
         ep_backend=ep_backend,
         fp8=fp8,
+        fsdp_fp8_gather=fsdp_fp8_gather,
     )
     model.gradient_checkpointing_enable()
     model.load_checkpoint_hp(hf_model_path)
     load_seconds = time.time() - _t_start
     print(f"[{tag}] rank {rank}: load_checkpoint done in {load_seconds:.1f}s", flush=True)
+
+    fp8_wrapped_params = 0
+    if fsdp_fp8_gather:
+        for name, param in model.named_parameters():
+            if ".experts.gate_up_proj" not in name and ".experts.down_proj" not in name:
+                continue
+            local = param.to_local()
+            assert isinstance(local, Fp8TensorAg), (name, type(local))
+            assert local._tensor.dtype == torch.float32, (name, local._tensor.dtype)
+            fp8_wrapped_params += 1
+        assert fp8_wrapped_params > 0
 
     # cp_size=1 时 apply_hp 不绑 _cp_group（hp.py:166 cp_size>1 才 _bind_cp）。
     # 显式分支，避免静默 getattr fallback。
@@ -658,6 +674,27 @@ def _pack_thd_worker(
         replay_indices=replay_indices,
     )
     result["load_seconds"] = load_seconds
+    if fsdp_fp8_gather:
+        stats = [
+            module._fp8_all_gather_stats
+            for module in model.modules()
+            if hasattr(module, "_fp8_all_gather_stats")
+        ]
+        assert stats
+        result["fp8_wrapped_params"] = fp8_wrapped_params
+        result["fp8_pre_calls"] = sum(item["pre_calls"] for item in stats)
+        result["fp8_post_calls"] = sum(
+            item["post_new_calls"] + item["post_reuse_calls"] for item in stats
+        )
+        fp8_grad_params = 0
+        for name, param in model.named_parameters():
+            if ".experts.gate_up_proj" not in name and ".experts.down_proj" not in name:
+                continue
+            assert param.grad is not None, name
+            local_grad = param.grad.to_local()
+            assert local_grad.dtype == torch.float32, (name, local_grad.dtype)
+            fp8_grad_params += 1
+        result["fp8_grad_params"] = fp8_grad_params
 
     del model, packed_ids, packed_position_ids, packed_labels, psp
     torch.cuda.empty_cache()
@@ -926,6 +963,7 @@ def _bench_thd_worker(
     indexer_backend: str = "fused",
     ep_backend: str = "eager",
     fp8: bool = False,
+    fsdp_fp8_gather: bool = False,
     fake_seq_lens: list[int] | None = None,
     padded_seq_lens: list[int] | None = None,
     ep_size: int = 8,
@@ -968,6 +1006,8 @@ def _bench_thd_worker(
     tag = f"bench_thd_ep{ep_size}_cp{cp_size}_{attn_backend}"
     if fp8:
         tag += "_fp8"
+    if fsdp_fp8_gather:
+        tag += "_fp8ag"
     print(f"[{tag}] rank {rank}: loading {hf_model_path} via meta-device ...")
     _t_start = time.time()
     model = _build_fork_model(hf_model_path, tokenizer)
@@ -980,6 +1020,7 @@ def _bench_thd_worker(
         indexer_backend=indexer_backend,
         ep_backend=ep_backend,
         fp8=fp8,
+        fsdp_fp8_gather=fsdp_fp8_gather,
     )
     model.gradient_checkpointing_enable()
     model.load_checkpoint_hp(hf_model_path)
@@ -1069,8 +1110,7 @@ def _bench_thd_worker(
     from gpatch_v4.utils.flops_counter import FlopsCounter, get_device_flops
     from gpatch_v4.core.constants import MODEL_ARCH
     counter = FlopsCounter(config, MODEL_ARCH.DEEPSEEK_V4)
-    real_seq_lens = fake_seq_lens if fake_seq_lens is not None else list(FAKE_SEQ_LENS)
-    est_tflops, dev_tflops = counter.estimate_flops(real_seq_lens, avg_step)
+    est_tflops, dev_tflops = counter.estimate_flops([local_ids.shape[1]], avg_step)
 
     print(
         f"[{tag}] rank {rank}: {n_steps} steps done, "
@@ -1135,6 +1175,7 @@ class TestEpCpThd(unittest.TestCase):
         padded_seq_lens: "list[int] | None" = None,
         cp_size_override: "int | None" = None,
         fp8: "bool | None" = None,
+        fsdp_fp8_gather: "bool | None" = None,
     ):
         pg_obj, bundle_indices = pg
         master_addr = ray.get(
@@ -1162,6 +1203,8 @@ class TestEpCpThd(unittest.TestCase):
                 kw["cp_size_override"] = cp_size_override
             if fp8 is not None:
                 kw["fp8"] = fp8
+            if fsdp_fp8_gather is not None:
+                kw["fsdp_fp8_gather"] = fsdp_fp8_gather
             futures.append(
                 worker_fn.options(
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
@@ -1188,6 +1231,7 @@ class TestEpCpThd(unittest.TestCase):
         fake_seq_lens: list[int] | None = None,
         padded_seq_lens: list[int] | None = None,
         fp8: bool = False,
+        fsdp_fp8_gather: bool = False,
     ):
         assert os.path.isdir(HF_MODEL_PATH), (
             f"model dir not found: {HF_MODEL_PATH}; "
@@ -1227,7 +1271,8 @@ class TestEpCpThd(unittest.TestCase):
         print("=" * 60)
         print(
             f"Running THD pack (ep={EP_SIZE} cp={CP_SIZE} N={NUM_GPUS} "
-            f"attn={attn_backend} fp8={fp8}) + router replay ..."
+            f"attn={attn_backend} fp8={fp8} fsdp_fp8_gather={fsdp_fp8_gather}) "
+            f"+ router replay ..."
         )
         pack_results = self._run_workers(
             _pack_thd_worker, NUM_GPUS, pg, master_port=master_port_base + 1,
@@ -1238,6 +1283,7 @@ class TestEpCpThd(unittest.TestCase):
             fake_seq_lens=fake_seq_lens,
             padded_seq_lens=padded_seq_lens,
             fp8=fp8,
+            fsdp_fp8_gather=fsdp_fp8_gather,
         )
 
         remove_placement_group(pg[0])
@@ -1260,6 +1306,16 @@ class TestEpCpThd(unittest.TestCase):
                     f"logits.mean={res['logits_mean']:.4f} "
                     f"total_grad_norm={res['total_grad_norm']:.4f} "
                     f"num_grads={res['num_grads']}"
+                )
+        if fsdp_fp8_gather:
+            for res in pack_results:
+                self.assertGreater(res["fp8_wrapped_params"], 0, res)
+                self.assertGreater(res["fp8_pre_calls"], 0, res)
+                self.assertGreater(res["fp8_post_calls"], 0, res)
+                self.assertEqual(
+                    res["fp8_grad_params"],
+                    res["fp8_wrapped_params"],
+                    res,
                 )
 
         # --- 数值等价 assert ---
@@ -1377,19 +1433,20 @@ class TestEpCpThd(unittest.TestCase):
                         f"abs_diff={abs(pk_n - bl_n):.2e}",
                 )
 
-        print(f"\nPASSED (attn={attn_backend} fp8={fp8})")
+        print(f"\nPASSED (attn={attn_backend} fp8={fp8} fsdp_fp8_gather={fsdp_fp8_gather})")
 
     def test_pack_runs_fused(self):
         """THD pack fused attn vs vanilla baseline, short segs [100, 200, 100]."""
         self._pack_runs_impl(attn_backend="fused", indexer_backend="fused", ep_backend="deepep")
 
     def test_pack_runs_fused_fp8(self):
-        """THD pack fused + MoE FP8 grouped GEMM vs bf16 vanilla baseline."""
+        """THD pack fused + MoE FP8 AG + TE GEMM vs bf16 vanilla baseline."""
         self._pack_runs_impl(
             attn_backend="fused",
             indexer_backend="fused",
             ep_backend="deepep",
             fp8=True,
+            fsdp_fp8_gather=True,
             master_port_base=12800,
         )
 
@@ -1502,6 +1559,7 @@ class TestEpCpThd(unittest.TestCase):
         indexer_backend: str = "fused",
         ep_backend: str = "eager",
         fp8: bool = False,
+        fsdp_fp8_gather: bool = False,
         master_port_base: int = 12800,
         fake_seq_lens: list[int] | None = None,
         padded_seq_lens: list[int] | None = None,
@@ -1538,8 +1596,11 @@ class TestEpCpThd(unittest.TestCase):
                     indexer_backend=indexer_backend,
                     ep_backend=ep_backend,
                     fp8=fp8,
+                    fsdp_fp8_gather=fsdp_fp8_gather,
                     fake_seq_lens=fake_seq_lens,
                     padded_seq_lens=padded_seq_lens,
+                    ep_size=EP_SIZE,
+                    cp_size=CP_SIZE,
                 )
             )
         results = ray.get(futures)
@@ -1576,13 +1637,14 @@ class TestEpCpThd(unittest.TestCase):
         return results
 
     def test_hp_fused_smoke(self):
-        """Run one HP THD fwd/bwd with fused attention, indexer, EP, and FP8 MoE."""
+        """Run one HP THD fwd/bwd with fused attention, indexer, EP, and FP8 MoE AG."""
         results = self._bench_impl(
             n_steps=1,
             attn_backend="fused",
             indexer_backend="fused",
             ep_backend="deepep",
             fp8=True,
+            fsdp_fp8_gather=True,
             master_port_base=13100,
         )
         for result in results:

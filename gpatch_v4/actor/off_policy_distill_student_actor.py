@@ -18,6 +18,7 @@ from megatron.core import mpu
 from gpatch_v4.actor.finetune_actor import FinetuneActor
 from gpatch_v4.actor.mixin import ProfileMixin, TestActorMixin
 from gpatch_v4.client import SamplerClient, TeacherClient
+from gpatch_v4.core.mappings import all_gather_from_context_parallel_region
 from gpatch_v4.core.parallel_state import (
     cpu_barrier,
     init_pg,
@@ -27,6 +28,7 @@ from gpatch_v4.core.parallel_state import (
 )
 from gpatch_v4.rollout_generator import RolloutGeneratorFactory
 from gpatch_v4.training_backend import TrainingEngineFactory
+from gpatch_v4.transfer import get_tq_connector, init_tq_connector
 from gpatch_v4.utils import (
     TrainReporterSingleton,
     display_rollout_generation,
@@ -48,6 +50,8 @@ class OffloadStudentEngineManager:
     def __enter__(self):
         self.model_engine.offload_optimizer()
         self.model_engine.offload_model()
+        if self.model_engine.config.training.enable_teacher_kl_loss:
+            self.model_engine.offload_teacher_output_weight()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -61,6 +65,8 @@ class OnloadStudentEngineManager:
     def __enter__(self):
         self.model_engine.onload_model()
         self.model_engine.onload_optimizer()
+        if self.model_engine.config.training.enable_teacher_kl_loss:
+            self.model_engine.onload_teacher_output_weight()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -71,10 +77,19 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
     async def init(self, config):
         await super().init(config)
 
+        if self.config.tq.enable:
+            init_tq_connector(self.config.tq)
+
         if self.config.training.enable_teacher_kl_loss and not self.config.training.setup_teacher_in_independent_topo:
             assert self.config.training.prefetch_num_gb == 1, "to speed up prefetch_num_gb must be 1 when setup_teacher_in_same_topo"
             extra_args = {"policy_config": config.teacher, "tokenizer": self.teacher_tokenizer}
             self.teacher_engine = TrainingEngineFactory.get_training_engine(config, **extra_args)
+
+    @override
+    async def setup_model_and_optimizer(self):
+        await super().setup_model_and_optimizer()
+        if self.config.training.enable_teacher_kl_loss:
+            self.model_engine.setup_teacher_output_weight()
 
     @override
     def validated_config(self):
@@ -100,7 +115,11 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
             await self.sampler_client.maybe_init_distributed_weight_group_for_disagg()
         if self.config.training.enable_teacher_kl_loss:
             if self.config.training.setup_teacher_in_independent_topo:
-                self.teacher_client = TeacherClient(self.config)
+                self.teacher_client = TeacherClient(
+                    self.config,
+                    teacher_name=None,
+                    teacher_config=self.config.teacher,
+                )
             else:
                 self.teacher_engine.setup_model_and_get_optimizer()
                 self.teacher_engine.offload_model()
@@ -132,14 +151,19 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
         metrics = {}
         return rollout_batches, metrics
 
-    def compute_teacher_logits_in_same_process(
+    def compute_teacher_hidden_states_in_same_process(
         self, rollout_batches_list: List[List[Dict[str, torch.Tensor]]]
     ):
         self.teacher_engine.onload_model()
         for rollout_batches in rollout_batches_list:
-            _, teacher_logits = self.teacher_engine.compute_logits(rollout_batches)
-            for rollout_batch, b_teacher_logits in zip(rollout_batches, teacher_logits):
-                rollout_batch["teacher_logits"] = b_teacher_logits
+            _, teacher_outputs = self.teacher_engine.compute_hidden_states(rollout_batches)
+            if (mpu.is_pipeline_last_stage() and mpu.get_context_parallel_world_size() > 1):
+                teacher_outputs = [
+                    all_gather_from_context_parallel_region(teacher_output, gather_dim=0)
+                    for teacher_output in teacher_outputs
+                ]
+            for rollout_batch, teacher_output in zip(rollout_batches, teacher_outputs):
+                rollout_batch["teacher_hidden_states"] = teacher_output
         self.teacher_engine.offload_model()
         return rollout_batches_list
 
@@ -147,7 +171,7 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
         self,
         epoch_i,
         train_step_i,
-        batched_data: List[Dict[str, torch.Tensor]],
+        batched_data: List[Dict[str, Any]],
         avg_rollout_time=None,
     ):
         begint_time = sync_cuda_and_get_time()
@@ -200,6 +224,7 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
                     training_config.prefetch_num_gb,
                     last_steps - prefetch_i * training_config.prefetch_num_gb
                 )
+                rollout_step = train_step
                 with OffloadStudentEngineManager(self.model_engine):
                     rollout_begin_time = sync_cuda_and_get_time()
                     rollout_batches, metrics = await self.rollout(
@@ -236,7 +261,7 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
                 rollout_batches_list = get_k_split_list(sorted_rbs, _prefetch_num_gb)
                 if self.config.training.enable_teacher_kl_loss and not self.config.training.setup_teacher_in_independent_topo:
                     rollout_begin_time = sync_cuda_and_get_time()
-                    rollout_batches_list = self.compute_teacher_logits_in_same_process(
+                    rollout_batches_list = self.compute_teacher_hidden_states_in_same_process(
                         rollout_batches_list
                     )
                     rollout_end_time = sync_cuda_and_get_time()
@@ -262,8 +287,18 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
 
                         train_step += 1
                         steps_in_curr_epoch += 1
-                        if train_step % training_config.save_interval == 0:
+                        if (
+                            train_step % training_config.save_interval == 0 and
+                            not self.config.debug.disable_save_checkpoint
+                        ):
                             self.model_engine.save_checkpoint(train_step)
+                    cpu_barrier()
+
+                if self.config.tq.enable:
+                    cpu_barrier()
+                    if (is_mp_and_cp_head() and mpu.get_data_parallel_rank() == 0):
+                        connector = get_tq_connector()
+                        await connector.async_clear_step(rollout_step)
                     cpu_barrier()
 
                 if exit_flag:
@@ -275,7 +310,10 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
         self.train_step_finished = True
 
         cpu_barrier()
-        if train_step % training_config.save_interval != 0:
+        if (
+            train_step % training_config.save_interval != 0 and
+            not self.config.debug.disable_save_checkpoint
+        ):
             self.model_engine.save_checkpoint(train_step)
 
         if is_last_rank():

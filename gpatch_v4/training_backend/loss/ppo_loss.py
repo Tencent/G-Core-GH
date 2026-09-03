@@ -1,9 +1,10 @@
 """Policy-loss path (sum-return + unified agg).
 
 Enabled when ``ppo.use_legacy_loss=False``. Legacy implementations remain in
-``loss_factory.py``.
+``loss_factory.py``, while entropy regularization is shared by both paths.
 
-dyn-CP is not supported yet.
+New loss expects plain 2D ``[B, S]`` tensors. Dyn-CP / THD packs must be
+response-padded before entering this path (``cu_seqlens_padded=None``).
 """
 
 from dataclasses import dataclass
@@ -12,11 +13,16 @@ from typing import Any, Callable, Dict, Optional
 import torch
 
 from gpatch_v4.configs.config import OnPolicyDistillConfig
+from gpatch_v4.core.adaptive_entropy import get_entropy_bonus_coef
 from gpatch_v4.core.correction_helper import compute_off_policy_correction_weights
 from gpatch_v4.training_backend.loss.metrics import compute_steer_histograms
 from gpatch_v4.training_backend.loss.registry import register_loss
 from gpatch_v4.training_backend.loss.utils import agg, compute_clip_metrics
-from gpatch_v4.utils import masked_mean, reduce_metrics_across_data_parallel_group
+from gpatch_v4.utils import (
+    masked_mean,
+    masked_sum,
+    reduce_metrics_across_data_parallel_group,
+)
 from gpatch_v4.utils.ppo_utils import calculate_kl_loss
 
 
@@ -43,9 +49,8 @@ class PolicyLossInput:
     # log-probs，用于 ``advantages.dim() == 3`` 时用于 3D PPO ratio 计算。
     prev_topk_logprobs: Optional[torch.Tensor] = None
     curr_topk_logprobs: Optional[torch.Tensor] = None
-    # cu_seqlens_padded: sample boundaries in THD packed format. When set,
-    # loss aggregation uses per-sample mean instead of global per-token mean
-    # to eliminate the length bias inherent in token-weighted averaging.
+    # Kept for call-site compatibility; must stay None / 1. Dyn-CP THD packs
+    # are response-padded to ``[B, S]`` before new loss (see mixin).
     cu_seqlens_padded: Optional[torch.Tensor] = None
     local_cp_size: int = 1
     calculate_per_token_loss: bool = False
@@ -61,6 +66,167 @@ class ActorLossResult:
     ratios: torch.Tensor
     algo_metrics: Optional[Dict[str, torch.Tensor]] = None
     algo_dumps: Optional[Dict[str, Any]] = None
+
+
+def compute_entropy_regularization_loss(
+    ppo_config,
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    pg_losses1: torch.Tensor,
+    pg_losses2: torch.Tensor,
+    entropy_aux_figures: Optional[torch.Tensor] = None,
+    rollout_log_probs: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict]:
+    """Entropy regularization via clip-cov or kl-cov.
+
+    Modifies the per-token policy gradient losses to control entropy collapse.
+    ref: https://arxiv.org/abs/2505.22617
+
+    Parameters
+    ----------
+    ppo_config : PpoConfig
+        PPO configuration containing regularization hyperparameters.
+    old_log_prob : torch.Tensor
+        Previous policy log-probabilities, shape ``[B, S]``.
+    log_prob : torch.Tensor
+        Current policy log-probabilities, shape ``[B, S]``.
+    advantages : torch.Tensor
+        Per-token advantages, shape ``[B, S]``.
+    response_mask : torch.Tensor
+        Binary mask for valid response tokens, shape ``[B, S]``.
+    pg_losses1 : torch.Tensor
+        Unclipped surrogate loss ``-advantages * ratios``, shape ``[B, S]``.
+    pg_losses2 : torch.Tensor
+        Clipped surrogate loss ``-advantages * ratios_clamped``, shape ``[B, S]``.
+    entropy_aux_figures : torch.Tensor, optional
+        Global covariance figures ``[mean_adv, mean_logp, kl_cov_tau]`` (shape
+        ``(3,)``) precomputed at collation across the global train_gbs / DP. When
+        present and ``ppo_entropy_global_cov`` is on, the covariance is centered
+        on the global means and kl-cov selects ``cov > kl_cov_tau`` (exact global
+        top-rho%). When None, the per-micro-batch behavior is used.
+    rollout_log_probs : torch.Tensor, optional
+        Sampler log-probs, used as the covariance log-prob in the global path
+        when ``skip_prev_logps`` (prev_log_probs is unavailable then).
+
+    Returns
+    -------
+    pg_losses : torch.Tensor
+        Modified per-token losses after entropy regularization, shape ``[B, S]``.
+    metrics : dict
+        Regularization-specific metrics for logging.
+    """
+    reg_type = ppo_config.ppo_entropy_regularization_type
+    assert reg_type in ("clip-cov", "kl-cov"), \
+        f"ppo_entropy_regularization_type must be 'clip-cov' or 'kl-cov', got '{reg_type}'"
+
+    # Global covariance: center on global means (and, for kl-cov, select via the
+    # global top-rho% threshold) using the same log-prob space as collation.
+    use_global = ppo_config.ppo_entropy_global_cov and entropy_aux_figures is not None
+    if use_global:
+        cov_log_prob = rollout_log_probs if ppo_config.skip_prev_logps else old_log_prob
+        assert cov_log_prob is not None, (
+            "global entropy cov requires rollout_log_probs (skip_prev_logps) "
+            "or prev_log_probs as the covariance log-prob"
+        )
+        cov_log_prob = cov_log_prob.detach()
+        global_mean_adv = entropy_aux_figures[0]
+        global_mean_logp = entropy_aux_figures[1]
+        kl_cov_tau = entropy_aux_figures[2]
+
+    metrics = {}
+    cov_for_metrics = None
+    pg_losses = None
+
+    if reg_type == "clip-cov":
+        corr = torch.ones_like(advantages)
+        clip_by_origin = (pg_losses2 > pg_losses1) & (response_mask > 0)
+        if use_global:
+            cov_all = (advantages - global_mean_adv) * (cov_log_prob - global_mean_logp)
+        else:
+            cov_all = (
+                (advantages - masked_mean(advantages, response_mask)) *
+                (log_prob - masked_mean(log_prob.detach(), response_mask))
+            )
+        cov_for_metrics = cov_all[response_mask > 0].clone().detach()
+        cov_all[response_mask == 0] = -torch.inf
+        cov_all[clip_by_origin] = -torch.inf
+        clip_num = max(int(ppo_config.ppo_clip_cov_ratio * response_mask.sum().item()), 1)
+        top_k_idx = (
+            (cov_all < ppo_config.ppo_clip_cov_ub) & (cov_all > ppo_config.ppo_clip_cov_lb) &
+            (response_mask > 0)
+        )
+        top_k_idx = torch.nonzero(top_k_idx)
+        if len(top_k_idx) > 0:
+            perm = torch.randperm(len(top_k_idx))
+            top_k_idx = top_k_idx[perm[:min(clip_num, len(top_k_idx))]]
+        else:
+            top_k_idx = torch.empty((0, 2), device=cov_all.device, dtype=torch.long)
+        corr[top_k_idx[:, 0], top_k_idx[:, 1]] = 0
+        pg_clipfrac = masked_mean((corr == 0).float(), response_mask)
+        pg_losses = torch.maximum(pg_losses1, pg_losses2) * corr
+        metrics["clip_cov_frac"] = pg_clipfrac
+
+    elif reg_type == "kl-cov":
+        clip_max_loss = torch.maximum(pg_losses1, pg_losses2)  # NOTE: avoid loss collapse
+        negative_approx_kl = log_prob - old_log_prob
+        if ppo_config.ppo_logps_ratio_clamp is not None:  # NOTE: avoid kl collapse
+            negative_approx_kl = torch.clamp(
+                negative_approx_kl,
+                min=-ppo_config.ppo_logps_ratio_clamp,
+                max=ppo_config.ppo_logps_ratio_clamp
+            )
+        abs_kl = negative_approx_kl.abs()
+        pg_losses_kl = clip_max_loss + ppo_config.ppo_kl_cov_coef * abs_kl
+        pg_losses = clip_max_loss.clone()
+
+        if use_global:
+            # Exact global top-rho%: select tokens whose globally-centered cov
+            # exceeds the global threshold tau (tau = +inf disables selection).
+            cov = (advantages - global_mean_adv) * (cov_log_prob - global_mean_logp)
+            select = (cov > kl_cov_tau) & (response_mask > 0)
+            cov_for_metrics = cov[response_mask > 0].clone().detach()
+            pg_losses[select] = pg_losses_kl[select]
+        else:
+            all_valid = response_mask > 0
+            all_valid_idx = torch.nonzero(all_valid.reshape(-1), as_tuple=True)[0]
+            all_valid_adv = advantages[all_valid].detach().reshape(-1)
+            all_valid_logp = log_prob[all_valid].detach().reshape(-1)
+            k = min(ppo_config.ppo_kl_cov_ratio, len(all_valid_adv))
+            if k != 0:
+                cov_lst_all = (
+                    (all_valid_adv - all_valid_adv.mean()) *
+                    (all_valid_logp - all_valid_logp.mean())
+                )
+                cov_for_metrics = cov_lst_all.clone().detach()
+                k_percent_nums = max(1, int(len(cov_lst_all) * ppo_config.ppo_kl_cov_ratio))
+                large_cov_idxs = torch.topk(cov_lst_all, k_percent_nums, largest=True).indices
+
+                if len(large_cov_idxs) != 0:
+                    large_cov_idxs = all_valid_idx[large_cov_idxs]
+                    pg_losses[large_cov_idxs // advantages.shape[1], large_cov_idxs %
+                              advantages.shape[1]] = pg_losses_kl[large_cov_idxs //
+                                                                  advantages.shape[1],
+                                                                  large_cov_idxs %
+                                                                  advantages.shape[1]]
+        ppo_kl_abs = masked_mean(negative_approx_kl.abs(), response_mask)
+        metrics["ppo_abs_kl"] = ppo_kl_abs
+
+    if cov_for_metrics is not None and len(cov_for_metrics) > 0:
+        # choose quantiles according to Table 1, https://arxiv.org/abs/2505.22617
+        p50, p80, p98, p99_8, p99_98 = torch.quantile(
+            cov_for_metrics,
+            torch.tensor([0.5, 0.8, 0.98, 0.998, 0.9998], device=cov_for_metrics.device),
+            interpolation='linear',
+        )
+        metrics["cov_p50"] = p50
+        metrics["cov_p80"] = p80
+        metrics["cov_p98"] = p98
+        metrics["cov_p99_8"] = p99_8
+        metrics["cov_p99_98"] = p99_98
+
+    return pg_losses, metrics
 
 
 def _token_level_ratios(ppo_config, curr_log_probs, effective_prev):
@@ -145,9 +311,6 @@ def _compute_steer_token_weights(
 
 def _compute_grpo_actor_loss(config, loss_input, response_mask, effective_prev):
     ppo_config = config.ppo
-    assert ppo_config.ppo_entropy_regularization_type is None, (
-        "new loss path does not support ppo_entropy_regularization_type yet"
-    )
     advantages = loss_input.advantages
     ratios = _token_level_ratios(ppo_config, loss_input.curr_log_probs, effective_prev)
     clip_ratio_low = (
@@ -161,7 +324,21 @@ def _compute_grpo_actor_loss(config, loss_input, response_mask, effective_prev):
     ratios_clamped = ratios.clamp(1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
     loss1 = -advantages * ratios
     loss2 = -advantages * ratios_clamped
-    clip_max_loss = torch.maximum(loss1, loss2)
+    entropy_reg_metrics = {}
+    if ppo_config.ppo_entropy_regularization_type is not None:
+        clip_max_loss, entropy_reg_metrics = compute_entropy_regularization_loss(
+            ppo_config,
+            old_log_prob=effective_prev,
+            log_prob=loss_input.curr_log_probs,
+            advantages=advantages,
+            response_mask=response_mask,
+            pg_losses1=loss1,
+            pg_losses2=loss2,
+            entropy_aux_figures=loss_input.entropy_aux_figures,
+            rollout_log_probs=loss_input.rollout_log_probs,
+        )
+    else:
+        clip_max_loss = torch.maximum(loss1, loss2)
 
     loss3 = None
     if ppo_config.ppo_dual_clip_ratio_c is not None:
@@ -185,13 +362,14 @@ def _compute_grpo_actor_loss(config, loss_input, response_mask, effective_prev):
             numel,
             loss3=loss3,
         )
+        algo_metrics.update(entropy_reg_metrics)
         algo_dumps = None
         if loss_input.should_dump_metrics:
             ratios_tmp = ratios.detach()
             algo_dumps = {
-                "ppo_ratio_unclamped":
+                "dump/ppo_ratio_unclamped":
                     ratios_tmp.to(dtype=torch.bfloat16, device="cpu"),
-                "is_ppo_ratio_clamped":
+                "dump/is_ppo_ratio_clamped":
                     ((ratios_tmp == ratios_clamped.detach()) & response_mask.bool()).cpu(),
             }
 
@@ -272,8 +450,10 @@ def _compute_cispo_actor_loss(config, loss_input, response_mask, effective_prev)
         if loss_input.should_dump_metrics:
             ratios_tmp = ratios.detach()
             algo_dumps = {
-                "ppo_ratio_unclamped": ratios_tmp.to(dtype=torch.bfloat16, device="cpu"),
-                "is_ppo_ratio_clamped": ((ratios_tmp == clipped_ratio.detach()) & mask_bool).cpu(),
+                "dump/ppo_ratio_unclamped":
+                    ratios_tmp.to(dtype=torch.bfloat16, device="cpu"),
+                "dump/is_ppo_ratio_clamped":
+                    ((ratios_tmp == clipped_ratio.detach()) & mask_bool).cpu(),
             }
 
     return ActorLossResult(
@@ -285,18 +465,11 @@ def _compute_cispo_actor_loss(config, loss_input, response_mask, effective_prev)
 
 
 def _compute_gspo_actor_loss(config, loss_input, response_mask, effective_prev):
-    """
-    GSPO actor loss implementation.
-    NTOE: THD and dynamic CP are not supported yet.
+    """GSPO actor loss with sequence-level importance ratios on ``[B, S]``.
 
-    Args:
-        config: The configuration object.
-        loss_input: The loss input object.
-        response_mask: The response mask tensor.
-        effective_prev: The effective previous log probabilities tensor.
-
-    Returns:
-        ActorLossResult: The actor loss result.
+    Dyn-CP / THD packs must already be response-padded before this path
+    (``cu_seqlens_padded=None``, ``local_cp_size=1``); see
+    ``mixin._rl_response_pad_dyn_cp_tensors``.
     """
     ppo_config = config.ppo
     assert ppo_config.ppo_entropy_regularization_type is None, (
@@ -359,9 +532,9 @@ def _compute_gspo_actor_loss(config, loss_input, response_mask, effective_prev):
         if loss_input.should_dump_metrics:
             ratios_tmp = ratios.detach()
             algo_dumps = {
-                "ppo_ratio_unclamped":
+                "dump/ppo_ratio_unclamped":
                     ratios_tmp.to(dtype=torch.bfloat16, device="cpu"),
-                "is_ppo_ratio_clamped":
+                "dump/is_ppo_ratio_clamped":
                     ((ratios_tmp == ratios_clamped.detach()) & response_mask.bool()).cpu(),
             }
 
@@ -408,7 +581,128 @@ def _compute_sapo_actor_loss(config, loss_input, response_mask, effective_prev):
         algo_dumps = None
         if loss_input.should_dump_metrics:
             algo_dumps = {
-                "ppo_ratio_unclamped": ratios.detach().to(dtype=torch.bfloat16, device="cpu"),
+                "dump/ppo_ratio_unclamped": ratios.detach().to(dtype=torch.bfloat16, device="cpu"),
+            }
+
+    return ActorLossResult(
+        actor_loss=actor_loss,
+        ratios=ratios,
+        algo_metrics=algo_metrics,
+        algo_dumps=algo_dumps,
+    )
+
+
+def _compute_vespo_actor_loss(config, loss_input, response_mask, effective_prev):
+    """VESPO: scale the REINFORCE gradient by a smooth sequence-level IS kernel.
+
+    The kernel ``φ(W) = W^c1 · exp(c2 (1 - W))`` acts on the *product* sequence
+    importance weight ``W = Π_t π_θ/π_rollout`` with no length normalization, and
+    is detached so it only reweights ``∇log π_θ``. ``φ(1) = 1`` keeps on-policy
+    samples at unit weight, so learning rates transfer from the GRPO path.
+    See `arXiv:2602.10693 <https://arxiv.org/abs/2602.10693>`_ Eq. (20).
+
+    Both sources of off-policyness are folded into that single ``W``: policy lag
+    ``π_θ/π_prev`` and train/infer engine mismatch ``π_prev/π_rollout``. This is
+    why ``enable_off_policy_correction`` must stay off — it would apply the
+    latter a second time, outside the kernel.
+
+    NOTE: THD and dynamic CP are not supported yet. Every reduction below folds
+    dim -1 into one scalar per sequence, which assumes each ``[B, S]`` row holds
+    exactly one sequence. Static CP is fine: log-probs are CP-all-gathered back
+    to full length before the loss runs.
+    """
+    ppo_config = config.ppo
+    assert loss_input.cu_seqlens_padded is None, (
+        "VESPO does not support THD packing: reducing over dim -1 would turn the "
+        "whole pack into a single W = Π_t ratio instead of one W per sequence."
+    )
+    advantages = loss_input.advantages
+    assert advantages.dim() == 2, (
+        "VESPO reweights whole sequences and cannot consume 3D (top-k OPD) advantages, "
+        f"got {advantages.dim()}D."
+    )
+    assert not ppo_config.skip_prev_logps, (
+        "VESPO requires prev_log_probs; set skip_prev_logps=False."
+    )
+    assert loss_input.rollout_log_probs is not None, (
+        "VESPO folds the train/infer IS ratio into W and always requires "
+        "rollout_log_probs."
+    )
+    assert ppo_config.ppo_logps_ratio_clamp is not None
+
+    with torch.no_grad():
+        token_log_ratio = (loss_input.curr_log_probs - effective_prev).float()
+        if ppo_config.ppo_logps_ratio_clamp is not None:
+            token_log_ratio = torch.clamp(
+                token_log_ratio,
+                min=-ppo_config.ppo_logps_ratio_clamp,
+                max=ppo_config.ppo_logps_ratio_clamp,
+            )
+        ratios = token_log_ratio.exp()
+
+        log_tis = torch.clamp(
+            (effective_prev - loss_input.rollout_log_probs).float(),
+            min=-ppo_config.ppo_logps_ratio_clamp,
+            max=ppo_config.ppo_logps_ratio_clamp,
+        )
+        seq_log_tis = masked_sum(log_tis, response_mask, dim=-1)
+
+        seq_log_w = masked_sum(token_log_ratio, response_mask, dim=-1) + seq_log_tis
+        # Both saturation ends drive φ to 0 (W^c1 for W→0, exp(-c2 W) for W→∞),
+        # so clamping only guards exp() from overflowing.
+        seq_log_w = torch.clamp(
+            seq_log_w, min=-ppo_config.ppo_logps_ratio_clamp, max=ppo_config.ppo_logps_ratio_clamp
+        )
+        w_seq = seq_log_w.exp()
+
+        # GRPO advantages are constant within a sequence; the masked mean picks
+        # that value without assuming any particular token position is valid.
+        seq_advantages = (
+            masked_sum(advantages, response_mask, dim=-1) / response_mask.sum(dim=-1).clamp(min=1)
+        )
+        is_pos = (seq_advantages >= 0).float()
+        c1 = is_pos * ppo_config.vespo_c1_pos + (1.0 - is_pos) * ppo_config.vespo_c1_neg
+        c2 = is_pos * ppo_config.vespo_c2_pos + (1.0 - is_pos) * ppo_config.vespo_c2_neg
+        c2 = torch.clamp(c2, min=1e-4)
+        log_w_seq = torch.log(w_seq.clamp(min=1e-8))
+        phi_seq = torch.exp(c2 + c1 * log_w_seq - c2 * w_seq)
+        phi_seq = torch.nan_to_num(phi_seq, nan=0.0, posinf=0.0, neginf=0.0)
+
+    actor_loss = -phi_seq.unsqueeze(-1) * advantages * loss_input.curr_log_probs
+
+    # ============================ VESPO METRICS ===============================
+    with torch.no_grad():
+        num_seqs = torch.tensor(float(w_seq.shape[0]), device=w_seq.device)
+        is_neg = 1.0 - is_pos
+        algo_metrics = {
+            "vespo/w_seq_mean":
+                torch.stack([w_seq.sum(), num_seqs]),
+            "vespo/w_seq_min":
+                w_seq.min(),
+            "vespo/w_seq_max":
+                w_seq.max(),
+            "vespo/log_w_seq_mean":
+                torch.stack([seq_log_w.sum(), num_seqs]),
+            "vespo/phi_mean":
+                torch.stack([phi_seq.sum(), num_seqs]),
+            "vespo/phi_min":
+                phi_seq.min(),
+            "vespo/phi_max":
+                phi_seq.max(),
+            "vespo/phi_pos_mean":
+                torch.stack([(phi_seq * is_pos).sum(), is_pos.sum()]),
+            "vespo/phi_neg_mean":
+                torch.stack([(phi_seq * is_neg).sum(), is_neg.sum()]),
+            # Negative-advantage sequences whose raw weight exploded: the paper's
+            # early warning for off-policy noise dominating the update.
+            "vespo/neg_noise_frac":
+                torch.stack([(is_neg * (w_seq > 100.0).float()).sum(), num_seqs]),
+        }
+        algo_metrics["vespo/seq_log_tis_mean"] = torch.stack([seq_log_tis.sum(), num_seqs])
+        algo_dumps = None
+        if loss_input.should_dump_metrics:
+            algo_dumps = {
+                "dump/ppo_ratio_unclamped": ratios.to(dtype=torch.bfloat16, device="cpu"),
             }
 
     return ActorLossResult(
@@ -433,8 +727,12 @@ def _policy_loss(
         denominator from ``agg`` (token count or sample count).
     """
     assert loss_input.cu_seqlens_padded is None, (
-        "new loss path does not support THD / dyn-CP yet "
-        "(cu_seqlens_padded must be None)"
+        "new loss expects [B, S] tensors; convert THD/dyn-CP to response-padded "
+        "sequence before loss (cu_seqlens_padded must be None)"
+    )
+    assert loss_input.local_cp_size == 1, (
+        "new loss expects local_cp_size=1; convert THD/dyn-CP to response-padded "
+        "sequence before loss (local_cp_size must be 1)"
     )
     ppo_config = config.ppo
     per_token_entropy = loss_input.per_token_entropy
@@ -466,12 +764,14 @@ def _policy_loss(
         calculate_per_token_loss=loss_input.calculate_per_token_loss,
         sample_mask=loss_input.sample_mask,
         token_weights=loss_input.token_weights,
+        cu_seqlens_padded=loss_input.cu_seqlens_padded,
+        local_cp_size=loss_input.local_cp_size,
     )
     actor_bwd_sum, actor_bwd_count = agg(actor.actor_loss, response_mask, **agg_kw)
 
     # ============================ AGGREGATE ENTROPY LOSS ======================
     entropy_bwd_sum, entropy_bwd_count = agg(per_token_entropy, response_mask, **agg_kw)
-    loss = actor_bwd_sum - entropy_bwd_sum * ppo_config.ppo_entropy_bonus
+    loss = actor_bwd_sum - entropy_bwd_sum * get_entropy_bonus_coef(ppo_config)
 
     # ============================ COMPUTE KL LOSS =============================
     use_absolute_kl = False
@@ -497,6 +797,25 @@ def _policy_loss(
     # ============================ COMPUTE BWD LOSS ============================
     bwd_loss = loss.clone()
 
+    # Token-level grads w.r.t. bwd_loss (before mixin GBS scale). retain_graph so
+    # Megatron can still backward the same graph for the parameter update.
+    dumped_actor_loss_grad = None
+    dumped_curr_logprob_grad = None
+    dump_gradient = (loss_input.should_dump_metrics and config.training.ppo_dump_gradient)
+    if dump_gradient:
+        actor_loss_grad, curr_logprob_grad = torch.autograd.grad(
+            outputs=bwd_loss,
+            inputs=(actor.actor_loss, loss_input.curr_log_probs),
+            retain_graph=True,
+            allow_unused=True,
+        )
+        if actor_loss_grad is not None:
+            dumped_actor_loss_grad = actor_loss_grad.detach().to(dtype=torch.bfloat16, device="cpu")
+        if curr_logprob_grad is not None:
+            dumped_curr_logprob_grad = curr_logprob_grad.detach().to(
+                dtype=torch.bfloat16, device="cpu"
+            )
+
     # ============================ COLLECT METRICS =============================
     with torch.no_grad():
         numel = response_mask.sum()
@@ -516,26 +835,27 @@ def _policy_loss(
     if actor.algo_metrics:
         metrics.update(actor.algo_metrics)
     if loss_input.sample_mask is not None:
-        sample_mask = loss_input.sample_mask
-        metrics["valid_sample_ratio"] = masked_mean(
-            sample_mask.float().detach(), torch.ones_like(sample_mask, dtype=torch.float)
-        )
+        sm = loss_input.sample_mask.float().detach()
+        metrics["valid_sample_ratio"] = torch.stack([sm.sum(), sm.new_tensor(float(sm.numel()))])
 
     reduce_metrics_across_data_parallel_group(metrics)
     # ============================ DUMP METRICS ================================
     if loss_input.should_dump_metrics:
         dumped = {
-            "curr_logprobs":
+            "dump/curr_logprobs":
                 loss_input.curr_log_probs.clone().detach().to(dtype=torch.bfloat16, device="cpu"),
-            "per_token_entropy":
+            "dump/per_token_entropy":
                 per_token_entropy.clone().detach().to(dtype=torch.bfloat16, device="cpu"),
-            "topk_logprobs":
+            "dump/topk_logprobs":
                 loss_input.dumped_topk_logprobs,
-            "topk_token_ids":
+            "dump/topk_token_ids":
                 loss_input.dumped_topk_token_ids,
-            "mask":
+            "dump/mask":
                 response_mask.detach().bool().to(device="cpu"),
         }
+        if dump_gradient:
+            dumped["dump/actor_loss_grad"] = dumped_actor_loss_grad
+            dumped["dump/curr_logprob_grad"] = dumped_curr_logprob_grad
         if actor.algo_dumps is not None:
             dumped.update(actor.algo_dumps)
         metrics.update(dumped)
@@ -543,17 +863,17 @@ def _policy_loss(
     return bwd_loss, actor_bwd_count, metrics
 
 
-@register_loss(backends=("mcore", ), loss_name="grpo", log_registration=True)
+@register_loss(backends=("mcore", ), loss_name="grpo")
 def grpo_loss(config, loss_input: PolicyLossInput):
     return _policy_loss(config, loss_input, _compute_grpo_actor_loss)
 
 
-@register_loss(backends=("mcore", ), loss_name="steer", log_registration=True)
+@register_loss(backends=("mcore", ), loss_name="steer")
 def steer_loss(config, loss_input: PolicyLossInput):
     return _policy_loss(config, loss_input, _compute_steer_actor_loss)
 
 
-@register_loss(backends=("mcore", ), loss_name="cispo", log_registration=True)
+@register_loss(backends=("mcore", ), loss_name="cispo")
 def cispo_loss(config, loss_input: PolicyLossInput):
     return _policy_loss(config, loss_input, _compute_cispo_actor_loss)
 
@@ -566,3 +886,8 @@ def gspo_loss(config, loss_input: PolicyLossInput):
 @register_loss(backends=("mcore", ), loss_name="sapo")
 def sapo_loss(config, loss_input: PolicyLossInput):
     return _policy_loss(config, loss_input, _compute_sapo_actor_loss)
+
+
+@register_loss(backends=("mcore", ), loss_name="vespo")
+def vespo_loss(config, loss_input: PolicyLossInput):
+    return _policy_loss(config, loss_input, _compute_vespo_actor_loss)

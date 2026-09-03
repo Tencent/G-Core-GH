@@ -150,7 +150,10 @@ class FSDPLRScheduler(LRScheduler):
         Returns:
             list[float]: A list of learning rates, one for each parameter group.
         """
-        return [self._get_lr_for_group(group) for group in self.optimizer.param_groups]
+        return [
+            self._get_lr_for_group(group) * group.get("lr_mult", 1.0)
+            for group in self.optimizer.param_groups
+        ]
 
 
 def get_lr_scheduler(config, optimizer: torch.optim.Optimizer) -> FSDPLRScheduler:

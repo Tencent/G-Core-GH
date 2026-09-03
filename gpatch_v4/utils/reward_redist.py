@@ -535,6 +535,24 @@ def lcs_match(
     return myers_lcs(x, y)
 
 
+def _mean_or_interpolate_gap_reward(
+    rewards: torch.Tensor,
+    y_start: int,
+    y_end: int,
+):
+    """Mean a non-empty gap, or interpolate an empty gap from its neighbors."""
+    gap_rewards = rewards[y_start:y_end]
+    if gap_rewards.numel() > 0:
+        return gap_rewards.mean()
+
+    neighbor_rewards = []
+    if y_start > 0:
+        neighbor_rewards.append(rewards[y_start - 1])
+    if y_end < rewards.shape[0]:
+        neighbor_rewards.append(rewards[y_end])
+    return torch.stack(neighbor_rewards).mean() if neighbor_rewards else 0.0
+
+
 def redistribute_rewards(
     orig_ids: List[int],
     reenc_ids: List[int],
@@ -584,11 +602,7 @@ def redistribute_rewards(
             # 一定是两边长度都 > 1；
 
             if blk.x_start < blk.x_end:
-                gap_rewards = rewards[blk.y_start:blk.y_end]
-                if gap_rewards.numel() > 0:
-                    mean_reward = gap_rewards.mean()
-                else:
-                    mean_reward = 0.0
+                mean_reward = _mean_or_interpolate_gap_reward(rewards, blk.y_start, blk.y_end)
                 result[blk.x_start:blk.x_end] = mean_reward
 
     return result
@@ -651,11 +665,7 @@ def _apply_blocks_to_rewards(
             result[blk.x_start:blk.x_end] = rewards[blk.y_start:blk.y_end]
         else:
             if blk.x_start < blk.x_end:
-                gap_rewards = rewards[blk.y_start:blk.y_end]
-                if gap_rewards.numel() > 0:
-                    mean_reward = gap_rewards.mean()
-                else:
-                    mean_reward = 0.0
+                mean_reward = _mean_or_interpolate_gap_reward(rewards, blk.y_start, blk.y_end)
                 result[blk.x_start:blk.x_end] = mean_reward
     return result
 

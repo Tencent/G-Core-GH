@@ -2,7 +2,22 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_attr_wrapped_model
 
-ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
+try:
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+        FullyShardedDataParallel as McoreFullyShardedDataParallel,
+    )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import (
+        MegatronFSDP,
+    )
+
+    ALL_MODULE_WRAPPER_CLASSNAMES = (
+        DDP,
+        Float16Module,
+        McoreFullyShardedDataParallel,
+        MegatronFSDP,
+    )
+except ImportError:
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
 
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):

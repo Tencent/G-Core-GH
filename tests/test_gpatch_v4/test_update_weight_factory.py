@@ -154,6 +154,39 @@ class UpdateWeightFactoryTest(unittest.IsolatedAsyncioTestCase):
             weights, 1024, moe_deepgemm=False, fp4_qat=True
         )
 
+    def test_dsv4_sglang_can_export_fp4_qdq_without_training_qat(self):
+        context = _make_sglang_context(
+            sglang_export_fp4_qdq=True,
+            svr_cluster_num_per_sampler=[],
+            sampler_engine_gpu_counts=None,
+        )
+        factory = get_update_weight_factory(
+            context=context, model_arch=MODEL_ARCH.DEEPSEEK_V4
+        )
+        sentinel = object()
+        weights = iter(())
+        engine = SimpleNamespace(
+            model=SimpleNamespace(config=SimpleNamespace(fp4_qat=False)),
+            export_weights=lambda: weights,
+        )
+        with patch(
+            "gpatch_v4.generation_backend.sglang_model_specific."
+            "sglang_weight_update_dsv4.iter_sglang_dsv4_weight_buckets",
+            return_value=sentinel,
+        ) as iterator:
+            self.assertIs(factory.iter_dsv4_update_buckets(engine, 1024), sentinel)
+        iterator.assert_called_once_with(
+            weights, 1024, moe_deepgemm=False, fp4_qat=True
+        )
+
+    def test_mixin_reads_export_only_fp4_qdq_config(self):
+        client = _make_mixin_client()
+        client.config.policy.sglang_export_fp4_qdq = True
+
+        factory = client._update_weight_factory()
+
+        self.assertTrue(factory.context.sglang_export_fp4_qdq)
+
     def test_mixin_caches_factory_and_syncs_dist_group(self):
         client = _make_mixin_client()
         first = client._update_weight_factory()

@@ -4,7 +4,7 @@ import inspect
 import os
 import traceback
 import uuid
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List
 
 import numpy as np
 import torch
@@ -15,15 +15,24 @@ from megatron.core import parallel_state as mcore_parallel_state
 
 from gpatch_v4.actor.mixin import RlTrainerMixin, TokenizerMixin
 from gpatch_v4.configs.dist_config import DistConfig
+from gpatch_v4.core.mappings import all_gather_from_context_parallel_region
 from gpatch_v4.core.parallel_state import (
     cpu_barrier,
+    get_model_and_context_parallel_group_gloo,
     init_pg,
     initlize_parallel_state,
     is_mp_and_cp_head,
+    is_tp_and_cp_head,
 )
 from gpatch_v4.extended_model import PrepareDataForwardFactory
 from gpatch_v4.orches.train_actor import BaseActor
 from gpatch_v4.training_backend import TrainingEngineFactory
+from gpatch_v4.transfer import init_tq_connector
+from gpatch_v4.transfer.utils import (
+    TqPayloadType,
+    async_offload_to_tq,
+    async_restore_from_tq,
+)
 from gpatch_v4.utils import (
     BroadcastUtils,
     clear_memory,
@@ -37,6 +46,7 @@ from gpatch_v4.utils import (
     split_dict_list_by_keys,
     sync_cuda_and_get_time,
 )
+from gpatch_v4.utils.training_utils import expand_rollout_batch
 
 
 class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
@@ -60,7 +70,7 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
         self.teacher_engine = TrainingEngineFactory.get_training_engine(config, **extra_args)
         self.lock = asyncio.Lock()
         self.computed = False
-        self.batching_reqs: List[Dict[str, Union[int, List[Any]]]] = []
+        self.batching_reqs: List[Dict[str, Any]] = []
         self.compute_logps_results: Dict[int, Dict[int, Dict]] = {}
         self.load_hf_config()
         self.teacher_engine.prepare_data = PrepareDataForwardFactory.get_prepare_data_fwd(
@@ -70,12 +80,24 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
             f"prepare_data={type(self.teacher_engine.prepare_data).__name__}, "
             f"teacher.model_arch={self.config.teacher.model_arch}"
         )
+        if config.tq.enable:
+            init_tq_connector(config.tq)
 
     def validated_config(self):
         teacher_config = self.config.teacher
         # auto set without_ref and without_optim
         teacher_config.without_ref = True
         teacher_config.without_optim = True
+        # Router replay belongs to the student policy whose routing decisions
+        # were captured by the sampler. A teacher can be dense or have a
+        # different layer/top-k layout, so replaying student indices is invalid.
+        if self.config.training.moe_router_replay:
+            log(
+                "DistillTeacherActor disables moe_router_replay; sampler routing "
+                "is replayed only by the student policy",
+                rank=0,
+            )
+            self.config.training.moe_router_replay = False
         assert teacher_config.without_ref is True, f"{teacher_config.without_ref=}"
         assert teacher_config.without_optim is True, f"{teacher_config.without_optim=}"
 
@@ -273,84 +295,94 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
         resp_dict = tmpd[sample_idx]
         return resp_dict
 
-    async def issue_calc_logits(self, req_dict: Dict[str, Any]):
+    async def issue_calc_hidden_states(self, req_dict: Dict[str, Any]):
         assert self.computed is False
+        request_meta, payload_batches = split_dict_list_by_keys(
+            [req_dict], ["actor_dp_rank", "sample_idx", "ppo_step"]
+        )
         async with self.lock:
-            if is_mp_and_cp_head():
-                self.batching_reqs.append(req_dict)
-            else:
-                self.batching_reqs.append({})
+            self.batching_reqs.append(
+                (request_meta[0], asyncio.create_task(async_restore_from_tq(payload_batches[0])))
+            )
         return {"ret": True}
 
-    async def get_calc_logits_result(self, req_dict: Dict[str, Any]):
-        log(
-            f"get_calc_logits_result dp {mpu.get_data_parallel_rank()} tp {mpu.get_tensor_model_parallel_rank()} pp {mpu.get_pipeline_model_parallel_rank()} {req_dict}",
-            rank=0
+    async def _compute_hidden_states(
+        self,
+        batched_data: List[tuple[Dict[str, Any], asyncio.Task]],
+    ) -> None:
+        """Restore prompts and publish one complete hidden state per sample."""
+        batched_data = sorted(
+            batched_data,
+            key=lambda item: (
+                int(item[0]["actor_dp_rank"]),
+                int(item[0]["sample_idx"]),
+                int(item[0]["ppo_step"]),
+            ),
         )
+        request_meta = [metadata for metadata, _ in batched_data]
+        payload_batches = list(
+            await asyncio.gather(*[restore_task for _, restore_task in batched_data])
+        )
+
+        publish_hidden = mpu.is_pipeline_last_stage() and is_tp_and_cp_head()
+        for metadata, payload_batch in zip(
+            request_meta,
+            payload_batches,
+            strict=True,
+        ):
+            samples = expand_rollout_batch(payload_batch)
+            _, teacher_outputs = self.teacher_engine.compute_hidden_states(samples)
+            if (mpu.is_pipeline_last_stage() and mpu.get_context_parallel_world_size() > 1):
+                teacher_outputs = [
+                    all_gather_from_context_parallel_region(hidden, gather_dim=0)
+                    for hidden in teacher_outputs
+                ]
+            if publish_hidden:
+                hidden_payload = await async_offload_to_tq(
+                    {
+                        "teacher_hidden_states":
+                            [hidden.detach().contiguous().cpu() for hidden in teacher_outputs],
+                    },
+                    int(metadata["ppo_step"]),
+                    TqPayloadType.DICT,
+                    fields=["teacher_hidden_states"],
+                )
+                actor_dp_rank = metadata["actor_dp_rank"]
+                ppo_step = metadata["ppo_step"]
+                sample_idx = metadata["sample_idx"]
+                step_results = self.compute_logps_results.setdefault(actor_dp_rank,
+                                                                     {}).setdefault(ppo_step, {})
+                step_results[sample_idx] = {
+                    "teacher_hidden_states": hidden_payload,
+                }
+            del teacher_outputs
+
+        # Last PP has TQ keys; MultiCast get() reads PP0. One gather after the batch.
+        group = get_model_and_context_parallel_group_gloo()
+        gathered = [None] * torch.distributed.get_world_size(group=group)
+        torch.distributed.all_gather_object(
+            gathered,
+            self.compute_logps_results if publish_hidden else None,
+            group=group,
+        )
+        filled = [result for result in gathered if result is not None]
+        assert len(filled) == 1
+        self.compute_logps_results = filled[0]
+
+        self.batching_reqs = []
+        clear_memory()
+
+    async def get_calc_hidden_states_result(self, req_dict: Dict[str, Any]):
         actor_dp_rank = req_dict["actor_dp_rank"]
         ppo_step = req_dict["ppo_step"]
         sample_idx = req_dict["sample_idx"]
+        # 这里可能一边算一边取会更高效
         async with self.lock:
             if not self.computed:
+                await self._compute_hidden_states(self.batching_reqs)
                 self.computed = True
-                batched_data = BroadcastUtils.broadcast_object_within_mp_and_cp(
-                    self.batching_reqs, make_recursive_clone_in_case_of_view=True
-                )
 
-                req_meta_data, real_data = split_dict_list_by_keys(
-                    batched_data, ['actor_dp_rank', 'sample_idx', 'ppo_step']
-                )
-                if not is_mp_and_cp_head():
-                    # 因为非 mp_and_cp_head 节点前面不接受数据
-                    self.batching_reqs = req_meta_data
-
-                try:
-                    _, teacher_logits = self.teacher_engine.compute_logits(real_data)
-                    # prevent seq_len across student batches between dp group
-                    assert len(real_data) == len(
-                        teacher_logits
-                    ), f"len(real_data) {len(real_data)} len(teacher_logits) {len(teacher_logits)}"
-
-                    for ri in range(len(real_data)):
-                        data = real_data[ri]
-                        # FIXME (@yeazhao) 这个 data['tokens'] 已经是 1-D tensor了，再for就错了
-                        # 不过这个函数目前基本是 deprecated 了，没怎么用
-                        max_seq_len = max([token.shape[-1] for token in data['tokens']])
-                        pad_to_multi_of = self.config.training.pad_to_mulitiple_of
-                        max_token_len = (
-                            (max_seq_len + pad_to_multi_of - 1) // pad_to_multi_of
-                        ) * pad_to_multi_of
-
-                        if teacher_logits is None or teacher_logits[ri] is None:
-                            continue
-                        for tj in range(len(teacher_logits[ri])):
-                            t_logits = teacher_logits[ri][tj]
-                            assert t_logits.ndim == 2, f"teacher_logits[i][j].ndim {t_logits.shape}"
-                            teacher_logits[ri][tj] = t_logits[:max_token_len].detach().clone()
-
-                    for _, (batch, b_teacher_logits) in enumerate(
-                        zip(self.batching_reqs, teacher_logits, strict=True)
-                    ):
-                        b_actor_dp_rank = batch["actor_dp_rank"]
-                        b_sample_idx = batch["sample_idx"]
-                        b_ppo_step = batch['ppo_step']
-
-                        tmpd = self.compute_logps_results.setdefault(b_actor_dp_rank, {})
-                        tmpdd = tmpd.setdefault(b_ppo_step, {})
-                        tmpdd[b_sample_idx] = {"teacher_logits": b_teacher_logits}
-
-                    self.batching_reqs = []
-                    clear_memory()
-                except Exception as e:
-                    log(f"compute_logits error {e}", rank=0)
-                    traceback.print_exc()
-                    import sys
-                    sys.exit()
-
-        assert actor_dp_rank in self.compute_logps_results
-        tmpd = self.compute_logps_results[actor_dp_rank][ppo_step]
-        resp_dict = tmpd[sample_idx]
-        return resp_dict
+        return self.compute_logps_results[actor_dp_rank][ppo_step][sample_idx]
 
     def test_ray_rpc_data(self, data_type, dtype, shape_meta):
         log(f"test_ray_rpc_data {data_type} {dtype}")

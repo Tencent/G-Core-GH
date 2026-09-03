@@ -19,6 +19,10 @@ class ReportConfig(MappingProtocol):
     wandb_project : str
     wandb_save_dir : str
     wandb_exp_name : str or None
+    wandb_mode : str or None
+        ``"online"`` / ``"offline"``. ``None`` infers ``offline`` when
+        ``wandb_key`` is unset, otherwise ``online``. ``wandb offline``
+        (``./wandb/settings``) wins over this field and over a present key.
     tensorboard_dir : str
     log_dir : str or None
         Defaults to ``checkpoint.save_ckpt_path/logs`` when unset.
@@ -62,6 +66,15 @@ class ReportConfig(MappingProtocol):
     wandb_run_id: Optional[str] = field(
         default=None,
         metadata={"help": "Name of the wandb run id"},
+    )
+    wandb_mode: Optional[str] = field(
+        default=None,
+        metadata={
+            "help":
+                '"online" / "offline". Unset infers offline when wandb_key is '
+                "missing, otherwise online. `wandb offline` (./wandb/settings) "
+                "wins over this field and over a present key."
+        },
     )
     tensorboard_dir: str = field(
         default="tensorboard_local",
@@ -132,6 +145,9 @@ class ReportConfig(MappingProtocol):
             "max", "minmax", "all"
         ], f"Invalid timing_log_option: {self.timing_log_option}"
         assert self.log_level.lower() in ["debug", "info"], f"Invalid log_level: {self.log_level}"
+        assert self.wandb_mode in [
+            None, "online", "offline"
+        ], f"Invalid wandb_mode: {self.wandb_mode}"
 
 
 @dataclass

@@ -52,6 +52,16 @@ class LoRAConfig(MappingProtocol):
         default=True,
         metadata={"help": "Verify LoRA weight consistency across TP/DP/CP ranks at init"}
     )
+    share_expert_adapters: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "If False (default), use per-expert GroupedExpertLinearAdapter "
+                    "(grouped_mm). If True, share one LoRA adapter across local MoE experts."
+                )
+        },
+    )
 
     def __post_init__(self):
         # DoRA 没测试过，先不使用，mbridge 也没有移过来

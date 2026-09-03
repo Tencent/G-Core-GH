@@ -59,6 +59,10 @@ class ApplySamplingRolloutAttrMultiModal(ApplySamplingRolloutAttrBase):
         return rollout_batch
 
     @override
+    def cached_rollout_attrs(self) -> Dict[str, Dict[str, Any]]:
+        return self.mm_data_cache
+
+    @override
     def remove_rollout_attr(self, rollout_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Second pass: strip cached fields again before next send (avoid OOM).
 
@@ -250,12 +254,14 @@ class SamplerGenerateFuncMultiModal(SamplerGenerateFunc):
 
             assert conversations[-1]['role'] != "assistant"
             add_generation_prompt = True
+            # Align with verl: when ignore_thinking_flag, omit enable_thinking
+            # entirely (Qwen3 False injects empty <think></think>).
             all_text = self.processor.apply_chat_template(
                 conversations,
                 tools=json_data.get("tools", None),
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
-                enable_thinking=config.training.enable_thinking,
+                **config.training.chat_template_thinking_kwargs(),
             )
 
             prompt_texts_or_id = self.processor.tokenizer([all_text])["input_ids"][0]
@@ -266,8 +272,16 @@ class SamplerGenerateFuncMultiModal(SamplerGenerateFunc):
         return prompt_texts_or_ids, raw_images, raw_audios, labels, batch
 
     @override
-    async def __call__(self, config, infer_engine, idx, tokenizer, batched_data,
-                       sampling_repeat_n) -> Dict[str, List[Any]]:
+    async def __call__(
+        self,
+        config,
+        infer_engine,
+        idx,
+        tokenizer,
+        batched_data,
+        sampling_repeat_n,
+        is_eval: bool = False
+    ) -> Dict[str, List[Any]]:
         if self.processor is None:
             model_info = config.sampler.model_info[idx]
             self.processor = AutoProcessor.from_pretrained(model_info.hf_model_path)
@@ -275,6 +289,7 @@ class SamplerGenerateFuncMultiModal(SamplerGenerateFunc):
         sampling_params = infer_engine.get_sampling_params_from_config(
             config.sampler.infer_engine_configs[idx],
             tokenizer.eos_token_id,
+            is_eval=is_eval,
         )
 
         prompt_texts_or_ids, raw_images, raw_audios, labels, prompt_data = self.get_batch(

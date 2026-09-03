@@ -133,11 +133,15 @@ def get_dataset_and_dataloader(
         seed=config.data.sampler_seed,
         drop_last=True,
     )
-    if meta_info is not None and "resume_step" in meta_info:
-        resume_step = meta_info["resume_step"]
-        rollout_gas = config.training.rollout_gbs // (dp_size * config.training.rollout_mbs)
-        consumed_batches = resume_step * rollout_gas
-        train_sampler.set_start_index(consumed_batches, config.training.rollout_mbs)
+    if meta_info is not None:
+        if "consumed_batches" in meta_info:
+            consumed_batches = meta_info["consumed_batches"]
+            train_sampler.set_start_index(consumed_batches, config.training.rollout_mbs)
+        elif "resume_step" in meta_info:
+            resume_step = meta_info["resume_step"]
+            rollout_gas = config.training.rollout_gbs // (dp_size * config.training.rollout_mbs)
+            consumed_batches = resume_step * rollout_gas
+            train_sampler.set_start_index(consumed_batches, config.training.rollout_mbs)
 
     train_dataloader = DataLoader(
         train_dataset,

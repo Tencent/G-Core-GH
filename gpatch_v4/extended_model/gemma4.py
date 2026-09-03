@@ -304,6 +304,15 @@ class Gemma4PrepareDataForward(PrepareDataForward):
         if rollout_log_probs is not None:
             batch_out["rollout_log_probs"] = rollout_log_probs.cuda(non_blocking=non_blocking)
 
+        if "sample_mask" in batches[0]:
+            sample_mask_l = [_batch["sample_mask"] for _batch in batches]
+            batch_out["sample_mask"] = torch.stack(sample_mask_l).cuda(non_blocking=non_blocking)
+
+        if "entropy_aux_figures" in batches[0]:
+            batch_out["entropy_aux_figures"] = batches[0]["entropy_aux_figures"].cuda(
+                non_blocking=non_blocking
+            )
+
         fwd_kwargs = dict(
             input_ids=tokens,
             attention_mask=attention_mask,

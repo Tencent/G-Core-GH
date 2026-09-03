@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import torch
+
 
 class EngineSwapMixin:
     def get_swap_state(self) -> SimpleNamespace:
@@ -64,3 +66,17 @@ class EngineSwapMixin:
             return
         self.swap_impl.onload_model(self.ref_model, onload_grad=False, tag="ref_")
         self.get_swap_state().ref_model = True
+
+    @torch.no_grad()
+    def offload_teacher_output_weight(self) -> None:
+        if self.teacher_output_weight is None or self.teacher_output_weight.device.type == "cpu":
+            return
+        self.teacher_output_weight = self.teacher_output_weight.to("cpu")
+
+    @torch.no_grad()
+    def onload_teacher_output_weight(self) -> None:
+        if self.teacher_output_weight is None or self.teacher_output_weight.device.type == "cuda":
+            return
+        self.teacher_output_weight = self.teacher_output_weight.to(
+            torch.cuda.current_device(), non_blocking=True
+        )

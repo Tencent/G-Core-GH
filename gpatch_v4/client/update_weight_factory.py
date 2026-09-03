@@ -93,6 +93,7 @@ class UpdateWeightContext:
     dist_weight_group_name: str | None = None
     sampler_engine_gpu_counts: list[int] | None = None
     moe_deepgemm: bool = False
+    sglang_export_fp4_qdq: bool = False
     placement_type: str = "disaggregated"
     wake_up: Any = None
     sleep: Any = None
@@ -530,13 +531,19 @@ class DeepSeekV4SglangUpdateWeightFactory(SglangUpdateWeightFactory):
         )
 
         model = model_engine.model
-        fp4_qat = getattr(model.config, "fp4_qat", False)
-        log(f"iter_dsv4_update_buckets with fp4_qat={fp4_qat}", rank=0)
+        fp4_qat = bool(getattr(model.config, "fp4_qat", False))
+        export_fp4_qdq = self.context.sglang_export_fp4_qdq or fp4_qat
+        log(
+            "iter_dsv4_update_buckets with "
+            f"fp4_qat={fp4_qat} sglang_export_fp4_qdq="
+            f"{self.context.sglang_export_fp4_qdq} export_fp4_qdq={export_fp4_qdq}",
+            rank=0,
+        )
         return iter_sglang_dsv4_weight_buckets(
             model_engine.export_weights(),
             max_bucket_bytes,
             moe_deepgemm=self._moe_deepgemm(),
-            fp4_qat=fp4_qat,
+            fp4_qat=export_fp4_qdq,
         )
 
     @staticmethod

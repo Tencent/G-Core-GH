@@ -1,9 +1,17 @@
 import collections
+import math
 from dataclasses import asdict, dataclass, field
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Union
 
 from gpatch_v4.configs.self_heal_config import GeminiSelfHealConfig
 from gpatch_v4.configs.utils import MappingProtocol
+
+
+def _hf_text_config_for_moe_router_replay(hf_config: Any) -> Any:
+    # Omni nests text under thinker_config; VL uses text_config; LLM is top-level.
+    if hasattr(hf_config, "thinker_config") and hasattr(hf_config.thinker_config, "text_config"):
+        return hf_config.thinker_config.text_config
+    return getattr(hf_config, "text_config", hf_config)
 
 
 @dataclass
@@ -33,6 +41,12 @@ class TrainingConfig(MappingProtocol):
         ``0`` → no evaluation.
     num_train_epoches : int
     apply_deterministic_mode : bool
+    disable_flash_attn_3 : bool
+        Force TE to skip FA3 (falls back to FA2). Deterministic mode +
+        ``attention_backend=flash`` sets this automatically.
+    disable_flash_attn_4 : bool
+        Force TE to skip FA4 (falls back to FA2). RTX PRO 5000 (sm_120)
+        sets this automatically; FA4 packed-THD training is unstable there.
     use_fast_tokenizer : bool
         Use the HF fast tokenizer.
     save_interval : int
@@ -79,6 +93,10 @@ class TrainingConfig(MappingProtocol):
         FSDP2 switch-style MoE load-balancing loss coefficient; ``0`` disables.
     freeze_router_weight : bool
         freeze MoE router weight (``requires_grad=False``).
+    freeze_csa_indexer : bool
+        ``True`` (default) freezes DeepSeek-V4 CSA Lightning Indexer params
+        (``requires_grad=False``) so AdamW/Muon weight decay cannot shrink
+        them when there is no indexer KL loss / top-k gradient.
     freeze_router_correction_bias : bool
         ``True`` (default) freezes ``e_score_correction_bias``;
         ``False`` enables the per-step loss-free load-balancing update.
@@ -100,6 +118,9 @@ class TrainingConfig(MappingProtocol):
     ppo_dump_per_token_entropy : bool
     dump_metrics_logprobs_topk : int
         Dump top-k logprobs ``[b, s, topk]``; ``0`` disables.
+    ppo_dump_gradient : bool
+        When dumping metrics, also dump ``∂bwd_loss/∂actor_loss`` and
+        ``∂bwd_loss/∂curr_log_probs`` (new loss path only). Default ``False``.
     im_end_metrics_enable : bool
         Compute EOS probability/top-k diagnostics during actor train forward.
     ppo_dump_moe_topk : int
@@ -137,13 +158,32 @@ class TrainingConfig(MappingProtocol):
         default=None, metadata={"help": "Total training steps."}
     )
     total_eval_step: int = field(default=0, metadata={"help": "Total eval steps."})
-    num_train_epoches: int = field(
+    num_train_epoches: Union[int, float] = field(
         default=1,
         metadata={"help": "Number of epochs for training."},
     )
     apply_deterministic_mode: bool = field(
         default=False,
         metadata={"help": "Whether to apply deterministic mode."},
+    )
+    disable_flash_attn_3: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Disable TransformerEngine FlashAttention 3 (fall back to FA2). "
+                "Set automatically when apply_deterministic_mode and "
+                "attention_backend=flash."
+            ),
+        },
+    )
+    disable_flash_attn_4: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Disable TransformerEngine FlashAttention 4 (fall back to FA2). "
+                "Set automatically on NVIDIA RTX PRO 5000."
+            ),
+        },
     )
     use_fast_tokenizer: bool = field(
         default=False,
@@ -260,6 +300,16 @@ class TrainingConfig(MappingProtocol):
         default=False,
         metadata={"help": "freeze MoE router weight (requires_grad=False)."},
     )
+    freeze_csa_indexer: bool = field(
+        default=True,
+        metadata={
+            "help":
+                "True (default) freezes DeepSeek-V4 CSA Lightning Indexer params "
+                "(requires_grad=False) so weight decay cannot shrink them when "
+                "there is no indexer KL / top-k gradient. Set False to keep them "
+                "trainable (e.g. after wiring indexer KL loss)."
+        },
+    )
     freeze_router_correction_bias: bool = field(
         default=True,
         metadata={
@@ -294,12 +344,13 @@ class TrainingConfig(MappingProtocol):
     )
 
     # dump metrics
-    # Not supported when DistConfig.dynamic_context_parallel=True;
     ppo_dump_metrics_interval: int = field(
         default=-1,
         metadata={
             "help":
-                "Dump train metrics every n ppo steps. Not supported when dynamic_context_parallel=True."
+                "Dump train metrics every n ppo steps. GRPO + dyn-CP reverse-reroutes "
+                "1D per-token fields; SFT dump, MoE top-k, and vocab top-k with dyn-CP "
+                "are unsupported."
         }
     )
     ppo_dump_metrics_dir: str = field(
@@ -311,6 +362,15 @@ class TrainingConfig(MappingProtocol):
 
     dump_metrics_logprobs_topk: int = field(
         default=0, metadata={"help": "Dump topk logits[b,s,v], choose topk ->[b,s,topk]"}
+    )
+    ppo_dump_gradient: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "When dumping metrics (ppo_dump_metrics_interval > 0), also dump "
+                "token-level ∂bwd_loss/∂actor_loss and ∂bwd_loss/∂curr_log_probs. "
+                "Only effective with ppo.use_legacy_loss=False."
+        },
     )
     im_end_metrics_enable: bool = field(
         default=False,
@@ -329,6 +389,22 @@ class TrainingConfig(MappingProtocol):
         default=False, metadata={"help": "Whether to ignore thinking, means no set it"}
     )
     moe_router_replay: bool = field(default=False, metadata={"help": "Whether to enable r3."})
+    moe_router_replay_num_layers: Optional[int] = field(
+        default=None,
+        metadata={
+            "help":
+                "Full sampler layer count used by MoE router replay. The parent "
+                "config resolves it during initialization when omitted."
+        },
+    )
+    moe_router_replay_topk: Optional[int] = field(
+        default=None,
+        metadata={
+            "help":
+                "Experts selected per token for MoE router replay. The parent config "
+                "resolves it from the HF config during initialization when omitted."
+        },
+    )
     calc_mfu_freq: Optional[int] = field(
         default=None, metadata={"help": "Calculate mfu frequency."}
     )
@@ -345,6 +421,30 @@ class TrainingConfig(MappingProtocol):
         },
     )
     enable_mtp: bool = field(default=False, metadata={"help": "Whether to build mtp model."})
+    enable_dspark: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "Load and save DeepSeek-V4 DSpark draft weights stored under mtp.*. "
+                "Training is gated by online_train_dspark."
+        },
+    )
+    online_train_dspark: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to train DSpark (prepare + loss). "
+                    "Requires enable_dspark=True."
+        },
+    )
+    dspark_num_anchors: Optional[int] = field(
+        default=None,
+        metadata={"help": "Sampled DSpark anchor blocks per sequence."},
+    )
+    dspark_ce_loss_alpha: float = field(default=0.1)
+    dspark_l1_loss_alpha: float = field(default=0.9)
+    dspark_confidence_loss_alpha: float = field(default=1.0)
+    dspark_loss_scaling_factor: float = field(default=1.0)
+    dspark_loss_decay_gamma: float = field(default=4.0)
     online_mtp_sft: bool = field(
         default=False,
         metadata={"help": "Whether to tune the mtp layers (during rl or sft)."},
@@ -371,24 +471,97 @@ class TrainingConfig(MappingProtocol):
                 "'split_n' (split d_logits along vocab dim, loop over splits, slowest)."
         },
     )
+    ce_compaction: bool = field(
+        default=False,
+        metadata={"help": "Compact masked tokens before MCore output projection and CE."},
+    )
+
+    def resolve_moe_router_replay_shape(
+        self,
+        hf_model_path: str,
+        model_override_args: Optional[dict[str, Any]] = None,
+    ) -> Optional[tuple[int, int]]:
+        """Fill the MoE router replay layout before actor creation."""
+        if not self.moe_router_replay:
+            return None
+
+        num_layers = self.moe_router_replay_num_layers
+        moe_router_topk = self.moe_router_replay_topk
+        assert (num_layers is None) == (moe_router_topk is None), (
+            "moe_router_replay_num_layers and moe_router_replay_topk must be "
+            "configured together"
+        )
+
+        if num_layers is None:
+            from transformers import AutoConfig
+
+            hf_config = AutoConfig.from_pretrained(
+                hf_model_path,
+                trust_remote_code=True,
+            )
+            hf_text_config = _hf_text_config_for_moe_router_replay(hf_config)
+            override_num_layers = (model_override_args or {}).get("num_hidden_layers", None)
+            num_layers = (
+                int(override_num_layers)
+                if override_num_layers is not None else int(hf_text_config.num_hidden_layers)
+            )
+            moe_router_topk = getattr(hf_text_config, "num_experts_per_tok", None)
+            assert moe_router_topk is not None, (
+                "moe_router_replay requires num_experts_per_tok on the policy "
+                "HF config or its text_config"
+            )
+
+        num_layers = int(num_layers)
+        moe_router_topk = int(moe_router_topk)
+        assert num_layers > 0 and moe_router_topk > 0, (
+            f"invalid MoE router replay shape: {(num_layers, moe_router_topk)}"
+        )
+        self.moe_router_replay_num_layers = num_layers
+        self.moe_router_replay_topk = moe_router_topk
+        return num_layers, moe_router_topk
+
+    @property
+    def return_hidden_states_for_ce(self) -> bool:
+        return self.use_linear_ce or self.ce_compaction
 
     def __post_init__(self):
-        assert self.training_backend in ["mcore", "fsdp2"]
+        assert self.training_backend in ["mcore", "fsdp2", "mlite"]
         assert self.attention_backend in ["flash", "fused", "unfused", "local", "auto"]
         assert self.moe_token_dispatcher_type in ['allgather', 'alltoall', 'flex']
+        assert not (self.enable_mtp and
+                    self.enable_dspark), ("enable_mtp and enable_dspark are mutually exclusive")
+        if self.enable_dspark:
+            assert self.training_backend == "fsdp2"
+        if self.online_train_dspark:
+            assert self.enable_dspark, ("online_train_dspark requires enable_dspark=True")
+            assert self.loss_func == "cross_entropy"
+            assert self.dspark_num_anchors is not None and self.dspark_num_anchors > 0
+            assert self.dspark_loss_decay_gamma > 0
+            assert min(
+                self.dspark_ce_loss_alpha,
+                self.dspark_l1_loss_alpha,
+                self.dspark_confidence_loss_alpha,
+                self.dspark_loss_scaling_factor,
+            ) >= 0
+            assert not self.use_linear_ce, (
+                "DSpark requires dense logits for Markov, L1, and confidence losses"
+            )
+            assert self.freeze_router_correction_bias, (
+                "DSpark P0 does not update router correction-bias buffers"
+            )
         assert self.linear_ce_backend in ["fuse_mn", "separate", "split_n"], (
             f"Unknown linear_ce_backend: '{self.linear_ce_backend}'. "
             f"Choose from: ['fuse_mn', 'separate', 'split_n']"
         )
-        # use_linear_ce has no [s, V] logits, so the two logits-only dumps fail fast (mirrors SFT).
-        if self.use_linear_ce:
+        if self.return_hidden_states_for_ce:
             assert self.dump_metrics_logprobs_topk == 0, (
-                "use_linear_ce is incompatible with dump_metrics_logprobs_topk: fused-CE does not "
-                "materialize logits (set dump_metrics_logprobs_topk=0 or disable use_linear_ce)"
+                "use_linear_ce/ce_compaction is incompatible with "
+                "dump_metrics_logprobs_topk: Linear CE and compact CE do not materialize "
+                "dense logits"
             )
             assert not self.im_end_metrics_enable, (
-                "use_linear_ce is incompatible with im_end_metrics_enable: no logits to compute "
-                "the EOS token-rank (disable one)"
+                "use_linear_ce/ce_compaction is incompatible with "
+                "im_end_metrics_enable: Linear CE and compact CE have no dense logits"
             )
         if self.ppo_dump_metrics_interval > 0:
             assert self.ppo_dump_metrics_dir
@@ -431,6 +604,19 @@ class TrainingConfig(MappingProtocol):
         except:
             pass
 
+    def chat_template_thinking_kwargs(self) -> dict:
+        """Build thinking-related kwargs for ``apply_chat_template``.
+
+        Returns
+        -------
+        dict
+            Empty when ``ignore_thinking_flag`` is True (omit the arg, like
+            verl); otherwise ``{"enable_thinking": <bool>}``.
+        """
+        if self.ignore_thinking_flag:
+            return {}
+        return {"enable_thinking": self.enable_thinking}
+
 
 @dataclass
 class FinetuneTrainingConfig(TrainingConfig):
@@ -459,6 +645,10 @@ class FinetuneTrainingConfig(TrainingConfig):
         Whether to periodically clear memory during forward-only passes.
     forward_clear_memory_interval : int
         Interval (in microbatches) to clear memory during forward-only passes.
+    manual_gc : bool
+        Disable automatic cyclic collection and collect at fixed training-step intervals.
+    manual_gc_interval : int
+        Number of completed training steps between manual collections.
     """
     train_step_per_epoch: Optional[int] = field(
         default=None, metadata={"help": "Number of steps per epoch."}
@@ -488,18 +678,69 @@ class FinetuneTrainingConfig(TrainingConfig):
         default=4,
         metadata={"help": "Interval (in microbatches) to clear memory during forward-only passes."}
     )
+    manual_gc: bool = field(
+        default=False,
+        metadata={"help": "Use fixed-interval Python cyclic garbage collection."},
+    )
+    manual_gc_interval: int = field(
+        default=20,
+        metadata={"help": "Training steps between manual garbage collections."},
+    )
 
     def __post_init__(self):
         super().__post_init__()
+        if self.manual_gc and self.manual_gc_interval <= 0:
+            raise ValueError("manual_gc_interval must be positive when manual_gc=True.")
+
         assert self.loss_func in [
             "cross_entropy", "ce_with_kl", "custom", "dpo", "rm_bt",
-            "square_averaging_cross_entropy"
+            "square_averaging_cross_entropy", "grad_cache_loss"
         ], f"Invalid loss function: {self.loss_func}"
         if self.loss_func == "custom":
             assert self.loss_func_py_path is not None and self.loss_func_py_name is not None, "Custom loss function must be provided"
+        if self.ce_compaction:
+            # TODO: support FSDP2 (SFT/GRPO/DSV4) via lm_head bypass gather before kernel.
+            assert self.training_backend == "mcore", (
+                "ce_compaction currently supports MCore SFT only"
+            )
+            assert not self.apply_deterministic_mode, (
+                "ce_compaction has not been validated with apply_deterministic_mode=True"
+            )
+            assert self.loss_func in ["cross_entropy", "square_averaging_cross_entropy"
+                                     ], ("ce_compaction supports cross_entropy losses only")
         assert self.cross_entropy_fusion_impl in [
             "native", "te", "linear"
         ], f"Invalid cross entropy fusion implementation: {self.cross_entropy_fusion_impl}"
+        if self.ce_compaction and not self.use_linear_ce:
+            assert (
+                not self.cross_entropy_loss_fusion or
+                self.cross_entropy_fusion_impl in ["native", "te"]
+            ), (
+                "non-Linear CE compaction requires cross_entropy_fusion_impl='native' or 'te' "
+                "when cross_entropy_loss_fusion=True"
+            )
+
+
+@dataclass
+class EmbeddingTrainingConfig(FinetuneTrainingConfig):
+    """Training configuration for embedding SFT.
+
+    Attributes
+    ----------
+    use_gbs_embedding_in_loss : bool
+        If True, gather embeddings across DP and compute the contrastive
+        loss at global batch size. If False, compute loss on local
+        micro-batch embeddings only.
+    """
+    use_gbs_embedding_in_loss: bool = field(
+        default=False, metadata={"help": "Use gbs embedding in loss"}
+    )
+    gradcache_loss_py_path: Optional[str] = field(
+        default=None, metadata={"help": "Path to calc grad cache loss."}
+    )
+    gradcache_loss_py_name: Optional[str] = field(
+        default=None, metadata={"help": "Name to calc grad cache loss."}
+    )
 
 
 @dataclass
@@ -556,6 +797,9 @@ class OffPolicyDistillTrainingConfig(FinetuneTrainingConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        assert not self.ce_compaction, (
+            "ce_compaction currently supports SFT only, not off-policy distillation"
+        )
         assert self.teacher_logits_dtype in [
             "bf16", "fp32"
         ], f"Invalid teacher logits dtype: {self.teacher_logits_dtype}"
@@ -574,6 +818,70 @@ class CustomActor(MappingProtocol):
     """
     name: str = field(metadata={"help": "register name of the actor class."})
     cls_path: str = field(metadata={"help": "cls path like xx.xxx.class_name"})
+
+
+@dataclass
+class DynamicSamplingConfig(MappingProtocol):
+    """Configuration for dynamic rollout sampling.
+
+    Each PPO step keeps sampling until ``target`` valid prompt groups are
+    collected.  A group is one prompt with ``sampling_repeat_n`` responses.
+
+    Sampling size per wave::
+
+        num_prompts = ceil(gap * ema_expansion_ratio * oversampling_ratio)
+
+    then rounded up to a multiple of ``rollout_mbs``.  ``gap`` is how many
+    valid groups are still missing.  The first wave starts from
+    ``ema_expansion_ratio = init_expansion_ratio``.  At most
+    ``max_refill_times`` extra waves are allowed after the first.
+
+    EMA expansion ratio, aggregated across DP ranks after the step::
+
+        current_ratio = min(total_groups / num_valid_groups, max_expansion_ratio)
+        # if num_valid_groups == 0: current_ratio = max_expansion_ratio
+        ema = ema_decay * ema + (1 - ema_decay) * current_ratio
+
+    Attributes
+    ----------
+    oversampling_ratio : float
+        Extra sampling on top of the EMA estimate.  Must be ``>= 1``.
+    ema_decay : float
+        EMA coefficient in ``(0, 1)``.  Closer to 1 means slower updates.
+    init_expansion_ratio : float
+        Initial ``ema_expansion_ratio``.  Must be ``>= 1``.
+    max_expansion_ratio : float
+        Cap on both ``current_ratio`` and the EMA value.
+    max_refill_times : int
+        Extra sampling waves after the first.  ``0`` means one wave only.
+        After the last wave, remaining slots are padded with invalid
+        groups (``sample_mask=False``).  Fails if even invalid groups are
+        not enough to fill the target.
+    filter_py_path, filter_fn_name : str or None
+        Optional custom group filter.  Must be set together or both omitted.
+    epoch_mode : str
+        ``"fixed_ppo_steps"`` or ``"consumed_data_epochs"``.
+        ``consumed_data_epochs`` stops the train loop after a PPO step
+        in which ``num_train_epoches`` of prompts have been consumed.
+        The finishing step may wrap into the next epoch to complete refill.
+    """
+    oversampling_ratio: float = field(default=1.2)
+    ema_decay: float = field(default=0.9)
+    init_expansion_ratio: float = field(default=1.0)
+    max_expansion_ratio: float = field(default=10.0)
+    max_refill_times: int = field(default=3)
+    filter_py_path: Optional[str] = field(default=None)
+    filter_fn_name: Optional[str] = field(default=None)
+    epoch_mode: str = field(default="fixed_ppo_steps")
+
+    def __post_init__(self):
+        assert self.oversampling_ratio >= 1.0
+        assert 0.0 < self.ema_decay < 1.0
+        assert self.init_expansion_ratio >= 1.0
+        assert self.max_expansion_ratio >= self.init_expansion_ratio
+        assert self.max_refill_times >= 0
+        assert (self.filter_py_path is None) == (self.filter_fn_name is None)
+        assert self.epoch_mode in ["fixed_ppo_steps", "consumed_data_epochs"]
 
 
 @dataclass
@@ -597,9 +905,17 @@ class RLTrainingConfig(TrainingConfig):
     eval_sampling_repeat_n : int
         Number of samples per prompt during evaluation.
     sampling_keeping_strategy : str
-        Strategy to filter kept samples: ``"all"``, ``"test"``, ``"best-and-worst"``, or others.
+        Strategy to filter kept samples on the legacy actor path:
+        ``"all"``, ``"test"``, ``"best-and-worst"``, or a custom name.
+    dynamic_batch_rollout_filter_strategy : list of str
+        Ordered sample-level filters for ``dynamic_batch_train``. Built-ins:
+        ``best-and-worst``, ``sample-mask``, ``valid_group``. Empty keeps all
+        samples; optional ``ppo_filter_samplings_*`` custom hook runs last.
     ppo_filter_samplings_path : str or None
-        Path to a file specifying which samples to filter.
+        Path to a custom filter function. Legacy actor path expects
+        ``(config, rollout_batches, sampling_repeat_n, sampling_keep_n)``.
+        With ``dynamic_batch_train``, expects
+        ``(config, samples) -> list[sample]``.
     ppo_filter_samplings_name : str or None
         Name of the filter sampling function.
     metrics_report : list of str or None
@@ -625,6 +941,27 @@ class RLTrainingConfig(TrainingConfig):
         synchronous training (no carry-over).  ``save_interval`` saves
         land on window boundaries (multiples of ``max(s, 1)``); the final
         step always gets a save.
+    rollout_over_dispatch_ratio : float
+        Tail-batching over-fire ratio.  ``1.0`` disables the feature and
+        is behaviourally identical to no tail-batching.  ``> 1.0`` fires
+        ``ceil(target_mb * ratio)`` microbatches and aborts whichever are
+        still running once ``target_mb`` worth of rollout batches have
+        been collected, trading a systematic bias against long samples
+        for a shorter rollout tail.  Mutually exclusive with
+        ``rollout_ordered_collection``.
+    rollout_reuse_unused_prompts : bool
+        Whether prompts whose generation was aborted are buffered and
+        reused later.  Requires ``rollout_over_dispatch_ratio > 1.0``
+        because only ``TailBatchingDataSource`` owns the buffer.
+    tail_batching_discard_py_path : str or None
+        Path to a ``.py`` file whose function is called once per
+        ``begin_step`` with the microbatches the previous window dropped,
+        as ``fn(samples) -> None`` where ``samples`` are the raw batched
+        prompts.  Runs before attr-cache release and independently of
+        ``rollout_reuse_unused_prompts``.  Requires
+        ``tail_batching_discard_fn_name``.
+    tail_batching_discard_fn_name : str or None
+        Function name within ``tail_batching_discard_py_path``.
     rollout_ordered_collection : bool
         When ``False`` (default), single-controller rollout collection
         consumes the ready queue in first-finished order.  When ``True``,
@@ -656,6 +993,7 @@ class RLTrainingConfig(TrainingConfig):
     ppo_step_per_epoch: Optional[int] = field(
         default=None, metadata={"help": "Number of ppo steps per epoch."}
     )
+    dynamic_sampling: DynamicSamplingConfig = field(default_factory=DynamicSamplingConfig)
     rollout_gbs: int = field(default=8, metadata={"help": "Rollout global batch size."})
     rollout_mbs: int = field(default=1, metadata={"help": "Rollout micro batch size. must be 1"})
     sampling_repeat_n: int = field(
@@ -671,11 +1009,30 @@ class RLTrainingConfig(TrainingConfig):
         default="all",
         metadata={
             "help":
-                "Strategy to keep the rollout. Built-in: [all, test, best-and-worst]. Custom names require ppo_filter_samplings_path."
+                "Legacy actor filter strategy. Built-in: "
+                "[all, test, best-and-worst]. "
+                "Custom names require ppo_filter_samplings_path. "
+                "Ignored when dynamic_batch_train=True."
         }
     )
+    dynamic_batch_rollout_filter_strategy: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help":
+                "Ordered dynamic-batch sample filters. Built-in: "
+                "[best-and-worst, sample-mask, valid_group]. "
+                "Empty list keeps all samples. Custom hook from "
+                "ppo_filter_samplings_path runs after these strategies."
+        },
+    )
     ppo_filter_samplings_path: Optional[str] = field(
-        default=None, metadata={"help": "Path to filter samplings"}
+        default=None,
+        metadata={
+            "help":
+                "Path to custom filter. Legacy: "
+                "(config, rollout_batches, sampling_repeat_n, sampling_keep_n). "
+                "dynamic_batch_train: (config, samples) -> list[sample]."
+        },
     )
     ppo_filter_samplings_name: Optional[str] = field(
         default=None, metadata={"help": "Name of the filter sampling function."}
@@ -701,6 +1058,18 @@ class RLTrainingConfig(TrainingConfig):
     use_external_reward: bool = field(
         default=False, metadata={"help": "Whether to use external reward."}
     )
+    stream_external_reward: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "Whether to fire each rollout micro-batch's external reward as soon as "
+                "that micro-batch finishes generating, instead of one batched call after "
+                "all generation completes. Honoured on the sync and agent-loop paths. "
+                "Ignored unless the reward sets supports_concurrent_calls=True (see "
+                "BaseExternalReward), and on the agent-loop path when use_gen_rm_reward "
+                "is on."
+        }
+    )
     early_swap_model: bool = field(default=False, metadata={"help": "Whether to early swap model."})
     async_rollout: bool = field(
         default=False,
@@ -719,6 +1088,36 @@ class RLTrainingConfig(TrainingConfig):
                 "Driver-side fire/collect loop with phased sampler/gen_rm wake/sleep."
         }
     )
+    dynamic_batch_train: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "Use the dynamic-batch single-controller GRPO train path. "
+                "Train-step groups are fixed before filtering."
+        },
+    )
+    custom_convert_samples_to_train_data_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help":
+                "Path to the dynamic-batch train-data conversion hook. "
+                "Hook receives a flat list[sample] with _train_step_id already set."
+        },
+    )
+    custom_convert_samples_to_train_data_name: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Function name to import from custom_convert_samples_to_train_data_path."
+        },
+    )
+    custom_compute_rollout_metrics_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the controller-side rollout metrics hook."},
+    )
+    custom_compute_rollout_metrics_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Function name to import from custom_compute_rollout_metrics_path."},
+    )
     rollout_max_staleness: int = field(
         default=0,
         metadata={
@@ -730,6 +1129,42 @@ class RLTrainingConfig(TrainingConfig):
                 "across update_weights (up to s policy-step drift). "
                 "s = 0 = fully synchronous (no carry-over)."
         }
+    )
+    rollout_over_dispatch_ratio: float = field(
+        default=1.0,
+        metadata={
+            "help":
+                "Tail-batching over-fire ratio. The single-controller "
+                "trainer fires ceil(target_mb * ratio) microbatches per "
+                "fire window but only collects target_mb worth of "
+                "rollout batches. ratio=1.0 disables tail-batching, "
+                "ratio>1.0 enables over-dispatch."
+        }
+    )
+    rollout_reuse_unused_prompts: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "When True, prompts from over-fired microbatches that "
+                "were not used for rollout are buffered and reused in "
+                "subsequent steps via TailBatchingDataSource. "
+                "When False, unused prompts are discarded."
+        }
+    )
+    tail_batching_discard_py_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help":
+                "Path to a .py file whose function is called once per "
+                "begin_step with the microbatches the previous window "
+                "dropped, as fn(samples) -> None. Runs before "
+                "attr-cache release and independently of "
+                "rollout_reuse_unused_prompts. Requires "
+                "tail_batching_discard_fn_name."
+        }
+    )
+    tail_batching_discard_fn_name: Optional[str] = field(
+        default=None, metadata={"help": "Function name within tail_batching_discard_py_path."}
     )
     num_agent_loop_workers: int = field(
         default=4,
@@ -818,6 +1253,14 @@ class RLTrainingConfig(TrainingConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.ce_compaction:
+            # TODO: support FSDP2 (SFT/GRPO/DSV4) via lm_head bypass gather before kernel.
+            assert self.training_backend == "mcore", (
+                "ce_compaction currently supports MCore GRPO only"
+            )
+            assert not self.apply_deterministic_mode, (
+                "ce_compaction has not been validated with apply_deterministic_mode=True"
+            )
         assert self.rb_multiplier is None, f"{self.rb_multiplier=} should not be set manually"
         if self.reflect_top_k is not None:
             assert self.agent_loop_actor_cls is not None, f"{self.agent_loop_actor_cls=} must be set when {self.reflect_top_k=} is set"
@@ -850,6 +1293,54 @@ class RLTrainingConfig(TrainingConfig):
                 "rollout_ordered_collection is only valid for single-controller "
                 "async or colocate rollout"
             )
+        if self.dynamic_batch_train:
+            assert self.single_controller
+            assert self.training_backend == "mcore"
+            assert self.filter_sampling_stage == "pre"
+            assert not self.ppo_filter_samplings_path or self.ppo_filter_samplings_name
+            assert (
+                not self.custom_convert_samples_to_train_data_path or
+                self.custom_convert_samples_to_train_data_name
+            )
+            assert (
+                not self.custom_compute_rollout_metrics_path or
+                self.custom_compute_rollout_metrics_name
+            )
+            _DYNAMIC_BATCH_FILTERS = {'best-and-worst', 'sample-mask', 'valid_group'}
+            unknown = [
+                name for name in self.dynamic_batch_rollout_filter_strategy
+                if name not in _DYNAMIC_BATCH_FILTERS
+            ]
+            assert not unknown, (
+                f"unknown dynamic_batch_rollout_filter_strategy entries {unknown}; "
+                f"built-ins: {sorted(_DYNAMIC_BATCH_FILTERS)}"
+            )
+        assert self.rollout_over_dispatch_ratio >= 1.0, (
+            f"rollout_over_dispatch_ratio must be >= 1.0, "
+            f"got {self.rollout_over_dispatch_ratio}"
+        )
+        tail_batching = self.rollout_over_dispatch_ratio > 1.0
+        # Ordered collection pins microbatch order; tail-batching drops whichever
+        # microbatches finish last.  The two cannot both hold.
+        assert not (tail_batching and self.rollout_ordered_collection), (
+            "rollout_over_dispatch_ratio > 1.0 is incompatible with "
+            "rollout_ordered_collection"
+        )
+        # Only TailBatchingDataSource owns the reuse buffer, and the controller
+        # builds it solely when the ratio exceeds 1.0.
+        assert not (self.rollout_reuse_unused_prompts and not tail_batching), (
+            "rollout_reuse_unused_prompts requires "
+            "rollout_over_dispatch_ratio > 1.0"
+        )
+        assert (self.tail_batching_discard_py_path
+                is None) == (self.tail_batching_discard_fn_name is None), (
+                    "tail_batching_discard_py_path and tail_batching_discard_fn_name "
+                    "must be set together"
+                )
+        assert self.tail_batching_discard_py_path is None or tail_batching, (
+            "tail_batching_discard_py_path requires "
+            "rollout_over_dispatch_ratio > 1.0"
+        )
 
 
 @dataclass
@@ -956,6 +1447,10 @@ class T2iRlTrainingConfig(RLTrainingConfig):
     )
     # TODO 如果靠谱，删掉开关保留代码；如果不靠谱，删除掉代码。
     t2i_cfg_logps_impl_v2: bool = field(default=False, metadata={'help': '激活新的 logps 的 impl'})
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        assert not self.ce_compaction, ("ce_compaction currently supports text GRPO only")
 
 
 @dataclass

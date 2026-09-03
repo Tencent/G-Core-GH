@@ -1,0 +1,66 @@
+"""PPO feature store: named scalar side-car across ``ppo_step`` intervals."""
+
+from gpatch_v4.core.ppo_feature_store.interval import PpoStepInterval, ppo_step_interval
+from gpatch_v4.core.ppo_feature_store.keys import (
+    AXIS_TOTAL_SUFFIX,
+    DEFAULT_REDUCE,
+    HISTORY_AXIS_SUFFIX,
+    LEGACY_TRAIN_EXTRA_STATE_FILENAME,
+    PENDING_SUFFIX,
+    PPO_FEATURE_STORE_FILENAME,
+    PPO_STEP_KEY,
+    REDUCE_SUFFIX,
+    STATE_VERSION,
+    TRAIN_STEP_KEY,
+    feature_axis_total_key,
+    feature_history_axis_key,
+    feature_history_key,
+    feature_pending_key,
+    feature_reduce_key,
+    iter_checkpoint_dir,
+)
+from gpatch_v4.core.ppo_feature_store.reduce import (
+    FeatureReduceFn,
+    get_feature_reduce,
+    register_feature_reduce,
+)
+from gpatch_v4.core.ppo_feature_store.state import (
+    PpoFeatureStore,
+    finalize_all_pending_features_and_sync,
+    finalize_feature_interval_and_sync,
+    get_ppo_feature_store,
+    is_ppo_feature_store_enabled,
+    reset_ppo_feature_store_for_test,
+    set_ppo_feature_store_enabled,
+)
+
+__all__ = [
+    "AXIS_TOTAL_SUFFIX",
+    "DEFAULT_REDUCE",
+    "HISTORY_AXIS_SUFFIX",
+    "LEGACY_TRAIN_EXTRA_STATE_FILENAME",
+    "PENDING_SUFFIX",
+    "PPO_FEATURE_STORE_FILENAME",
+    "PPO_STEP_KEY",
+    "PpoFeatureStore",
+    "PpoStepInterval",
+    "REDUCE_SUFFIX",
+    "STATE_VERSION",
+    "TRAIN_STEP_KEY",
+    "FeatureReduceFn",
+    "feature_axis_total_key",
+    "feature_history_axis_key",
+    "feature_history_key",
+    "feature_pending_key",
+    "feature_reduce_key",
+    "finalize_all_pending_features_and_sync",
+    "finalize_feature_interval_and_sync",
+    "get_feature_reduce",
+    "get_ppo_feature_store",
+    "is_ppo_feature_store_enabled",
+    "iter_checkpoint_dir",
+    "ppo_step_interval",
+    "register_feature_reduce",
+    "reset_ppo_feature_store_for_test",
+    "set_ppo_feature_store_enabled",
+]

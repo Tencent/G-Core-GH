@@ -22,6 +22,7 @@ from gpatch_v4.models.deepseek_v4.thd import (
     PackedSeqParams,
     _PerMLayout,
     _make_seg_layout,
+    count_cross_cp_segments,
     cp_slice_layout,
     make_packed_seq_layout,
     pack_sequences,
@@ -404,7 +405,7 @@ class TestCpSliceLayout(unittest.TestCase):
         self.assertTrue(torch.equal(m4_1.first_of_seg_window_mask_with_prefix, expected_first1))
 
     def test_seg_id_per_token_full_stays_global(self):
-        """``seg_id_per_token_full`` is **not** sliced by cp_slice_layout.
+        """Global token layout fields are not sliced by cp_slice_layout.
 
         ``seg_id_per_token_with_prefix`` carries the SWA kv-buffer view
         (``l_swa_prefix = sliding_window - 1`` on rank > 0).
@@ -419,6 +420,9 @@ class TestCpSliceLayout(unittest.TestCase):
         self.assertTrue(torch.equal(
             layout.seg_id_per_token_with_prefix, layout.seg_id_per_token,
         ))
+        self.assertTrue(torch.equal(
+            layout.pad_token_mask_full, layout.pad_token_mask,
+        ))
 
         # cp_slice_layout 后：seg_id_per_token 切到 [s_local]，但 _full 不切。
         for cp_rank in (0, 1):
@@ -430,11 +434,19 @@ class TestCpSliceLayout(unittest.TestCase):
             self.assertTrue(torch.equal(
                 sliced.seg_id_per_token_full, layout.seg_id_per_token_full,
             ))
+            self.assertEqual(sliced.pad_token_mask_full.shape[0], 512)
+            self.assertTrue(torch.equal(
+                sliced.pad_token_mask_full, layout.pad_token_mask_full,
+            ))
             # 切片后的 seg_id_per_token 应等于 _full 切对应区间。
             start = cp_rank * 256
             self.assertTrue(torch.equal(
                 sliced.seg_id_per_token,
                 layout.seg_id_per_token_full[start : start + 256],
+            ))
+            self.assertTrue(torch.equal(
+                sliced.pad_token_mask,
+                layout.pad_token_mask_full[start : start + 256],
             ))
             l_swa_prefix = 0 if cp_rank == 0 else SLIDING_WINDOW - 1
             self.assertEqual(sliced.seg_id_per_token_with_prefix.shape[0], 256 + l_swa_prefix)
@@ -841,6 +853,18 @@ class TestMakeSegMetaPrivate(unittest.TestCase):
             device=DEVICE,
         )
         self.assertTrue(torch.equal(pad, expected_pad))
+
+
+class TestCountCrossCpSegments(unittest.TestCase):
+    def test_boundary_and_span(self):
+        # T=8, cp=2, s_local=4。贴着 4 切开不算跨 CP。
+        cu_on_cut = torch.tensor([0, 4, 8])
+        self.assertEqual(count_cross_cp_segments(cu_on_cut, 2), 0)
+        cu_cross = torch.tensor([0, 3, 8])
+        self.assertEqual(count_cross_cp_segments(cu_cross, 2), 1)
+        cu_one = torch.tensor([0, 8])
+        self.assertEqual(count_cross_cp_segments(cu_one, 2), 1)
+        self.assertEqual(count_cross_cp_segments(cu_cross, 1), 0)
 
 
 if __name__ == "__main__":

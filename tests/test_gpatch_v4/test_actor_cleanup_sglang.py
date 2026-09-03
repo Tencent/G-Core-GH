@@ -147,8 +147,14 @@ class ActorCleanupSglangTest(unittest.IsolatedAsyncioTestCase):
         kill_all_actors_and_shutdown_ray()
 
     async def test_gen_rm_actor_cleanup_releases_gpu_and_kills_sglang(self):
-        # 1) Baseline: cluster-wide GPU mem low, no sglang procs anywhere.
+        # Baseline assert fails when prior tests leave GPU memory occupied.
         baseline, baseline_per_node = _cluster_max_gpu_mem()
+        assert baseline < 1 * _GB, (
+            f"baseline cluster-max GPU mem {baseline / _GB:.2f}GiB too high "
+            f"(per-node: {baseline_per_node}) — needs clean GPU cluster"
+        )
+
+        # 1) Baseline: cluster-wide GPU mem low, no sglang procs anywhere.
         assert baseline < 1 * _GB, (
             f"baseline cluster-max GPU mem {baseline / _GB:.2f}GiB too high "
             f"(per-node: {baseline_per_node}) — prior test probably leaked"

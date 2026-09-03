@@ -16,7 +16,12 @@ from torch import distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 from torch.nn import Module
 
-from .fp_quantize import quant_fp4_e2m1_scale_e8m0_packed, quant_fp8_e4m3_scale_e8m0
+from gpatch_v4.kernel.quantize.eager_quant_kernels import (
+    quant_fp4_e2m1_scale_e8m0_packed,
+    quant_fp8_e4m3_scale_e8m0,
+)
+
+from .fp8_tensor import Fp8TensorAg
 
 
 def _weight_export_debug_log(msg: str) -> None:
@@ -73,6 +78,7 @@ _FP8_DISK_KEY_PATTERNS: tuple[str, ...] = (
     r"^mtp\.\d+\.attn\.indexer\.wq_b\.weight$",
     r"^mtp\.\d+\.ffn\.shared_experts\.w[123]\.weight$",
     r"^mtp\.\d+\.(?:e_proj|h_proj)\.weight$",
+    r"^mtp\.0\.main_proj\.weight$",
 )
 _FP8_DISK_KEY_RE = re.compile("|".join(_FP8_DISK_KEY_PATTERNS))
 
@@ -288,12 +294,15 @@ def iter_disk_checkpoint_tensors(
             cls = "fp8_e4m3"
 
         if dtype_format == "quantized":
+            # Quantize the BF16 view, not the FP32 master — same rationale as
+            # quantize_fp4_qat_expert: the trainer forward fake-quants the BF16
+            # compute view, so group scales must flip in lockstep with it.
             if cls == "fp4_expert":
-                packed, scale = quant_fp4_e2m1_scale_e8m0_packed(mv)
+                packed, scale = quant_fp4_e2m1_scale_e8m0_packed(mv.bfloat16().float())
                 yield disk_key, packed
                 yield _scale_key(disk_key), scale
             elif cls == "fp8_e4m3":
-                qfp8, scale = quant_fp8_e4m3_scale_e8m0(mv)
+                qfp8, scale = quant_fp8_e4m3_scale_e8m0(mv.bfloat16().float())
                 yield disk_key, qfp8
                 yield _scale_key(disk_key), scale
             elif cls == "f32_passthrough":
@@ -330,6 +339,11 @@ def _iter_deepseek_v4_gathered_state_dict(model: Module, ) -> Iterator[tuple[str
 
         is_expert_weight = (".mlp.experts.gate_up_proj" in name or ".mlp.experts.down_proj" in name)
         if isinstance(tensor, DTensor):
+            local = tensor.to_local()
+            local_is_fp8 = isinstance(local, Fp8TensorAg)
+            if local_is_fp8:
+                # 未经测试，但似乎正确。
+                local = local._tensor
             if is_expert_weight and ep_size > 1:
                 # Keep the same expert gather semantics as checkpoint.py:
                 # gather ep_fsdp shards first, then all_gather over ep ranks
@@ -337,7 +351,7 @@ def _iter_deepseek_v4_gathered_state_dict(model: Module, ) -> Iterator[tuple[str
                 assert ep_group is not None and ep_fsdp_mesh is not None, (
                     "DSV4 EP gather requires _ep_group and _ep_fsdp_mesh"
                 )
-                local = tensor.to_local().contiguous()
+                local = local.contiguous()
                 if not local.is_cuda:
                     local = local.cuda()
                     torch.cuda.synchronize()
@@ -345,6 +359,8 @@ def _iter_deepseek_v4_gathered_state_dict(model: Module, ) -> Iterator[tuple[str
                     local,
                     device_mesh=ep_fsdp_mesh,
                     placements=[Shard(0)],
+                    shape=tensor.shape,
+                    stride=tensor.stride(),
                 )
                 ep_local_full = dt_fsdp.full_tensor()
                 # Use a single preallocated receive buffer to avoid
@@ -361,11 +377,20 @@ def _iter_deepseek_v4_gathered_state_dict(model: Module, ) -> Iterator[tuple[str
                 # instead of rebuilding from local shard, so sharding metadata
                 # (especially empty-shard layouts) stays identical to the
                 # original parameter object.
-                local = tensor.to_local().contiguous()
+                source = tensor
+                if local_is_fp8:
+                    # 未经测试，但似乎正确。
+                    source = DTensor.from_local(
+                        local,
+                        device_mesh=tensor.device_mesh,
+                        placements=tensor.placements,
+                        shape=tensor.shape,
+                        stride=tensor.stride(),
+                    )
                 if local.is_cuda:
-                    dt_cuda = tensor
+                    dt_cuda = source
                 else:
-                    dt_cuda = tensor.cuda()
+                    dt_cuda = source.cuda()
                     torch.cuda.synchronize()
                 full_tensor = dt_cuda.full_tensor()
                 if not local.is_cuda:

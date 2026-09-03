@@ -24,9 +24,9 @@ import torch
 
 
 def _load_fp_quantize():
-    """Load ``fp_quantize`` by file path to avoid ``gpatch_v4`` package side effects."""
+    """Load eager quantize kernels by file path to avoid ``gpatch_v4`` package side effects."""
     repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    path = os.path.join(repo, "gpatch_v4", "models", "deepseek_v4", "fp_quantize.py")
+    path = os.path.join(repo, "gpatch_v4", "kernel", "quantize", "eager_quant_kernels.py")
     name = "gpatch_v4_dsv4_fp_quantize_standalone"
     if name in sys.modules:
         return sys.modules[name]

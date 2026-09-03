@@ -12,7 +12,13 @@ import vllm
 from typing_extensions import override
 
 from gpatch_v4.generation_backend.infer_engine import InferEngine
-from gpatch_v4.utils import gcore_save_vllm_checkpoint, log
+from gpatch_v4.utils import GenerationAborted, gcore_save_vllm_checkpoint, log
+
+
+def raise_if_aborted(completion_output) -> None:
+    """Signal a cancelled vLLM request before treating its partial output as complete."""
+    if completion_output.finish_reason == "abort":
+        raise GenerationAborted("vLLM aborted a generation request")
 
 
 def merge_vllm_routed_experts(gen_output, completion_output):
@@ -201,6 +207,7 @@ class VllmEngine(InferEngine):
                 continue
             rep_outs = []
             for completion_output in gen_output.outputs:
+                raise_if_aborted(completion_output)
                 assert completion_output.logprobs is not None, \
                     "Missing logprobs in CompletionOutput"
                 output_logprobs = [
@@ -310,6 +317,16 @@ class VllmEngine(InferEngine):
     async def flush_cache(self):
         """Flush the KV cache of the vLLM engine."""
         await self.infer_engine.reset_prefix_cache()
+
+    @override
+    async def abort_all_requests(self):
+        """Abort every in-flight request on this vLLM engine."""
+        request_ids = list(self.infer_engine.output_processor.request_states.keys())
+        if request_ids:
+            log(f"[VllmEngine] aborting {len(request_ids)} in-flight requests", rank=0)
+            await self.infer_engine.abort(request_ids)
+        else:
+            log("[VllmEngine] abort_all_requests: no in-flight requests", rank=0)
 
     async def init_weights_update_group(
         self,

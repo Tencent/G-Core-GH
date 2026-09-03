@@ -19,6 +19,8 @@ import shutil
 from collections import defaultdict
 from copy import deepcopy
 from typing import Literal, Optional
+from packaging.version import Version
+from importlib.metadata import version as pkg_version
 
 import safetensors
 import torch
@@ -30,6 +32,7 @@ from torch.distributed.tensor import DTensor, Shard
 from gpatch_v4.utils import log_debug
 from gpatch_v4.utils.safetensor_io import save_file
 
+from .fp8_tensor import Fp8TensorAg
 from .weight_export import _classify_for_save  # re-export for tests
 from .weight_export import _model_key_to_disk_key  # re-export for tests
 from .weight_export import iter_disk_checkpoint_tensors, resolve_dsv4_export_dtypes
@@ -284,6 +287,16 @@ def _load_checkpoint_hp(
             ),
         ]
     )
+    # Adapt to transformers>=5.10.1 where ``weights_proj.weight`` is moved into ``scorer`` layer.
+    if Version(pkg_version("transformers")) >= Version("5.10.1"):
+        renamings.extend(
+            [
+                WeightRenaming(
+                    source_patterns=r"^(.*\.)?self_attn\.compressor\.indexer\.scorer\.weights_proj\.weight$",
+                    target_patterns=r"\1self_attn.compressor.indexer.weights_proj.weight",
+                ),
+            ]
+        )
 
     _t1 = _time.time()
     if rank == 0:
@@ -322,7 +335,7 @@ def _load_checkpoint_hp(
     phantom_keys: list[str] = []
     sharded_sd: dict[str, object] = {}
     num_base_layers = int(self.config.num_hidden_layers)
-    num_mtp_layers = int(self.config.num_nextn_predict_layers)
+    num_mtp_layers = len(self.mtp.layers) if self.mtp is not None else 0
 
     # Classify ckpt variant once (see _is_wo_a_bf16_on_disk). ONLY the SGLang
     # fp4->fp8 dequantized mirror (wo_a stored bf16, phantom wo_a.scale in index)
@@ -452,8 +465,9 @@ def _load_checkpoint_hp(
                 flush=True,
             )
 
-    # --- MTP routing audit (phase 2-3) -----------------------------------
-    # When ``num_mtp_layers > 0`` the model has an active MTP submodule
+    # --- mtp.* namespace routing audit (phase 2-3) ------------------------
+    # When ``num_mtp_layers > 0`` the model has an active auxiliary submodule
+    # stored under ``mtp.*`` (classic MTP or DSpark)
     # (see DeepseekV4ForCausalLM.__init__: it clears
     # ``_keys_to_ignore_on_load_unexpected`` so mtp.* keys are NOT silently
     # dropped). We must guarantee:
@@ -474,18 +488,33 @@ def _load_checkpoint_hp(
         ]
         routed_mtp_targets = [t for t in fqn_to_mapping if t.startswith("mtp.layers.")]
         assert not skipped_mtp, (
-            f"MTP enabled (num_mtp_layers={num_mtp_layers}) but {len(skipped_mtp)} "
+            f"mtp.* namespace active (num_layers={num_mtp_layers}) but {len(skipped_mtp)} "
             f"in-range mtp.* disk keys were not routed to a model FQN — remap is "
             f"broken. First few: {sorted(skipped_mtp)[:8]}"
         )
         assert routed_mtp_targets, (
-            f"MTP enabled (num_mtp_layers={num_mtp_layers}) but 0 target FQNs under "
+            f"mtp.* namespace active (num_layers={num_mtp_layers}) but 0 target FQNs under "
             f"mtp.layers.* were created from {len(disk_mtp_keys)} disk mtp.* keys — "
             f"remap is broken."
         )
+        if self.dspark_enabled:
+            last = num_mtp_layers - 1
+            required_dspark_targets = {
+                "mtp.layers.0.main_proj.weight",
+                "mtp.layers.0.main_norm.weight",
+                f"mtp.layers.{last}.norm.weight",
+                f"mtp.layers.{last}.markov_head.markov_w1.weight",
+                f"mtp.layers.{last}.markov_head.markov_w2.weight",
+                f"mtp.layers.{last}.confidence_head.proj.weight",
+            }
+            missing_dspark_targets = required_dspark_targets.difference(fqn_to_mapping)
+            assert not missing_dspark_targets, (
+                "DSpark checkpoint is missing required routed parameters: "
+                f"{sorted(missing_dspark_targets)}"
+            )
         if rank == 0:
             print(
-                f"[load_checkpoint_hp] MTP routing: {len(disk_mtp_keys)} disk mtp.* keys "
+                f"[load_checkpoint_hp] mtp.* routing: {len(disk_mtp_keys)} disk keys "
                 f"→ {len(routed_mtp_targets)} mtp.layers.* targets "
                 f"(num_mtp_layers={num_mtp_layers})",
                 flush=True,
@@ -674,7 +703,9 @@ def _load_checkpoint_hp(
             # routes through PyTorch's own chunking, so it matches FSDP2 exactly.
             target_global_shape = tuple(target.shape)
             target_global_stride = target.stride()
-            target_local_shape = tuple(target.to_local().shape)
+            target_local = target.to_local()
+            target_local_shape = tuple(target_local.shape)
+            target_local_is_fp8 = isinstance(target_local, Fp8TensorAg)
             target_placements = target.placements
             target_device_mesh = target.device_mesh
 
@@ -715,20 +746,28 @@ def _load_checkpoint_hp(
             # them from the uneven per-rank sizes.
             if local_dst.dtype != dtype:
                 local_dst = local_dst.to(dtype)
+            local_for_dtensor = Fp8TensorAg(local_dst) if target_local_is_fp8 else local_dst
             sharded = DTensor.from_local(
-                local_dst,
+                local_for_dtensor,
                 target_device_mesh,
                 target_placements,
                 shape=torch.Size(target_global_shape),
                 stride=target_global_stride,
             )
 
-            new_local_shape = tuple(sharded.to_local().shape)
+            new_local = sharded.to_local()
+            new_local_shape = tuple(new_local.shape)
             assert new_local_shape == target_local_shape, (
                 f"load layout drift on {tfqn}: local shape "
                 f"{new_local_shape} != target {target_local_shape} "
                 f"(rank={rank}, global={target_global_shape})"
             )
+            assert isinstance(new_local, Fp8TensorAg) == target_local_is_fp8, (
+                f"load wrapper drift on {tfqn}: local type {type(new_local)} "
+                f"!= target type {type(target_local)}"
+            )
+            if target_local_is_fp8:
+                assert new_local._tensor.dtype == torch.float32, (tfqn, new_local._tensor.dtype)
             assert tuple(sharded.shape) == target_global_shape, (
                 f"load layout drift on {tfqn}: global shape "
                 f"{tuple(sharded.shape)} != {target_global_shape}"
@@ -742,7 +781,7 @@ def _load_checkpoint_hp(
             )
 
             sharded_sd[tfqn] = nn.Parameter(sharded, requires_grad=target.requires_grad)
-            del local_dst, local_dst_flat, src_cpu_flat
+            del local_dst, local_dst_flat, local_for_dtensor, src_cpu_flat
 
         _tw2 = _time.time()
         _t_allreduce_total += _tw2 - _tw1
@@ -866,6 +905,31 @@ def _discover_safetensor_shards(hf_path: str, ) -> tuple[dict[str, str], list[st
         f"No safetensors checkpoint found in {hf_path}. "
         f"Expected model.safetensors.index.json or model.safetensors."
     )
+
+
+def infer_dspark_num_layers(hf_path: str) -> int:
+    """Infer DSpark stages from its contiguous ``mtp.{depth}.*`` disk namespace.
+
+    Parameters
+    ----------
+    hf_path : str
+        HF directory containing a safetensors index or a single shard.
+
+    Returns
+    -------
+    int
+        Number of depths after validating that numbering starts at zero.
+    """
+    weight_map, _ = _discover_safetensor_shards(hf_path)
+    depths = {
+        int(match.group(1))
+        for key in weight_map if (match := re.match(r"^mtp\.(\d+)\.", key)) is not None
+    }
+    assert depths, f"DSpark checkpoint has no mtp.* tensors: {hf_path}"
+    ordered = sorted(depths)
+    assert ordered == list(range(ordered[-1] + 1)
+                          ), (f"DSpark mtp depths must be contiguous from zero, got {ordered}")
+    return len(ordered)
 
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1145,7 @@ def _rank0_finalize(
     #   ``AttributeError: 'NoneType'.get('quant_method')``. Fix: save, then
     #   re-read + pop the key from the raw JSON.
     config_for_save = deepcopy(self.config)
+    config_for_save.__dict__.pop("dspark_num_layers", None)
     if dtype_format == "bf16":
         config_for_save.quantization_config = None
         config_for_save.save_pretrained(save_path)
@@ -1411,6 +1476,10 @@ def _save_checkpoint_hp(
             is_expert_weight = (".experts.gate_up_proj" in name or ".experts.down_proj" in name)
 
             if isinstance(p, DTensor):
+                local = p.to_local()
+                local_is_fp8 = isinstance(local, Fp8TensorAg)
+                if local_is_fp8:
+                    local = local._tensor
                 if is_expert_weight and self._ep_size > 1:
                     # Two-step gather to recover expert weights in MODEL ORDER.
                     #
@@ -1424,11 +1493,13 @@ def _save_checkpoint_hp(
                     # expert layout. Fix: gather ep_fsdp first (correct order within
                     # each EP slot), then ``dist.all_gather`` over ep to concatenate
                     # slots in ep_idx order → full expert tensor.
-                    local = p.to_local().contiguous()
+                    local = local.contiguous()
                     dt_fsdp = DTensor.from_local(
                         local,
                         device_mesh=self._ep_fsdp_mesh,
                         placements=[Shard(0)],
+                        shape=p.shape,
+                        stride=p.stride(),
                     )
                     ep_local_full = dt_fsdp.full_tensor()  # (num_local, ...)
 
@@ -1437,7 +1508,17 @@ def _save_checkpoint_hp(
                     t = torch.cat(ep_chunks, dim=0)  # (num_experts, ...)
                     del ep_local_full, ep_chunks
                 else:
-                    t = p.full_tensor()
+                    gather_param = p
+                    if local_is_fp8:
+                        # 这段逻辑暂时没有被测试过，因为目前只有 MoE weights 是 fp8，后续其他会加上的。
+                        gather_param = DTensor.from_local(
+                            local,
+                            device_mesh=p.device_mesh,
+                            placements=p.placements,
+                            shape=p.shape,
+                            stride=p.stride(),
+                        )
+                    t = gather_param.full_tensor()
             else:
                 t = p.detach()
 

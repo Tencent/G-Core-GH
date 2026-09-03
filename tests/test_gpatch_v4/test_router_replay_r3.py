@@ -7,7 +7,15 @@ from unittest.mock import patch
 import torch
 
 from gpatch_v4.configs.config import RlConfig
+from gpatch_v4.extended_model.welm_v4 import (
+    WelmV4PrepareDataForwardLLM,
+    _flatten_routed_experts_for_dynamic_cp,
+    _restore_packed_routed_experts,
+)
 from gpatch_v4.training_backend.fsdp2_backend.mixin import ForwardStepMixin
+from gpatch_v4.training_backend.megatron_backend.mixin import (
+    ForwardStepMixin as McoreForwardStepMixin,
+)
 from gpatch_v4.trainer import GrpoTrainer
 from gpatch_v4_test_helper import (
     kill_all_actors_and_shutdown_ray,
@@ -88,6 +96,135 @@ class PackedRouterReplayUnitTest(unittest.TestCase):
         expected_rows = torch.tensor([4, 0, 1, 2, 3, 4, 0, 1])
         self.assertEqual(len(per_layer), 1)
         self.assertTrue(torch.equal(per_layer[0], routed1[expected_rows, 0, :].long()))
+
+
+class DynamicCPRouterReplayUnitTest(unittest.TestCase):
+    def test_welm_reroute_packs_multisegment_experts_without_losing_layout(self):
+        num_layers = 2
+        topk = 2
+        routed0 = torch.arange(4 * num_layers * topk).view(4, num_layers, topk)
+        routed1 = 100 + torch.arange(6 * num_layers * topk).view(6, num_layers, topk)
+
+        flat0 = _flatten_routed_experts_for_dynamic_cp(
+            routed0, actual_len=3, padded_len=4, dp_rank=0
+        )
+        flat1 = _flatten_routed_experts_for_dynamic_cp(
+            routed1, actual_len=5, padded_len=8, dp_rank=0
+        )
+        packed = [{
+            "tokens": torch.arange(12),
+            "routed_experts": torch.cat([flat0, flat1]),
+        }]
+        _restore_packed_routed_experts(packed, num_layers=num_layers, topk=topk)
+
+        expected0 = routed0[torch.tensor([0, 1, 2, 0])]
+        expected1 = routed1[torch.tensor([0, 1, 2, 3, 4, 0, 1, 2])]
+        self.assertEqual(packed[0]["routed_experts"].shape, (12, num_layers, topk))
+        self.assertTrue(
+            torch.equal(packed[0]["routed_experts"], torch.cat([expected0, expected1]))
+        )
+
+    @patch.object(torch.Tensor, "cuda", lambda self, *args, **kwargs: self)
+    @patch("gpatch_v4.extended_model.welm_v4.get_thd_partitioned_indices")
+    @patch("gpatch_v4.extended_model.welm_v4.parallel_state")
+    def test_welm_dynamic_cp_slices_experts_with_token_thd_index(
+        self, mock_parallel_state, mock_partition
+    ):
+        class _Group:
+            def size(self):
+                return 2
+
+            def rank(self):
+                return 1
+
+        class _TPGroup:
+            def size(self):
+                return 1
+
+        cp_group = _Group()
+        mock_parallel_state.get_dynamic_data_context_parallel_groups.return_value = cp_group
+        mock_parallel_state.get_tensor_model_parallel_group.return_value = _TPGroup()
+        index = torch.tensor([4, 1, 6, 3])
+        mock_partition.return_value = index
+
+        prepare = WelmV4PrepareDataForwardLLM.__new__(WelmV4PrepareDataForwardLLM)
+        prepare._oe_grams = []
+        prepare._ngram_vocab_size = None
+        routed_experts = torch.arange(8 * 3 * 2).view(8, 3, 2)
+        batch = {
+            "tokens": torch.arange(8),
+            "labels": 10 + torch.arange(8),
+            "position_ids": torch.arange(8),
+            "advantages": torch.arange(8, dtype=torch.float32),
+            "prev_log_probs": torch.arange(8, dtype=torch.float32),
+            "loss_mask": torch.ones(8),
+            "routed_experts": routed_experts.clone(),
+            "cu_seqlens_padded": torch.tensor([0, 8], dtype=torch.int32),
+            "max_seqlen": torch.tensor(8, dtype=torch.int32),
+            "local_cp_size": torch.tensor(2, dtype=torch.int32),
+        }
+
+        prepared_batch, fwd_kwargs = prepare.grpo_train_with_dynamic_cp(
+            [batch],
+            seqlen=8,
+            pad_token_id=0,
+            ppo_pack_seq=False,
+        )
+
+        self.assertTrue(torch.equal(prepared_batch["tokens"], index.view(1, -1)))
+        self.assertEqual(prepared_batch["routed_experts"].shape, (4, 3, 2))
+        self.assertTrue(
+            torch.equal(prepared_batch["routed_experts"], routed_experts.index_select(0, index))
+        )
+        self.assertEqual(fwd_kwargs["input_ids"].shape, (1, 4))
+
+    @patch.object(torch.Tensor, "cuda", lambda self, *args, **kwargs: self)
+    @patch(
+        "gpatch_v4.training_backend.megatron_backend.mixin.get_transformer_layer_offset",
+        return_value=1,
+    )
+    @patch(
+        "gpatch_v4.training_backend.megatron_backend.mixin.get_num_layers_to_build",
+        return_value=1,
+    )
+    @patch("gpatch_v4.training_backend.megatron_backend.mixin.mpu")
+    def test_mcore_packed_thd_replay_skips_fixed_cp_and_keeps_tp_sp(
+        self, mock_mpu, _mock_num_layers, _mock_layer_offset
+    ):
+        mixin = McoreForwardStepMixin.__new__(McoreForwardStepMixin)
+        mixin.get_mcore_config = lambda: SimpleNamespace(
+            context_parallel_size=4,
+            sequence_parallel=True,
+            tensor_model_parallel_size=2,
+            moe_router_topk=2,
+        )
+        mock_mpu.get_tensor_model_parallel_rank.return_value = 1
+
+        captured = []
+        mixin.get_router_replay_manager = lambda: SimpleNamespace(
+            append_micro_batch=lambda value: captured.append(value)
+        )
+        routed_experts = torch.arange(8 * 3 * 2).view(8, 3, 2)
+        original_arange = torch.arange
+
+        def _cpu_arange(*args, **kwargs):
+            kwargs.pop("device", None)
+            return original_arange(*args, **kwargs)
+
+        with patch(
+            "gpatch_v4.training_backend.megatron_backend.mixin.torch.arange",
+            side_effect=_cpu_arange,
+        ):
+            mixin.prepare_for_router_replay(
+                [{"routed_experts": routed_experts}],
+                seqlen=8,
+                packed_thd=True,
+            )
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(len(captured[0]), 1)
+        expected = routed_experts[torch.tensor([4, 5, 6, 7]), 1, :].long()
+        self.assertTrue(torch.equal(captured[0][0], expected))
 
 
 class RouterReplayR3Test(unittest.IsolatedAsyncioTestCase):

@@ -2,7 +2,7 @@ from typing import Dict, Optional
 
 import torch
 
-from gpatch_v4.utils import masked_mean
+from gpatch_v4.utils.training_utils import masked_mean, masked_sum, masked_sum_per_seq
 
 
 def agg(
@@ -11,8 +11,15 @@ def agg(
     calculate_per_token_loss: bool = False,
     sample_mask: Optional[torch.Tensor] = None,
     token_weights: Optional[torch.Tensor] = None,
+    cu_seqlens_padded: Optional[torch.Tensor] = None,
+    local_cp_size: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Aggregate per-token values into ``(bwd_sum, bwd_count)`` for one mode.
+
+    New loss expects plain 2D ``[B, S]`` tensors. Dyn-CP / THD packs must be
+    reconstructed and response-padded before entering loss; pass
+    ``cu_seqlens_padded=None`` and ``local_cp_size=1``.
+
     In order to support fine-grained agentic sample custom weight, we support
     token-level weights. You can pre-compute the weights in rollout phase to
     customize various loss, like per-prompt / per-traj / per-sample etc.
@@ -20,6 +27,14 @@ def agg(
     ``token_weights`` (if set) only reweights the numerator; the denominator
     stays mask / sample counts.
     """
+    assert cu_seqlens_padded is None, (
+        "new loss agg expects [B, S] tensors; convert THD/dyn-CP to "
+        "response-padded sequence before loss (cu_seqlens_padded must be None)"
+    )
+    assert local_cp_size == 1, (
+        f"new loss agg expects local_cp_size=1 after response-pad, got {local_cp_size}"
+    )
+
     if token_weights is not None:
         b, s = values.shape[0], values.shape[-1]
         assert token_weights.shape == (b, 1) or token_weights.shape == (b, s), (
@@ -29,17 +44,13 @@ def agg(
         values = values * token_weights
 
     if calculate_per_token_loss:
-        bwd_sum = (values * mask).sum()
-        bwd_count = mask.sum()
-        return bwd_sum, bwd_count
+        return masked_sum(values, mask), mask.sum()
 
-    per_seq_mean = (values * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
-    if sample_mask is not None:
-        per_seq_mean = per_seq_mean * sample_mask
-        bwd_count = sample_mask.sum()
-    else:
-        bwd_count = mask.new_tensor(float(mask.shape[0]))
-    return per_seq_mean.sum(), bwd_count
+    bwd_sum = masked_sum_per_seq(values, mask, sample_mask)
+    bwd_count = (
+        sample_mask.sum() if sample_mask is not None else mask.new_tensor(float(mask.shape[0]))
+    )
+    return bwd_sum, bwd_count
 
 
 def compute_clip_metrics(

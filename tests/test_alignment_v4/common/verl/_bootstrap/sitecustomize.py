@@ -27,7 +27,7 @@ imports the way gcore does -- instead we hook them at import time from here.
      - set cuDNN deterministic / disable benchmark.
      - unload FA3 from TransformerEngine (FA3's deterministic backward is
        unreliable on Hopper) so the ``attention_backend=flash`` override falls
-       back to FA2; mirrors gcore ``_disable_flash_attn_3``. Gated on
+       back to FA2; mirrors gcore ``disable_flash_attn_3``. Gated on
        ``GCORE_VERL_DETERMINISTIC`` so it only activates for the deterministic run.
    The env vars (NCCL_DETERMINISTIC / NCCL_ALGO / FLASH_ATTENTION_DETERMINISTIC /
    NVTE_ALLOW_NONDETERMINISTIC_ALGO / CUBLAS_WORKSPACE_CONFIG) are exported by the
@@ -144,7 +144,7 @@ def _enable_torch_determinism(torch_module):
 
 
 def _disable_flash_attn_3(_te_utils_module):
-    # mirror gcore gpatch_v4/core/parallel_state.py::_disable_flash_attn_3
+    # mirror gcore gpatch_v4/core/parallel_state.py::disable_flash_attn_3
     from transformer_engine.pytorch.attention.dot_product_attention.utils import (
         FlashAttentionUtils,
     )

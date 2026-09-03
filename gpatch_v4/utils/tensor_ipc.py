@@ -164,10 +164,16 @@ def disable_expandable_segments():
     """
     alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
     need_disable = "expandable_segments:True" in alloc_conf
+    disabled_alloc_conf = alloc_conf.replace(
+        "expandable_segments:True", "expandable_segments:False"
+    )
     if need_disable:
-        torch._C._accelerator_setAllocatorSettings("expandable_segments:False")
+        try:
+            torch._C._accelerator_setAllocatorSettings(disabled_alloc_conf)
+        except (AttributeError, RuntimeError, NotImplementedError):
+            need_disable = False
     try:
         yield
     finally:
         if need_disable:
-            torch._C._accelerator_setAllocatorSettings("expandable_segments:True")
+            torch._C._accelerator_setAllocatorSettings(alloc_conf)

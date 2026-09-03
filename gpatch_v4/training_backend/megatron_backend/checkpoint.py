@@ -14,6 +14,7 @@ from contextlib import nullcontext
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
@@ -22,29 +23,34 @@ import torch.distributed
 import yaml
 from packaging.version import Version
 from safetensors.torch import load_file, save_file
+from torch.distributed.tensor import DTensor
 
 from megatron.core import dist_checkpointing, mpu, package_info, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
-)
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
 from megatron.core.dist_checkpointing.strategies.torch import (
     HAVE_NVRX,
+    TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
 )
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 
 try:
-    from mbridge.peft.canonical_lora import LoRALinearSplitFC1UpGate, LoRALinearSplitQKV
+    from mbridge.peft.canonical_lora import (
+        LoRALinearSplitFC1UpGate,
+        LoRALinearSplitGDNInProj,
+        LoRALinearSplitQKV,
+        get_gdn_in_proj_split_sizes,
+    )
+    from mbridge.peft.grouped_expert_adapter import GroupedExpertLinearAdapter
     from mbridge.peft.lora import (
         gather_lora_state_dict,
         infer_hf_target_modules,
+        interleave_gdn_qkv_lora_b,
         lora_merged,
         mcore_adapter_name_to_hf,
     )
@@ -53,9 +59,6 @@ try:
         LoRAGroupedLinear,
         LoRALinear,
         LoRATopKRouter,
-    )
-    from megatron.bridge.training.checkpointing import (
-        apply_peft_adapter_filter_to_state_dict,
     )
 
 except ImportError:
@@ -68,7 +71,17 @@ except ImportError:
     LoRALinear = None
     LoRATopKRouter = None
     LoRALinearSplitFC1UpGate = None
+    LoRALinearSplitGDNInProj = None
     LoRALinearSplitQKV = None
+    GroupedExpertLinearAdapter = None
+    get_gdn_in_proj_split_sizes = None
+    interleave_gdn_qkv_lora_b = None
+
+try:
+    from megatron.bridge.training.checkpointing import (
+        apply_peft_adapter_filter_to_state_dict,
+    )
+except ImportError:
     apply_peft_adapter_filter_to_state_dict = None
 
 from gpatch_v4.configs.checkpoint_config import CheckpointConfig
@@ -76,7 +89,10 @@ from gpatch_v4.core.parallel_state import cpu_barrier
 from gpatch_v4.training_backend.megatron_backend.mcore_peft import (
     peft_to_run_config_dict,
 )
-from gpatch_v4.training_backend.megatron_backend.megatron_utils import unwrap_model
+from gpatch_v4.training_backend.megatron_backend.megatron_utils import (
+    get_model_config,
+    unwrap_model,
+)
 from gpatch_v4.utils.common_utils import (
     assert_hf_metadata_cache_exists,
     copy_cached_hf_metadata_files,
@@ -96,6 +112,14 @@ def get_dataloader_save_path(checkpoint_config, iteration, dp_rank):
     return out_dir, state_path
 
 
+def get_dynamic_sampling_save_path(ckpt_path, iteration, dp_rank):
+    if not ckpt_path:
+        return None, None
+    out_dir = os.path.join(ckpt_path, f"dynamic_sampling/iter_{iteration:07d}")
+    state_path = os.path.join(out_dir, f"dp_rank_{dp_rank:03d}.pt")
+    return out_dir, state_path
+
+
 @contextlib.contextmanager
 def _lora_structure_unwrapped(models):
     """Context manager that temporarily swaps LoRA wrappers with their inner
@@ -110,6 +134,7 @@ def _lora_structure_unwrapped(models):
         LoRAGroupedLinear,
         LoRALinearSplitQKV,
         LoRALinearSplitFC1UpGate,
+        LoRALinearSplitGDNInProj,
         LoRATopKRouter,
     )
 
@@ -520,12 +545,19 @@ def _load_adapter_from_hf_peft(models, adapter_dir, bridge=None):
     # as during save (which uses unwrap_model before gather_lora_state_dict).
     unwrapped_models = unwrap_model(models)
 
-    # Build reverse mapping: hf_key -> (mcore_name, "linear_in"/"linear_out")
+    # Build reverse mapping: hf_key -> (adapter_module, part, parent, expert_local_idx|None)
+    # expert_local_idx is set for packed GroupedExpertLinearAdapter / legacy LoRAGroupedLinear
+    # per-expert tensors; None for a single 2D adapter weight.
     hf_to_mcore = {}
     for model_chunk in unwrapped_models:
         for name, module in model_chunk.named_modules():
             if LoRALinearSplitQKV is not None and isinstance(
-                module, (LoRALinearSplitQKV, LoRALinearSplitFC1UpGate)
+                module,
+                (
+                    LoRALinearSplitQKV,
+                    LoRALinearSplitFC1UpGate,
+                    LoRALinearSplitGDNInProj,
+                ),
             ):
                 for sub_name, sub_adapter in module.adapter.items():
                     if sub_adapter is None:
@@ -533,18 +565,17 @@ def _load_adapter_from_hf_peft(models, adapter_dir, bridge=None):
                     for part in ("linear_in", "linear_out"):
                         mcore_key = f"{name}.adapter.{sub_name}.{part}.weight"
                         hf_key = mcore_adapter_name_to_hf(mcore_key, bridge=bridge)
-                        hf_to_mcore[hf_key] = (sub_adapter, part, module)
+                        hf_to_mcore[hf_key] = (sub_adapter, part, module, None)
 
             elif LoRATopKRouter is not None and isinstance(module, LoRATopKRouter):
                 adapter = module.adapter
                 for part in ("linear_in", "linear_out"):
                     mcore_key = f"{name}.adapter.{part}.weight"
                     hf_key = mcore_adapter_name_to_hf(mcore_key, bridge=bridge)
-                    hf_to_mcore[hf_key] = (adapter, part, module)
+                    hf_to_mcore[hf_key] = (adapter, part, module, None)
 
             elif LoRAGroupedLinear is not None and isinstance(module, LoRAGroupedLinear):
                 ep_rank = mpu.get_expert_model_parallel_rank()
-                ep_size = mpu.get_expert_model_parallel_world_size()
                 num_local_experts = len(module.adapter)
                 for i in range(num_local_experts):
                     global_expert_id = ep_rank * num_local_experts + i
@@ -552,20 +583,33 @@ def _load_adapter_from_hf_peft(models, adapter_dir, bridge=None):
                     for part in ("linear_in", "linear_out"):
                         mcore_key = f"{name}.adapter.{global_expert_id}.{part}.weight"
                         hf_key = mcore_adapter_name_to_hf(mcore_key, bridge=bridge)
-                        hf_to_mcore[hf_key] = (adapter_i, part, module)
+                        hf_to_mcore[hf_key] = (adapter_i, part, module, None)
 
             elif LinearAdapter is not None and isinstance(module, LinearAdapter):
                 for part in ("linear_in", "linear_out"):
                     mcore_key = f"{name}.{part}.weight"
                     hf_key = mcore_adapter_name_to_hf(mcore_key, bridge=bridge)
-                    hf_to_mcore[hf_key] = (module, part, module)
+                    hf_to_mcore[hf_key] = (module, part, module, None)
 
             elif LoRALinear is not None and isinstance(module, LoRALinear):
                 adapter = module.adapter
-                for part in ("linear_in", "linear_out"):
-                    mcore_key = f"{name}.adapter.{part}.weight"
-                    hf_key = mcore_adapter_name_to_hf(mcore_key, bridge=bridge)
-                    hf_to_mcore[hf_key] = (adapter, part, module)
+                # Packed per-expert adapters: HF keys use global expert id (same as gather).
+                if GroupedExpertLinearAdapter is not None and isinstance(
+                    adapter, GroupedExpertLinearAdapter
+                ):
+                    ep_rank = mpu.get_expert_model_parallel_rank()
+                    num_local_experts = adapter.num_local_experts
+                    for i in range(num_local_experts):
+                        global_expert_id = ep_rank * num_local_experts + i
+                        for part in ("linear_in", "linear_out"):
+                            mcore_key = (f"{name}.adapter.{global_expert_id}.{part}.weight")
+                            hf_key = mcore_adapter_name_to_hf(mcore_key, bridge=bridge)
+                            hf_to_mcore[hf_key] = (adapter, part, module, i)
+                else:
+                    for part in ("linear_in", "linear_out"):
+                        mcore_key = f"{name}.adapter.{part}.weight"
+                        hf_key = mcore_adapter_name_to_hf(mcore_key, bridge=bridge)
+                        hf_to_mcore[hf_key] = (adapter, part, module, None)
 
     loaded_count = 0
     for hf_key, full_weight in adapter_state.items():
@@ -573,21 +617,47 @@ def _load_adapter_from_hf_peft(models, adapter_dir, bridge=None):
             log(f"Warning: adapter key {hf_key!r} not matched to any model module", rank=0)
             continue
 
-        adapter_module, part, parent_lora_module = hf_to_mcore[hf_key]
-        target_linear = getattr(adapter_module, part)
-        device = target_linear.weight.device
+        adapter_module, part, parent_lora_module, expert_local_idx = hf_to_mcore[hf_key]
+        weight_container = getattr(adapter_module, part)
+        device = weight_container.weight.device
 
         # For standard LoRA linear_out on strided layers (SwiGLU), re-interleave
-        if part == "linear_out" and LoRALinear is not None and isinstance(
-            parent_lora_module, LoRALinear
+        if (
+            expert_local_idx is None and part == "linear_out" and LoRALinear is not None and
+            isinstance(parent_lora_module, LoRALinear)
         ):
             stride = getattr(parent_lora_module.to_wrap, 'stride', 1)
             tp_size = mpu.get_tensor_model_parallel_world_size()
             if stride > 1 and tp_size > 1:
                 full_weight = _interleave_lora_b_for_scatter(full_weight, stride, tp_size)
 
-        local_weight = _scatter_weight_to_local_shard(full_weight, target_linear, device)
-        target_linear.weight.data.copy_(local_weight)
+        if (
+            expert_local_idx is None and part == "linear_out" and
+            LoRALinearSplitGDNInProj is not None and
+            isinstance(parent_lora_module, LoRALinearSplitGDNInProj) and
+            adapter_module is parent_lora_module.adapter.adapter_qkv
+        ):
+            config = parent_lora_module.to_wrap.config
+            qkv_size, _, _, _ = get_gdn_in_proj_split_sizes(config)
+            qk_size = config.linear_num_key_heads * config.linear_key_head_dim
+            value_size = (config.linear_num_value_heads * config.linear_value_head_dim)
+            component_sizes = (qk_size, qk_size, value_size)
+            assert qkv_size == sum(component_sizes)
+            full_weight = interleave_gdn_qkv_lora_b(
+                full_weight,
+                component_sizes,
+                mpu.get_tensor_model_parallel_world_size(),
+            )
+
+        if expert_local_idx is not None:
+            # GroupedExpertLinearAdapter: copy into weight[local_expert] slice.
+            param = weight_container.weight
+            slice_holder = SimpleNamespace(weight=param[expert_local_idx])
+            local_weight = _scatter_weight_to_local_shard(full_weight, slice_holder, device)
+            param.data[expert_local_idx].copy_(local_weight)
+        else:
+            local_weight = _scatter_weight_to_local_shard(full_weight, weight_container, device)
+            weight_container.weight.data.copy_(local_weight)
         loaded_count += 1
 
     log(f"Loaded {loaded_count} adapter weight tensors from {adapter_dir}", rank=0)
@@ -680,7 +750,11 @@ def get_latest_checkpoint_folder(path):
     return latest_ckpt_step
 
 
-def get_rng_state(use_dist_ckpt: bool = True, data_parallel_random_init: bool = False):
+def get_rng_state(
+    use_dist_ckpt: bool = True,
+    data_parallel_random_init: bool = False,
+    use_megatron_fsdp: bool = False,
+):
     """collect rng state across data parallel ranks"""
     rng_state = {
         "random_rng_state": random.getstate(),
@@ -702,6 +776,11 @@ def get_rng_state(use_dist_ckpt: bool = True, data_parallel_random_init: bool = 
     else:
         rng_state_list = [rng_state]
 
+    if use_megatron_fsdp:
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        return {f"({pp_rank}, {tp_rank})": rng_state_list}
+
     if use_dist_ckpt:
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         pp_size = mpu.get_pipeline_model_parallel_world_size()
@@ -718,7 +797,25 @@ def get_rng_state(use_dist_ckpt: bool = True, data_parallel_random_init: bool = 
     return rng_state_list
 
 
-def load_rng_states(rng_states, data_parallel_random_init=False, use_dist_ckpt=True):
+def load_rng_states(
+    rng_states,
+    data_parallel_random_init=False,
+    use_dist_ckpt=True,
+    use_megatron_fsdp: bool = False,
+):
+    if use_megatron_fsdp:
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        key = f"({pp_rank}, {tp_rank})"
+        if key in rng_states:
+            rng_states = rng_states[key]
+        else:
+            log(
+                f"RNG state for PP/TP key {key} not found; falling back to the first saved RNG state.",
+                rank=0,
+            )
+            rng_states = next(iter(rng_states.values()))
+
     # access rng_state for data parallel rank
     if data_parallel_random_init:
         rng_states = rng_states[mpu.get_data_parallel_rank()]
@@ -851,7 +948,7 @@ def save_dist_checkpointing(sharded_state_dict, ckpt_path, async_save=False):
 
 def load_dist_checkpointing(sharded_state_dict, ckpt_dir):
     # Get checkpointing strategies
-    load_strategy = get_default_load_sharded_strategy(ckpt_dir)
+    load_strategy = TorchDistLoadShardedStrategy()
     load_strategy = FullyParallelLoadStrategyWrapper(
         load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
     )
@@ -874,7 +971,8 @@ def load_dist_checkpointing(sharded_state_dict, ckpt_dir):
 
 
 def _build_sharded_state_dict_metadata(
-    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    use_megatron_fsdp: bool = False,
 ) -> dict:
     """Builds metadata used for sharded_state_dict versioning.
 
@@ -892,7 +990,10 @@ def _build_sharded_state_dict_metadata(
     if Version(package_info.__version__) <= Version("0.13.1"):
         return metadata
 
-    metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
+    if use_megatron_fsdp:
+        metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
+    else:
+        metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
 
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
@@ -910,25 +1011,36 @@ def generate_state_dict(
     generate_optimizer: bool = True,
     generate_model: bool = True,
     is_loading: bool = False,
+    use_megatron_fsdp: bool = False,
 ):
     torch.cuda.synchronize()
     state_dict = {}
 
-    sharded_sd_metadata = dict(metadata=_build_sharded_state_dict_metadata())
+    sharded_sd_metadata = dict(
+        metadata=_build_sharded_state_dict_metadata(use_megatron_fsdp=use_megatron_fsdp)
+    )
 
     # Should always generate model state dict
     # All ranks Save Model to reduce memory pressure
     # Get sharded state dict, notice that state_dict will collect among dp groups, causing memory pressure
-    if generate_model:
+    # NOTE: optimizer needs model sharded state as sharding metadata even when generate_model=False
+    need_model_sharded_state = generate_model or generate_optimizer
+    model_keys_to_remove = []
+
+    if need_model_sharded_state:
         for vpp_rank, model in enumerate(models):
             if len(models) > 1:
                 mpu.set_virtual_pipeline_model_parallel_rank(vpp_rank)
                 key = f"model{vpp_rank}" if len(models) > 1 else "model"
             else:
                 key = "model"
-            if hasattr(model, "module"):
-                model = model.module
-            state_dict[key] = model.sharded_state_dict(**sharded_sd_metadata)
+            if use_megatron_fsdp:
+                state_dict[key] = model.state_dict_for_save_checkpoint()
+            else:
+                unwrapped = model.module if hasattr(model, "module") else model
+                state_dict[key] = unwrapped.sharded_state_dict(**sharded_sd_metadata)
+            if not generate_model:
+                model_keys_to_remove.append(key)
 
     # Optimizer State Dict
     if generate_optimizer:
@@ -936,6 +1048,9 @@ def generate_state_dict(
         optimizer_sharded_states = optimizer.sharded_state_dict(
             state_dict, is_loading=is_loading, **sharded_sd_metadata
         )
+        # Remove model keys that were only needed as optimizer metadata
+        for key in model_keys_to_remove:
+            state_dict.pop(key, None)
         state_dict["optimizer"] = optimizer_sharded_states
 
         if lr_scheduler is not None:
@@ -944,7 +1059,7 @@ def generate_state_dict(
 
         # RNG States State Dict
         torch.distributed.barrier()
-        rng_state = get_rng_state()
+        rng_state = get_rng_state(use_megatron_fsdp=use_megatron_fsdp)
         state_dict["rng_state"] = rng_state
 
     return state_dict
@@ -953,6 +1068,287 @@ def generate_state_dict(
 def get_dist_checkpoint_path(checkpoint_path, global_step):
     dist_checkpoint_path = os.path.join(checkpoint_path, 'iter_{:07d}'.format(global_step))
     return dist_checkpoint_path
+
+
+def _assert_megatron_fsdp_checkpoint_supported(config, models, *, is_save: bool):
+    checkpoint_config = config.checkpoint
+    assert not config.training.build_from_mbridge, (
+        "Megatron-FSDP checkpointing requires training.build_from_mbridge=False."
+    )
+    assert len(
+        models
+    ) == 1, "Megatron-FSDP checkpointing with virtual pipeline chunks is not verified yet."
+    assert not checkpoint_config.async_save, "Megatron-FSDP DTensor checkpoints do not support async_save yet."
+    assert not checkpoint_config.skip_save_mcore_model, (
+        "Megatron-FSDP DTensor checkpoints require saving/loading the mcore model state."
+    )
+    assert not checkpoint_config.convert_mcore_to_hf_online, (
+        "Online HF export for Megatron-FSDP checkpoints is not verified yet."
+    )
+    if is_save:
+        assert not checkpoint_config.no_save_optim, (
+            "Megatron-FSDP optimizer-only or model-only checkpoint layouts are not verified yet."
+        )
+    else:
+        assert not checkpoint_config.no_load_optim, (
+            "Loading Megatron-FSDP checkpoints without optimizer state is not verified yet."
+        )
+
+
+def _make_megatron_bridge_fsdp_checkpoint_config(config, *, is_save: bool):
+    checkpoint_config = config.checkpoint
+    return SimpleNamespace(
+        save=checkpoint_config.save_ckpt_path,
+        load=checkpoint_config.load_ckpt_path,
+        save_optim=not checkpoint_config.no_save_optim,
+        save_rng=True,
+        load_optim=not checkpoint_config.no_load_optim,
+        load_rng=True,
+        ckpt_format="fsdp_dtensor",
+        async_save=False,
+        strict_fsdp_dtensor_load=False,
+        fully_parallel_save=True,
+        fully_parallel_load=False,
+        finetune=False,
+        use_checkpoint_args=False,
+        ckpt_step=None,
+    )
+
+
+def resolve_megatron_fsdp_dist_param(model, key: str) -> torch.nn.Parameter:
+    candidates = [key, f"module.{key}"]
+    if key.startswith("module."):
+        candidates.append(key[len("module."):])
+    seen = set()
+    ordered = []
+    for name in candidates:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+
+    for name in ordered:
+        try:
+            return model.get_parameter(name)
+        except AttributeError:
+            continue
+
+    name_map = dict(model.named_parameters())
+    for name in ordered:
+        if name in name_map:
+            return name_map[name]
+    raise KeyError(
+        f"Cannot resolve Megatron-FSDP parameter for optimizer state key {key!r}; "
+        f"tried {ordered}"
+    )
+
+
+def megatron_fsdp_param_local_tensor(dist_param: torch.nn.Parameter) -> torch.Tensor:
+    try:
+        from torch.distributed._tensor import DTensor
+    except ImportError:
+        from torch.distributed.tensor import DTensor
+
+    if isinstance(dist_param, DTensor):
+        return dist_param.to_local()
+    data = dist_param.data
+    if isinstance(data, DTensor):
+        return data.to_local()
+    if hasattr(dist_param, "_local_tensor"):
+        return dist_param._local_tensor
+    raise TypeError(
+        "Megatron-FSDP parameter is missing a local tensor view "
+        f"(type={type(dist_param)!r})"
+    )
+
+
+def plain_tensor_to_fsdp_local_shard(
+    tensor: torch.Tensor, dist_param: torch.nn.Parameter
+) -> torch.Tensor:
+    """Slice a plain Adam moment into this rank's FSDP-local shard.
+
+    TE FusedAdam may allocate moments with global numel for ``nn.Parameter(DTensor)``.
+    tip LM SwiGLU/GDN preprocess expects DTensor or plain FSDP-local shards.
+    """
+    if not hasattr(dist_param, "megatron_fsdp_slice"):
+        raise AttributeError(
+            "Megatron-FSDP parameter is missing megatron_fsdp_slice; "
+            "cannot normalize plain optimizer tensor."
+        )
+    fsdp_slice = dist_param.megatron_fsdp_slice
+    local_expected = fsdp_slice.stop - fsdp_slice.start
+    flat = tensor.detach().view(-1)
+    if flat.numel() == dist_param.numel():
+        local = flat[fsdp_slice].contiguous()
+    elif flat.numel() == local_expected:
+        local = flat.contiguous()
+    else:
+        raise ValueError(
+            "Plain optimizer tensor numel does not match FSDP global or local shard: "
+            f"got {flat.numel()}, global={dist_param.numel()}, "
+            f"local_expected={local_expected}, fsdp_slice={fsdp_slice}"
+        )
+    local_ref = megatron_fsdp_param_local_tensor(dist_param)
+    if local.numel() != local_ref.numel():
+        raise ValueError(
+            "FSDP-local optimizer shard numel mismatch after slice: "
+            f"got {local.numel()}, param_local={local_ref.numel()}, "
+            f"fsdp_slice={fsdp_slice}"
+        )
+    return local.reshape(local_ref.shape)
+
+
+def normalize_megatron_fsdp_optimizer_state_tensors(model, optimizer_state_dict: dict) -> dict:
+    """Rewrite plain full/local Adam tensors into Megatron-FSDP DTensors for DCP save."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+        make_fsdp_dtensor,
+    )
+
+    if "state" not in optimizer_state_dict:
+        raise KeyError(
+            "Megatron-FSDP optimizer state dict missing 'state' "
+            f"(keys={list(optimizer_state_dict.keys())})"
+        )
+
+    # Weight-sized optimizer tensors only; skip scalars like step.
+    weight_state_keys = frozenset({"exp_avg", "exp_avg_sq", "master_param", "param", "fp32_param"})
+
+    opt_state = optimizer_state_dict["state"]
+    for key, param_state in opt_state.items():
+        if not isinstance(param_state, dict):
+            continue
+        dist_param = resolve_megatron_fsdp_dist_param(model, key)
+        if not hasattr(dist_param, "megatron_fsdp_dist_index"):
+            raise AttributeError(
+                f"Parameter for optimizer key {key!r} is missing megatron_fsdp_dist_index"
+            )
+        is_expert_param = "mlp.experts" in key
+        for subkey, value in list(param_state.items()):
+            if subkey not in weight_state_keys:
+                continue
+            if not isinstance(value, torch.Tensor) or isinstance(value, DTensor):
+                continue
+            local = plain_tensor_to_fsdp_local_shard(value, dist_param)
+            param_state[subkey] = make_fsdp_dtensor(
+                local_tensor=local,
+                param=dist_param,
+                dist_index=dist_param.megatron_fsdp_dist_index,
+                is_sharded_param=True,
+                is_expert_param=is_expert_param,
+                run_check=True,
+                update_uneven_dtensor_chunk_meta=True,
+            )
+    return optimizer_state_dict
+
+
+def save_megatron_fsdp_checkpoint(config, models, optimizer, lr_scheduler, dist_checkpoint_path):
+    import torch.distributed.checkpoint as torch_dist_checkpoint
+    from torch.distributed.checkpoint import FileSystemWriter
+
+    from megatron.bridge.training.checkpointing import (
+        preprocess_fsdp_dtensor_state_dict,
+    )
+
+    state_dict = generate_state_dict(
+        models,
+        optimizer,
+        lr_scheduler,
+        generate_optimizer=True,
+        generate_model=True,
+        use_megatron_fsdp=True,
+    )
+    checkpoint_model = getattr(models[0], "module", models[0])
+    if "optimizer" in state_dict:
+        state_dict["optimizer"] = normalize_megatron_fsdp_optimizer_state_tensors(
+            checkpoint_model, state_dict["optimizer"]
+        )
+    state_dict = preprocess_fsdp_dtensor_state_dict(
+        get_model_config(checkpoint_model),
+        state_dict,
+        checkpoint_model,
+    )
+    storage_writer = FileSystemWriter(dist_checkpoint_path)
+    torch_dist_checkpoint.save(state_dict=state_dict, storage_writer=storage_writer)
+    torch.distributed.barrier()
+    return None
+
+
+def load_megatron_fsdp_checkpoint(
+    config,
+    models,
+    optimizer,
+    lr_scheduler,
+    global_step: int,
+    bridge=None,
+):
+    from megatron.bridge.training.checkpointing import load_fsdp_dtensor_checkpoint
+
+    checkpoint_config = config.checkpoint
+    sharded_state_dict = generate_state_dict(
+        models,
+        optimizer,
+        lr_scheduler,
+        generate_optimizer=True,
+        generate_model=True,
+        is_loading=True,
+        use_megatron_fsdp=True,
+    )
+    checkpoint_model = getattr(models[0], "module", models[0])
+    sharded_state_dict["_model"] = [checkpoint_model]
+
+    bridge_ckpt_config = _make_megatron_bridge_fsdp_checkpoint_config(config, is_save=False)
+    load_sig = inspect.signature(load_fsdp_dtensor_checkpoint)
+    required_params = {
+        "load_dir",
+        "ckpt_cfg",
+        "rank0",
+        "sharded_state_dict",
+        "iteration",
+        "release",
+        "cfg",
+    }
+    assert required_params.issubset(
+        load_sig.parameters
+    ), ("Megatron-Bridge load_fsdp_dtensor_checkpoint signature is unsupported: "
+        f"{load_sig}")
+    state_dict, _, _, _ = load_fsdp_dtensor_checkpoint(
+        load_dir=checkpoint_config.load_ckpt_path,
+        ckpt_cfg=bridge_ckpt_config,
+        rank0=False,
+        sharded_state_dict=sharded_state_dict,
+        iteration=global_step,
+        release=False,
+        cfg=get_model_config(checkpoint_model),
+    )
+
+    assert "model" in state_dict, (
+        f"Model state dict not found in {state_dict.keys()}. Please check the checkpoint file "
+        f"{checkpoint_config.load_ckpt_path}."
+    )
+    models[0].load_state_dict(state_dict["model"], strict=True)
+    log(f"Loaded Megatron-FSDP model checkpoint from {checkpoint_config.load_ckpt_path}", rank=0)
+
+    assert "optimizer" in state_dict, (
+        f"Optimizer state dict not found in {state_dict.keys()}. Please check the checkpoint file "
+        f"{checkpoint_config.load_ckpt_path}."
+    )
+    optimizer.load_state_dict(state_dict["optimizer"])
+    log(
+        f"Loaded Megatron-FSDP optimizer checkpoint from {checkpoint_config.load_ckpt_path}",
+        rank=0
+    )
+
+    if "lr_scheduler" in state_dict and lr_scheduler is not None:
+        lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
+        log(
+            f"Loaded Megatron-FSDP LR scheduler checkpoint from {checkpoint_config.load_ckpt_path}",
+            rank=0
+        )
+
+    assert "rng_state" in state_dict, (
+        f"RNG state dict not found in {state_dict.keys()}. Please check the checkpoint file "
+        f"{checkpoint_config.load_ckpt_path}."
+    )
+    load_rng_states(state_dict["rng_state"], use_megatron_fsdp=True)
 
 
 def save_checkpoint(
@@ -964,6 +1360,7 @@ def save_checkpoint(
     bridge=None,
     override_tokenizer_special_token: dict = None,
     peft=None,
+    use_megatron_fsdp: bool = False,
 ):
     tracker_filename = "latest_checkpointed_iteration.txt"
     checkpoint_config = config.checkpoint
@@ -973,6 +1370,9 @@ def save_checkpoint(
     log(f"saving checkpoint to {dist_checkpoint_path}", rank=0)
     if not isinstance(models, list):
         models = [models]
+
+    if use_megatron_fsdp:
+        _assert_megatron_fsdp_checkpoint_supported(config, models, is_save=True)
 
     if checkpoint_config.convert_mcore_to_hf_online and checkpoint_config.save_ckpt_path is not None:
         assert bridge is not None
@@ -987,7 +1387,15 @@ def save_checkpoint(
 
     # Note that model weights, optimizer states, and extra states are generated
     # together in a state dict, we save them in one time
-    if checkpoint_config.use_dist_checkpointing:
+    if use_megatron_fsdp:
+        async_save_request = save_megatron_fsdp_checkpoint(
+            config,
+            models,
+            optimizer,
+            lr_scheduler,
+            dist_checkpoint_path,
+        )
+    elif checkpoint_config.use_dist_checkpointing:
         # Generate state dict for saving
         state_dict = generate_state_dict(
             models,
@@ -1077,6 +1485,9 @@ def save_checkpoint(
         dataloader_save_path, _ = get_dataloader_save_path(
             checkpoint_config, iteration_to_delete, 0
         )
+        ds_save_path, _ = get_dynamic_sampling_save_path(
+            checkpoint_config.save_ckpt_path, iteration_to_delete, 0
+        )
         try:
             shutil.rmtree(checkpoint_name)
             log(
@@ -1119,6 +1530,17 @@ def save_checkpoint(
             except Exception as e:
                 log(
                     f'encountered exception "{e}" when trying to delete dataloader state from iteration {iteration_to_delete:7d} at {checkpoint_config.save_ckpt_path}'
+                )
+                pass
+        if ds_save_path is not None and os.path.exists(ds_save_path):
+            try:
+                shutil.rmtree(ds_save_path)
+                log(
+                    f"successfully deleted dynamic sampling state from iteration {iteration_to_delete:7d} at {checkpoint_config.save_ckpt_path}"
+                )
+            except Exception as e:
+                log(
+                    f'encountered exception "{e}" when trying to delete dynamic sampling state from iteration {iteration_to_delete:7d} at {checkpoint_config.save_ckpt_path}'
                 )
                 pass
 
@@ -1206,6 +1628,7 @@ def load_checkpoint(
     global_step: int = 0,
     bridge=None,
     peft=None,
+    use_megatron_fsdp: bool = False,
 ):
     checkpoint_config = config.checkpoint
     assert global_step is not None, \
@@ -1218,6 +1641,20 @@ def load_checkpoint(
 
     if not isinstance(models, list):
         models = [models]
+
+    if use_megatron_fsdp:
+        _assert_megatron_fsdp_checkpoint_supported(config, models, is_save=False)
+        load_megatron_fsdp_checkpoint(
+            config,
+            models,
+            optimizer,
+            lr_scheduler,
+            global_step,
+            bridge=bridge,
+        )
+        cpu_barrier()
+        log(f"successfully loaded Megatron-FSDP checkpoint from {dist_checkpoint_path}", rank=0)
+        return global_step
 
     # 当 skip_save_mcore_model 为 True 时，模型权重需要从 HF 格式通过 bridge 加载
     load_model_from_hf = checkpoint_config.skip_save_mcore_model

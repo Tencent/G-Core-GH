@@ -1,0 +1,60 @@
+# @package _global_
+
+defaults:
+  - rl_grpo_dapo17k_config
+  - _self_
+
+training:
+  use_bt_rm_reward: False
+  use_external_reward: True
+  rollout_gbs: 32
+  rollout_mbs: 1
+  sampling_repeat_n: 8
+  sampling_keep_n: 8
+  train_gbs: 32
+  train_mbs: 1
+  seq_length: 4096
+  num_train_epoches: 1
+  save_interval: 1000
+  eval_interval: 4
+  eval_rollout_gbs: 16
+  eval_rollout_mbs: 1
+  eval_sampling_repeat_n: 1
+  metrics_report:
+    - "external_reward"
+    - "acc_reward"
+    - "fmt_reward"
+
+checkpoint:
+  load_ckpt_path: null
+  save_ckpt_path: "tests/async_eval_smoke_ckpt"
+  no_save_optim: True
+  convert_mcore_to_hf_online: False
+
+data:
+  data_pathes:
+    - "hf-hub/zhuzilin/dapo-math-17k/"
+  eval_data_pathes:
+    - "hf-hub/HuggingFaceH4/aime_2024/data/train-00000-of-00001.parquet"
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+sampler:
+  infer_engine_configs:
+    - dist_config:
+        tensor_model_parallel_size: 2
+        pipeline_model_parallel_size: 1
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.7
+      max_running_requests: 128
+      temperature: 1.0
+      top_p: 1.0
+      generate_max_tokens: 3072
+
+external_reward:
+  async_eval: True
+  eval_delay_s: -1
+  reward_info:
+    - reward_py_path: tasks/math_rl_v4/math_external_reward.py
+      reward_cls_name: MathRuleExternalReward
+      reward_weight: 1.0

@@ -72,14 +72,14 @@ policy:
 sampler:
   backend: sglang
   dist_config:
-    nnodes: 2
+    nnodes: -1
   model_info:
     - model_arch: "qwen3"
       hf_model_path: "hf-hub/Qwen/Qwen3-30B-A3B-Thinking-2507"
 
   infer_engine_configs:
     - dist_config:
-        nnodes: 2
+        nnodes: -1
         tensor_model_parallel_size: 4
       use_fast_tokenizer: True
       gpu_memory_utilization: 0.7
@@ -99,7 +99,7 @@ bt_rm:
   infer_engine_configs:
     - dist_config:
         tensor_model_parallel_size: 1
-        nnodes: 2
+        nnodes: -1
 
 ppo:
   grpo_advantage_epsilon: 1.0e-4

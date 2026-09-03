@@ -79,6 +79,19 @@ class BaseEngine(ABC):
         ...
 
     @abstractmethod
+    def pretrain_step(self, batch: List[Dict[str, Any]], num_microbatches: int, step: int):
+        """Execute one fine-tuning step.
+
+        Parameters
+        ----------
+        batch : list of dict
+        num_microbatches : int
+            Gradient-accumulation micro-batches.
+        step : int
+        """
+        ...
+
+    @abstractmethod
     def set_model_eval(self):
         """Set the model to evaluation mode."""
         ...

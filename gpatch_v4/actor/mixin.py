@@ -1,9 +1,12 @@
+import gzip
 import os
+import shutil
 import time
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.distributed import ReduceOp
@@ -25,7 +28,9 @@ from gpatch_v4.core.advantage_helper import (
     get_post_advantage_fn,
 )
 from gpatch_v4.core.advantage_impl import mask_single_valid_sample_groups
+from gpatch_v4.core.constants import MODEL_ARCH
 from gpatch_v4.core.parallel_state import cpu_barrier, is_mp_and_cp_head
+from gpatch_v4.core.ppo_feature_store.keys import feature_history_key
 from gpatch_v4.orches import get_actor
 from gpatch_v4.utils import (
     BroadcastUtils,
@@ -311,6 +316,21 @@ class MetricsMixin:
                 rb.pop(rm_key)
 
         return rollout_batches
+
+    def report_extra_metrics(
+        self,
+        output_metrics: Dict[str, Any],
+        final_values: Dict[str, Optional[float]],
+    ) -> None:
+        if not self.config.ppo.feature_store_enable:
+            return
+        for name, final_value in final_values.items():
+            if final_value is not None:
+                output_metrics[f"extra/{name}"] = final_value
+            hist = self.feature_store.get(feature_history_key(name), [])
+            output_metrics[f"extra/{name}_history_len"] = float(
+                len(hist) if isinstance(hist, list) else 0
+            )
 
 
 class CheckpointConverterMixin:
@@ -772,8 +792,8 @@ class RlTrainerMixin:
                 # 迭代的 rollout_batch 数量一致（否则 all_reduce 会卡住）。
                 if self.config.ppo.whiten_advantages and mask is not None:
                     assert self.config.ppo.advantage_type in [
-                        "identity", "reinforce", "ppo"
-                    ], "whiten_advantages only support identity and reinforce"
+                        "identity", "reinforce", "ppo", "grpo"
+                    ], "whiten_advantages only support identity, reinforce and ppo"
                     advantages, whiten_metrics = whiten_advantages_cross_dp(advantages, mask)
                     for k, v in whiten_metrics.items():
                         ppo_rollout_metrics[k] += v
@@ -1224,13 +1244,25 @@ class ProfileMixin:
         if self.profile_config.enable_profile:
             self.prof = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=True,
-                with_stack=True,
-                use_cuda=True
+                record_shapes=bool(self.profile_config.record_shapes),
+                with_stack=bool(self.profile_config.with_stack),
+                profile_memory=bool(self.profile_config.profile_memory),
+                with_modules=bool(self.profile_config.with_modules),
             )
+            logging_rank0(f"profile config: {self.profile_config}")
+
         else:
             self.prof = None
         self.init_profile_flag = True
+
+    def _should_export_trace(self) -> bool:
+        export_ranks = list(self.profile_config.export_ranks)
+        if len(export_ranks) == 0:
+            return True
+        return torch.distributed.get_rank() in export_ranks
+
+    def _nsys_enabled(self) -> bool:
+        return self.profile_config.use_nsys
 
     def profile_start(self, train_step):
         """Start profiling if ``train_step`` matches the configured start step.
@@ -1242,6 +1274,8 @@ class ProfileMixin:
         assert getattr(self, "init_profile_flag", False), "profile not initialized"
         if self.profile_config.enable_profile and train_step == self.profile_config.profile_start_step:
             self.prof.start()
+        if self._nsys_enabled() and train_step == self.profile_config.profile_start_step:
+            torch.cuda.profiler.start()
 
     def profile_end(self, train_step, save_name="timeline"):
         """Stop profiling and export a Chrome trace if ``train_step`` matches.
@@ -1252,14 +1286,37 @@ class ProfileMixin:
         save_name : str, optional
         """
         assert getattr(self, "init_profile_flag", False), "profile not initialized"
-        if self.profile_config.enable_profile and train_step == self.profile_config.profile_end_step:
-            self.prof.stop()
-            proflie_resut = self.profile_config.profile_save_dir
-            os.makedirs(proflie_resut, exist_ok=True)
-            self.prof.export_chrome_trace(
-                f"{proflie_resut}/{save_name}_rank_{torch.distributed.get_rank()}_step_{train_step}.json"
-            )
-            self._log_profile_summary(train_step)
+        if self._nsys_enabled() and train_step == self.profile_config.profile_end_step:
+            torch.cuda.profiler.stop()
+        if not (
+            self.profile_config.enable_profile and
+            train_step == self.profile_config.profile_end_step
+        ):
+            return
+
+        self.prof.stop()
+        self._log_profile_summary(train_step)
+
+        if not self._should_export_trace():
+            return
+
+        profile_dir = self.profile_config.profile_save_dir
+        os.makedirs(profile_dir, exist_ok=True)
+        rank = torch.distributed.get_rank()
+        json_path = (f"{profile_dir}/{save_name}_rank_{rank}_step_{train_step}.json")
+        self.prof.export_chrome_trace(json_path)
+        out_path = json_path
+        if self.profile_config.gzip_trace:
+            gz_path = json_path + ".gz"
+            with open(json_path, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            os.remove(json_path)
+            out_path = gz_path
+        try:
+            size_mb = os.path.getsize(out_path) / (1024 * 1024)
+        except OSError:
+            size_mb = -1.0
+        log(f"[profile] exported {out_path} ({size_mb:.1f} MiB)")
 
     def _log_profile_summary(self, train_step):
         """Print a kernel-level CUDA-time summary and a comm-vs-compute split.
@@ -1430,7 +1487,9 @@ class FlopsCounterMixin:
         avg_mfu = None
 
         if self.flops_counter and (train_step + 1) % self.calc_mfu_freq == 0:
+            uses_global_seqlen_sums = (seqlen_sum is not None and seqlen_sq_sum is not None)
             images_seqlens = []
+            audio_seqlens = []
             for rbs in expanded_rbs:
                 if self.image_grid_thw_name in rbs and rbs[self.image_grid_thw_name] is not None:
                     image_grid_thw = rbs[self.image_grid_thw_name]
@@ -1439,12 +1498,29 @@ class FlopsCounterMixin:
                             image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0]
                         )
                         images_seqlens.extend(image_seqlen.tolist())
+                # for welm_omni_v4_5
+                if "audio_feature_lengths" in rbs and rbs["audio_feature_lengths"] is not None:
+                    audio_seqlens.extend(rbs["audio_feature_lengths"].tolist())
+            if (
+                uses_global_seqlen_sums and
+                self.config.policy.model_arch == MODEL_ARCH.WELM_OMNI_V4_5
+            ):
+                # Dyn-CP seqlen sums are global-batch aggregates, while
+                # ``expanded_rbs`` only holds this DP rank's share. Gather the
+                # audio lengths over DP so the audio-tower FLOPs are global
+                # too. In the rank-local fallback below, the DP all-reduce of
+                # estimated_flops already scales them up.
+                gathered = [None] * mpu.get_data_parallel_world_size()
+                dist.all_gather_object(gathered, audio_seqlens, group=mpu.get_data_parallel_group())
+                audio_seqlens = [length for rank_lens in gathered for length in rank_lens]
             kwargs = {}
             if len(images_seqlens) > 0:
                 kwargs["images_seqlens"] = images_seqlens
+            if len(audio_seqlens) > 0:
+                kwargs["audio_seqlens"] = audio_seqlens
             delta_time = torch.tensor(delta_time, device=torch.cuda.current_device())
             dist.all_reduce(delta_time, op=dist.ReduceOp.MAX)
-            if seqlen_sum is not None and seqlen_sq_sum is not None:
+            if uses_global_seqlen_sums:
                 estimated_flops, promised_flops = self.flops_counter.estimate_flops_from_sums(
                     seqlen_sum, seqlen_sq_sum, delta_time.item(), **kwargs
                 )
@@ -1454,9 +1530,13 @@ class FlopsCounterMixin:
                     batch_seqlens, delta_time.item(), **kwargs
                 )
             estimated_flops = torch.tensor(estimated_flops, device=torch.cuda.current_device())
-            dist.all_reduce(
-                estimated_flops, op=dist.ReduceOp.SUM, group=mpu.get_data_parallel_group()
-            )
+            if not uses_global_seqlen_sums:
+                # The fallback estimates rank-local batches, so sum them over
+                # DP. Dynamic-CP sums are already global-batch aggregates and
+                # must not be multiplied by the DP size again.
+                dist.all_reduce(
+                    estimated_flops, op=dist.ReduceOp.SUM, group=mpu.get_data_parallel_group()
+                )
             mfu = estimated_flops.item() / promised_flops / torch.distributed.get_world_size() * 100
             self.mfu_sum += mfu
             self.mfu_count += 1

@@ -1,0 +1,37 @@
+# @package _global_
+# Tail-batching GRPO on gsm8k, disaggregated, 2 nodes.
+#
+# GPU layout (16 GPU = 2 physical nodes, num_gpus_per_node=8):
+#   policy:  1 node = 8 GPU
+#   sampler: 1 node = 8 GPU (tp=2)
+#   gen_rm / bt_rm: 0 GPU (rule-only external reward)
+
+defaults:
+  - rl_config_async
+  - _self_
+
+training:
+  rollout_over_dispatch_ratio: 1.5
+  rollout_reuse_unused_prompts: True
+
+checkpoint:
+  load_ckpt_path: save_qwen_2_5_1_5b_grpo_tail_batching_async
+  save_ckpt_path: save_qwen_2_5_1_5b_grpo_tail_batching_async
+
+policy:
+  hf_model_path: "hf-hub/Qwen/Qwen2.5-1.5B"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen2.5-1.5B"
+  ref_hf_model_path: "hf-hub/Qwen/Qwen2.5-1.5B"
+
+sampler:
+  model_info:
+    - model_arch: "qwen2"
+      hf_model_path: "hf-hub/Qwen/Qwen2.5-1.5B"
+
+gen_rm:
+  reward_model_info:
+    - model_arch: "qwen2"
+      hf_model_path: "hf-hub/Qwen/Qwen2.5-1.5B"
+      reward_py_path: tasks/math_rl_v4/gen_rm_reward.py
+      gen_reward_fn_name: generate_rewards
+      reward_weight: 1.0

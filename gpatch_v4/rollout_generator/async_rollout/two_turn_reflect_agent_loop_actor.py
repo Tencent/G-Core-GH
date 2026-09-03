@@ -11,7 +11,7 @@ from gpatch_v4.configs.config import RlConfig
 from gpatch_v4.rollout_generator.async_rollout.agent_loop_actor import (
     BaseAgentLoopActor,
 )
-from gpatch_v4.utils import import_fn_from_path, log
+from gpatch_v4.utils import GenerationAborted, import_fn_from_path, log
 
 _DEFAULT_REFLECT_PROMPT = "请重新审视你的回答，仔细检查一下你的推理过程和最终答案。"
 
@@ -308,6 +308,15 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
             sample_indices,
             use_colocate,
         )
+
+        # Turn 2 issues brand-new sampler requests, which a hard abort can no
+        # longer reach, so the cooperative flag is the only way to stop a
+        # microbatch that survived into the gap between the two turns.
+        if self._pause_event.is_set():
+            raise GenerationAborted(
+                f"[TwoTurnReflect-{self.worker_id}] paused before turn 2, "
+                f"dropping {len(cleaned_batches)} microbatch(es) at {ppo_step=}"
+            )
 
         # ---- Selection + build reflect prompts (CPU) ----
         reward_key = "rewards"

@@ -29,7 +29,22 @@ from typing_extensions import override
 
 from gpatch_v4.generation_backend.infer_engine import InferEngine
 from gpatch_v4.generation_backend.routed_experts_utils import extract_routed_experts
-from gpatch_v4.utils import log
+from gpatch_v4.utils import GenerationAborted, log
+
+
+def raise_if_aborted(meta_info: dict) -> None:
+    """Signal a cancelled request before its missing logprobs trip an assert."""
+    finish_reason = meta_info.get("finish_reason")
+    if isinstance(finish_reason, dict):
+        aborted = finish_reason.get("type") == "abort"
+    elif isinstance(finish_reason, str):
+        # Native generate uses ``{"type": "abort"}``; OpenAI-style / some
+        # sglang versions emit the bare string.
+        aborted = finish_reason == "abort"
+    else:
+        aborted = False
+    if aborted:
+        raise GenerationAborted(f"sglang aborted a generation request: {finish_reason}")
 
 
 def cuda_graph_max_bs_args(value):
@@ -43,6 +58,13 @@ def cuda_graph_max_bs_args(value):
     if "cuda_graph_max_bs_decode" in fields:
         return {"cuda_graph_max_bs_decode": value, "cuda_graph_max_bs_prefill": value}
     return {"cuda_graph_max_bs": value}
+
+
+def filter_server_args_kwargs(kwargs: Dict) -> Dict:
+    """Drop keys that the installed ``sgl.ServerArgs`` does not accept."""
+    import dataclasses
+    fields = {f.name for f in dataclasses.fields(sgl.ServerArgs)}
+    return {k: v for k, v in kwargs.items() if k in fields}
 
 
 def save_sharded_model_kwargs(path, pattern=None, max_size=None):
@@ -60,14 +82,13 @@ def save_sharded_model_kwargs(path, pattern=None, max_size=None):
         from sglang.srt.managers.scheduler_update_weights_mixin import (
             SchedulerUpdateWeightsMixin,
         )
-        params = inspect.signature(
-            SchedulerUpdateWeightsMixin.save_sharded_model
-        ).parameters
+        params = inspect.signature(SchedulerUpdateWeightsMixin.save_sharded_model).parameters
         if "params" in params and "path" not in params:
             return {"params": save_args}
     except Exception:
         pass
     return save_args
+
 
 # sglang engine 这里有一些 TODO：
 # 1. 输入从 prompt_ids 换成 text
@@ -92,7 +113,7 @@ class SglangEngine(InferEngine):
     def __init__(self, infer_engine, model_path, infer_engine_role, placement_type):
         super().__init__(infer_engine, model_path, infer_engine_role, placement_type)
         self.sglang_version = sgl.__version__
-        # tokenizer_manager.get_load() is not safe to call concurrently; all
+        # tokenizer_manager.get_loads() is not safe to call concurrently; all
         # callers must go through this lock.
         self.get_load_lock = asyncio.Lock()
 
@@ -242,6 +263,7 @@ class SglangEngine(InferEngine):
                 rep_outs = []
                 for rep_out in async_out:
                     meta = rep_out['meta_info']
+                    raise_if_aborted(meta)
                     assert 'output_token_logprobs' in meta, \
                         f"Missing key: output_token_logprobs, meta_info keys = {meta.keys()}"
                     rep_outs.append(
@@ -256,6 +278,7 @@ class SglangEngine(InferEngine):
                     )
             else:
                 meta = async_out['meta_info']
+                raise_if_aborted(meta)
                 assert 'output_token_logprobs' in meta, \
                     f"Missing key: output_token_logprobs, meta_info keys = {meta.keys()}"
                 rep_outs = [
@@ -278,14 +301,29 @@ class SglangEngine(InferEngine):
         await self.infer_engine.tokenizer_manager.flush_cache()
 
     @override
+    async def abort_all_requests(self):
+        """Abort every in-flight request on this sglang engine."""
+        log("[SglangEngine] abort_all_requests called", rank=0)
+        ret = self.infer_engine.tokenizer_manager.abort_request(abort_all=True)
+        if asyncio.iscoroutine(ret):
+            ret = await ret
+        return ret
+
+    @override
     async def get_load(self) -> Dict[str, int]:
+        tm = self.infer_engine.tokenizer_manager
+        # sglang 0.5.14 renamed TokenizerManager.get_load -> get_loads and
+        # switched the payload to LoadSnapshot (num_running/waiting/used_tokens).
         async with self.get_load_lock:
-            loads = await self.infer_engine.tokenizer_manager.get_load()
+            if hasattr(tm, "get_loads"):
+                loads = await tm.get_loads()
+            else:
+                loads = await tm.get_load()
         if not loads:
-            # sglang's IPC communicator can return None when the scheduler is
-            # saturated; treat as "busy" so the caller routes elsewhere.
+            # sglang's IPC communicator can return None / [] when the scheduler
+            # is saturated; treat as "busy" so the caller routes elsewhere.
             log(
-                "[WARN] tokenizer_manager.get_load() returned None, "
+                "[WARN] tokenizer_manager.get_loads() returned empty, "
                 "reporting max load so caller avoids this cluster"
             )
             return {
@@ -295,16 +333,22 @@ class SglangEngine(InferEngine):
                 "num_waiting_reqs": 999,
             }
         ld = loads[0]
+        if hasattr(ld, "num_running_reqs"):
+            num_running_reqs = ld.num_running_reqs
+            num_waiting_reqs = ld.num_waiting_reqs
+            num_reqs = num_running_reqs + num_waiting_reqs
+            num_tokens = ld.num_used_tokens
+        else:
+            # Pre-0.5.14 GetLoad schema.
+            num_reqs = ld.num_reqs
+            num_waiting_reqs = ld.num_waiting_reqs
+            num_running_reqs = num_reqs - num_waiting_reqs
+            num_tokens = ld.num_tokens
         return {
-            "num_reqs": ld.num_reqs,
-            # ``num_tokens`` (total tokens in flight) may not be present in
-            # all sglang versions.  Fall back to the same large sentinel used
-            # in the ``not loads`` branch above so callers see a consistently
-            # "busy" signal and avoid this cluster rather than making routing
-            # decisions based on a semantically wrong value.
-            "num_tokens": getattr(ld, "num_tokens", 999999),
-            "num_running_reqs": ld.num_reqs - ld.num_waiting_reqs,
-            "num_waiting_reqs": ld.num_waiting_reqs,
+            "num_reqs": num_reqs,
+            "num_tokens": num_tokens,
+            "num_running_reqs": num_running_reqs,
+            "num_waiting_reqs": num_waiting_reqs,
         }
 
     @override

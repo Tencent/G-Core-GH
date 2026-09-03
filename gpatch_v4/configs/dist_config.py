@@ -135,7 +135,12 @@ class DistConfig(MappingProtocol):
     )
     virtual_pipeline_model_parallel_size: Optional[int] = field(
         default=None,
-        metadata={"help": "Virtual pipeline model parallel size."},
+        metadata={
+            "help":
+                "Virtual pipeline model parallel size (interleaved schedule). "
+                "When > 1, incompatible with training.use_dynamic_mbs and "
+                "policy.smart_pad_train."
+        },
     )
     pipeline_model_parallel_split_rank: Optional[int] = field(
         default=None,
@@ -184,4 +189,31 @@ class DistConfig(MappingProtocol):
         assert self.dynamic_cp_scheduler_type in _valid_dcp_types, (
             f"dynamic_cp_scheduler_type must be one of {_valid_dcp_types}, "
             f"got '{self.dynamic_cp_scheduler_type}'"
+        )
+
+    def assert_vpp_compatible(
+        self,
+        *,
+        use_dynamic_mbs: bool = False,
+        smart_pad_train: bool = False,
+    ) -> None:
+        """Reject interleaved VPP when features that fragment / vary ``M`` are on.
+
+        Interleaved VPP needs each ``fwd_bwd`` call to satisfy ``M >= PP`` and
+        ``M % microbatch_group_size == 0`` (default group size = PP). Both
+        ``use_dynamic_mbs`` (packs short seqs → fewer microbatches) and
+        ``smart_pad_train`` (per-seqlen buckets → small ``M`` per call) break
+        that assumption.
+        """
+        if self.virtual_pipeline_model_parallel_size in (None, 1):
+            return
+        assert not use_dynamic_mbs, (
+            "virtual_pipeline_model_parallel_size > 1 is incompatible with "
+            "training.use_dynamic_mbs (dynamic mbs varies M; interleaved VPP "
+            "needs stable M>=PP / M%PP==0)"
+        )
+        assert not smart_pad_train, (
+            "virtual_pipeline_model_parallel_size > 1 is incompatible with "
+            "policy.smart_pad_train (per-seqlen buckets yield small M per "
+            "fwd_bwd; interleaved VPP needs stable M>=PP / M%PP==0)"
         )

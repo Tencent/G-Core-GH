@@ -10,6 +10,8 @@ import torch
 
 from gpatch_v4.core.device import get_visible_devices_env_var
 
+_DEFAULT_PROPAGATED_ENV_VALUES = {}
+
 # Refer to
 # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/nvidia_gpu.py#L95-L96
 # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/amd_gpu.py#L102-L103
@@ -34,8 +36,8 @@ _PROPAGATE_ENV_KEYS = [
     "LIBRARY_PATH",
     "CUDA_DEVICE_MAX_CONNECTIONS",
     "PYTORCH_CUDA_ALLOC_CONF",
+    "PYTHONDONTWRITEBYTECODE",
     "SGLANG_EMPTY_CACHE_INTERVAL",
-    "SGLANG_RETURN_ORIGINAL_LOGPROB",
     "GPATCH_EXTRA_PROPAGATE_ENV",
     # deterministic mode
     "NCCL_DETERMINISTIC",
@@ -43,9 +45,14 @@ _PROPAGATE_ENV_KEYS = [
     "FLASH_ATTENTION_DETERMINISTIC",
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
     "CUBLAS_WORKSPACE_CONFIG",
-    "GPATCH_DISABLE_FA3",
     "GPATCH_DYN_CP_CHECK_A2A",
+    "GPATCH_DYN_CP_COMPARE_REROUTE",
 ]
+
+
+def get_propagated_env_value(key: str) -> str | None:
+    """Get a propagated environment value, including gcore defaults."""
+    return os.environ.get(key, _DEFAULT_PROPAGATED_ENV_VALUES.get(key))
 
 
 def build_actor_env_vars(extra_env_vars=None):
@@ -62,7 +69,7 @@ def build_actor_env_vars(extra_env_vars=None):
     if extra_propagate:
         extra_keys = [name.strip() for name in extra_propagate.split(",") if name.strip()]
     for key in (*_PROPAGATE_ENV_KEYS, *extra_keys):
-        val = os.environ.get(key)
+        val = get_propagated_env_value(key)
         if val is not None:
             env_vars[key] = val
     env_vars.update({name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST})

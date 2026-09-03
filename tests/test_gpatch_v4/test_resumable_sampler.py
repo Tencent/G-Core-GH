@@ -623,3 +623,30 @@ class ResumableSamplerTest(unittest.TestCase):
             print(f"    [验证4] consumed({len(orig_consumed_set)}) ∪ "
                   f"remaining({len(new_remaining_set)}) = "
                   f"{len(actual_total)} 样本, 无重叠 ✓")
+
+
+class TestAlignSamplerNumSamples(unittest.TestCase):
+    """align_sampler_num_samples 截断后必须能安全 __iter__（复现 itao resume 挂）。"""
+
+    def test_align_drop_last_false_then_iter(self):
+        from gpatch_v4.utils.training_utils import align_sampler_num_samples
+
+        # 对齐 03 日志量级：N=100310, dp=2, step_per_epoch=3134, gas=16, mbs=1
+        dataset = DummyDataset(size=100310)
+        sampler = ResumableDistributedSampler(
+            dataset,
+            rank=0,
+            num_replicas=2,
+            shuffle=False,
+            drop_last=False,
+        )
+        assert sampler.num_samples == 50155
+        assert sampler.total_size == 100310
+
+        align_sampler_num_samples(sampler, train_step_per_epoch=3134, mbs=1, gas=16)
+        assert sampler.num_samples == 50144
+        assert sampler.total_size == 100288
+        assert sampler.drop_last is True
+
+        indices = list(sampler)
+        assert len(indices) == sampler.num_samples

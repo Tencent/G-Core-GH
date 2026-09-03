@@ -1,0 +1,148 @@
+# @package _global_
+# 1-GPU colocated smoke：验证 train/eval 采样走不同 generate_params。
+#
+# 期望：
+#   train  → temperature=1.0 (legacy flat → generate_params)
+#   eval   → temperature=0.0 (eval_generate_params)
+#
+# 跑法（远端 GPU，路径按集群改）：
+#   cd /work/wepsdl/gcore-dev
+#   # 先 init ray，再：
+#   python -m gpatch_v4.entry.train_lm_grpo \
+#     --config-path=tests/test_gpatch_v4/configs/test_yaml \
+#     --config-name=test_eval_generate_params_smoke
+#
+# 验法：在 get_sampling_params_from_config 临时打 rank0 log
+#   f"[sampling] is_eval={is_eval} temperature={generate_params.temperature}"
+# 然后 grep training log：train 行 1.0，eval 行 0.0；external reward ppo_step 非 0..N-1 下标。
+
+training:
+  training_backend: mcore
+  early_swap_model: False
+  use_gen_rm_reward: False
+  use_bt_rm_reward: True
+  use_external_reward: False
+  use_fast_tokenizer: True
+  rollout_gbs: 1
+  rollout_mbs: 1
+  sampling_repeat_n: 1
+  sampling_keep_n: 1
+  eval_sampling_repeat_n: 1
+  train_gbs: 1
+  train_mbs: 1
+  exit_step: 1
+  save_interval: 9999
+  eval_interval: 1
+  eval_before_train: True
+  eval_rollout_gbs: 1
+  eval_rollout_mbs: 1
+  data_parallel_random_init: False
+  build_from_mbridge: True
+  num_train_epoches: 1
+  ppo_max_epochs_2: 1
+  metrics_report:
+    - "acc_reward"
+    - "fmt_reward"
+
+checkpoint:
+  load_ckpt_path: test_eval_generate_params_smoke_ckpt
+  save_ckpt_path: test_eval_generate_params_smoke_ckpt
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+
+optimizer:
+  lr: 5.0e-7
+  lr_warmup_steps: 0
+  lr_decay_steps: 1
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  # smoke：train/eval 可用同一小数据；eval 必须配 eval_data_pathes（math simple_dataset）
+  data_pathes:
+    - "/mnt/ceph-hz1-csp/mm-base-plt2/nrwu/hf-hub/openai/gsm8k-jsonl/train/"
+  eval_data_pathes:
+    - "/mnt/ceph-hz1-csp/mm-base-plt2/nrwu/hf-hub/openai/gsm8k-jsonl/train/"
+  py_path: "tasks/math_rl_v4/simple_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+policy:
+  dist_config:
+    nnodes: 1
+    num_gpus_per_node: 1
+    tensor_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+  model_arch: "qwen2"
+  without_ref: True
+  hf_model_path: "/mnt/ceph-hz1-csp/mm-base-plt2/nrwu/hf-hub/Qwen/Qwen2.5-Math-1.5B"
+  hf_tokenizer_path: "/mnt/ceph-hz1-csp/mm-base-plt2/nrwu/hf-hub/Qwen/Qwen2.5-Math-1.5B"
+  sampler_client:
+    rpc_type: ray
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+
+sampler:
+  backend: sglang
+  dist_config:
+    nnodes: 1
+    num_gpus_per_node: 1
+  model_info:
+    - model_arch: "qwen2"
+      hf_model_path: "/mnt/ceph-hz1-csp/mm-base-plt2/nrwu/hf-hub/Qwen/Qwen2.5-Math-1.5B"
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 1
+        num_gpus_per_node: 1
+        tensor_model_parallel_size: 1
+      use_fast_tokenizer: True
+      load_format: "dummy"
+      gpu_memory_utilization: 0.5
+      max_running_requests: 1
+      # 旧扁平字段：启动时刷进 generate_params
+      temperature: 1.0
+      top_p: 0.9
+      top_k: 0
+      # eval 独立采样
+      eval_generate_params:
+        temperature: 0.0
+        top_k: 1
+        top_p: 0.9
+        min_p: 0.0
+      generate_max_tokens: 8
+      disable_cuda_graph: True
+
+bt_rm:
+  reward_type: "rule_only"
+  reward_model_info:
+    - model_arch: "qwen2"
+      hf_model_path: "/mnt/ceph-hz1-csp/mm-base-plt2/nrwu/hf-hub/Qwen/Qwen2.5-Math-1.5B"
+      reward_py_path: tasks/math_rl_v4/bt_reward.py
+      parse_reward_fn_name: math_rl_rule_reward
+      reward_weight: 1.0
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 1
+        num_gpus_per_node: 1
+        tensor_model_parallel_size: 1
+
+gen_rm:
+  dist_config:
+    nnodes: 0
+
+ppo:
+  grpo_advantage_epsilon: 1.0e-4
+  ppo_ratio_eps: 0.2
+
+debug:
+  save_first_rollout_data: False
+  debug_engine_update_weight: False
+  trainer_return_ppo_step_metrics: True

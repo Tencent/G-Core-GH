@@ -4,12 +4,10 @@
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import os
-import shutil
 import socket
-import subprocess
-import time
 import unittest
 from pathlib import Path
 
@@ -25,9 +23,9 @@ from test_gpatch_v4.gpatch_v4_test_helper import kill_all_actors_and_shutdown_ra
 from gpatch_v4.orches.placement_group import _create_placement_group
 from gpatch_v4.orches.utils import build_actor_env_vars
 
-WORLD_SIZE = 32
+WORLD_SIZE = 16
 SEQ_LEN = 32 * 1024
-_FLASH_ATTN_AVAILABLE = importlib.util.find_spec("flash_attn") is not None
+_FA3_AVAILABLE = importlib.util.find_spec("flash_attn_interface") is not None
 ULYSSES_CP_SIZES = (16,)
 ULYSSES_BATCH_SIZE = int(os.environ.get("DSV4_ULYSSES_BATCH_SIZE", "1"))
 ULYSSES_NUM_HEADS = int(os.environ.get("DSV4_ULYSSES_NUM_HEADS", "128"))
@@ -37,7 +35,13 @@ ULYSSES_WARMUP_STEPS = int(os.environ.get("DSV4_ULYSSES_WARMUP", "2"))
 # heads_per_group MUST be divisible by cp_size.
 ULYSSES_NUM_GROUPS = int(os.environ.get("DSV4_ULYSSES_NUM_GROUPS", "4"))
 ULYSSES_HEADS_PER_GROUP = int(os.environ.get("DSV4_ULYSSES_HEADS_PER_GROUP", "0"))
-_NSYS_MARKER = "ulysses_e2e_overlap"
+# FA3 的 sm_margin 留出 SM 给通信；margin=0 时 FA 占满 SM，a2a 会被饿死。
+ULYSSES_SM_MARGIN = int(os.environ.get("DSV4_ULYSSES_SM_MARGIN", "4"))
+SM_MARGINS = tuple(
+    int(x) for x in os.environ.get("DSV4_SP_SM_MARGINS", "0,4,8,16").split(",") if x.strip()
+)
+# 低于此值说明通信基本没被隐藏，overlap 能力不成立。
+OVERLAP_EFF_GATE = float(os.environ.get("DSV4_SP_OVERLAP_GATE", "0.5"))
 
 
 @ray.remote(num_cpus=0, num_gpus=0)
@@ -263,8 +267,13 @@ def _profile_ulysses_worker(
     world_size: int,
     master_addr: str,
     master_port: int,
+    enable_nsys: bool = False,
+    trace_dir: str | None = None,
 ) -> list[dict[str, int | float | bool | str]]:
-    flash_attn_func = importlib.import_module("flash_attn").flash_attn_func
+    flash_attn_func = functools.partial(
+        importlib.import_module("flash_attn_interface").flash_attn_func,
+        sm_margin=ULYSSES_SM_MARGIN,
+    )
 
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(master_port)
@@ -328,7 +337,9 @@ def _profile_ulysses_worker(
             del serial_out, pipeline_out
 
             timings = {}
+            trace_paths: dict[str, str] = {}
             for mode, fn in (
+                # 这个先不用看了
                 (
                     "serial",
                     lambda: _ulysses_e2e_serial(q, k, v, cp_group, flash_attn_func),
@@ -345,38 +356,76 @@ def _profile_ulysses_worker(
                 torch.cuda.synchronize()
                 dist.barrier(group=cp_group)
                 profile_with_nsys = (
-                    rank == 0
+                    enable_nsys
+                    and rank == 0
                     and cp_size == ULYSSES_CP_SIZES[-1]
                     and mode == "overlap"
                 )
+                # 所有 rank 一起开 profiler：只插桩 rank 0 会让它比 peers 慢，
+                # skew 沿 NCCL stream 传播，污染 a2a 的 kernel duration。
+                profile_chrome = trace_dir is not None and not enable_nsys
                 if profile_with_nsys:
                     torch.cuda.profiler.start()
                 dist.barrier(group=cp_group)
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
-                with torch.cuda.nvtx.range(f"ulysses_e2e_{mode}_cp{cp_size}"):
-                    start.record()
-                    fn()
-                    end.record()
-                torch.cuda.synchronize()
+                if profile_chrome:
+                    chrome_warmup = 2
+                    with torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        schedule=torch.profiler.schedule(
+                            wait=0, warmup=chrome_warmup, active=1
+                        ),
+                        record_shapes=False,
+                        profile_memory=False,
+                        with_stack=False,
+                    ) as profiler:
+                        # CUPTI 已开启但事件被 schedule 丢弃，先跑完懒初始化再进 active
+                        for _ in range(chrome_warmup):
+                            fn()
+                            torch.cuda.synchronize()
+                            profiler.step()
+                        dist.barrier(group=cp_group)
+                        with torch.cuda.nvtx.range(f"ulysses_e2e_{mode}_cp{cp_size}"):
+                            start.record()
+                            fn()
+                            end.record()
+                        torch.cuda.synchronize()
+                    if rank == 0:
+                        trace_path = Path(trace_dir) / f"rank-0-cp{cp_size}-{mode}.json"
+                        profiler.export_chrome_trace(str(trace_path))
+                        trace_paths[mode] = str(trace_path)
+                        print(f"[ulysses] chrome trace: {trace_path}", flush=True)
+                else:
+                    with torch.cuda.nvtx.range(f"ulysses_e2e_{mode}_cp{cp_size}"):
+                        start.record()
+                        fn()
+                        end.record()
+                    torch.cuda.synchronize()
                 if profile_with_nsys:
                     torch.cuda.profiler.stop()
                 timings[mode] = start.elapsed_time(end)
                 dist.barrier(group=cp_group)
 
-            results.append(
-                {
-                    "rank": rank,
-                    "cp_size": cp_size,
-                    "heads_per_group": heads_per_group,
-                    "num_groups": ULYSSES_NUM_HEADS // heads_per_group,
-                    "local_seq_len": local_seq_len,
-                    "local_num_heads": ULYSSES_NUM_HEADS // cp_size,
-                    "roundtrip_ok": roundtrip_ok,
-                    "serial_ms": timings["serial"],
-                    "overlap_ms": timings["overlap"],
-                }
-            )
+            result: dict[str, int | float | bool | str] = {
+                "rank": rank,
+                "cp_size": cp_size,
+                "heads_per_group": heads_per_group,
+                "num_groups": ULYSSES_NUM_HEADS // heads_per_group,
+                "local_seq_len": local_seq_len,
+                "local_num_heads": ULYSSES_NUM_HEADS // cp_size,
+                "roundtrip_ok": roundtrip_ok,
+                "serial_ms": timings["serial"],
+                "overlap_ms": timings["overlap"],
+            }
+            if "overlap" in trace_paths:
+                result["trace_overlap"] = trace_paths["overlap"]
+            if "serial" in trace_paths:
+                result["trace_serial"] = trace_paths["serial"]
+            results.append(result)
             del q, k, v
             torch.cuda.empty_cache()
             dist.barrier()
@@ -385,17 +434,157 @@ def _profile_ulysses_worker(
         dist.destroy_process_group()
 
 
-def _wait_for_report(profile_dir: Path, timeout: float = 60.0) -> Path:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        reports = list(profile_dir.glob("ulysses_rank0_*.nsys-rep"))
-        if len(reports) == 1:
-            return reports[0]
-        time.sleep(0.5)
-    raise AssertionError(f"expected one nsys report under {profile_dir}")
+@ray.remote(num_gpus=1, max_calls=1)
+def _overlap_probe_worker(
+    rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
+) -> list[dict[str, int | float | str]]:
+    """量化 a2a 与 FA3 的 overlap 能力；a2a 与 FA 之间故意无数据依赖。"""
+    fa3_func = importlib.import_module("flash_attn_interface").flash_attn_func
+
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    gpu_cnt = torch.cuda.device_count()
+    assert gpu_cnt > 0
+    device = torch.device("cuda", rank % gpu_cnt)
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+    )
+
+    try:
+        cp_size = ULYSSES_CP_SIZES[-1]
+        assert world_size % cp_size == 0
+        assert SEQ_LEN % cp_size == 0
+        assert ULYSSES_NUM_HEADS % cp_size == 0
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        cp_group = init_device_mesh(
+            "cuda",
+            mesh_shape=(world_size // cp_size, cp_size),
+            mesh_dim_names=("dp", "cp"),
+        )["cp"].get_group()
+
+        local_seq_len = SEQ_LEN // cp_size
+        shape = (ULYSSES_BATCH_SIZE, local_seq_len, ULYSSES_NUM_HEADS, ULYSSES_HEAD_DIM)
+        q = torch.empty(shape, device="cuda", dtype=torch.bfloat16).normal_(std=0.02)
+        k = torch.empty_like(q).normal_(std=0.02)
+        v = torch.empty_like(q).normal_(std=0.02)
+        q_x = _ulysses_seq_to_head(q, cp_group)
+        k_x = _ulysses_seq_to_head(k, cp_group)
+        v_x = _ulysses_seq_to_head(v, cp_group)
+
+        def comm_only() -> None:
+            # pending 持有 recv buffer，防止 a2a 在飞时被回收
+            pending = [_launch_seq_to_head_async(t, cp_group) for t in (q, k, v)]
+            for _, work, _ in pending:
+                work.wait()
+
+        def make_comp(sm_margin: int):
+            def comp() -> None:
+                fa3_func(q_x, k_x, v_x, causal=True, sm_margin=sm_margin)
+
+            return comp
+
+        def make_both(sm_margin: int):
+            def both() -> None:
+                pending = [_launch_seq_to_head_async(t, cp_group) for t in (q, k, v)]
+                fa3_func(q_x, k_x, v_x, causal=True, sm_margin=sm_margin)
+                for _, work, _ in pending:
+                    work.wait()
+
+            return both
+
+        def bench_ms(fn) -> float:
+            for _ in range(ULYSSES_WARMUP_STEPS):
+                fn()
+            torch.cuda.synchronize()
+            dist.barrier(group=cp_group)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            fn()
+            end.record()
+            torch.cuda.synchronize()
+            dist.barrier(group=cp_group)
+            return start.elapsed_time(end)
+
+        results = []
+        with torch.no_grad():
+            comm_ms = bench_ms(comm_only)
+            for sm_margin in SM_MARGINS:
+                assert 0 <= sm_margin < sm_count, (
+                    f"sm_margin={sm_margin} out of range for {sm_count} SMs"
+                )
+                comp_ms = bench_ms(make_comp(sm_margin))
+                both_ms = bench_ms(make_both(sm_margin))
+                results.append(
+                    {
+                        "rank": rank,
+                        "sm_count": sm_count,
+                        "sm_margin": sm_margin,
+                        "comm_ms": comm_ms,
+                        "comp_ms": comp_ms,
+                        "both_ms": both_ms,
+                    }
+                )
+        return results
+    finally:
+        dist.destroy_process_group()
 
 
-@unittest.skipUnless(_FLASH_ATTN_AVAILABLE, "flash_attn not installed")
+def _overlap_eff(comm_ms: float, comp_ms: float, both_ms: float) -> float:
+    return (comm_ms + comp_ms - both_ms) / min(comm_ms, comp_ms)
+
+
+def _assert_ulysses_worker_results(
+    test_case: unittest.TestCase,
+    worker_results: list[list[dict[str, int | float | bool | str]]],
+) -> None:
+    results = [result for rank_results in worker_results for result in rank_results]
+    print(
+        "\nUlysses head-pipeline overlap demo: "
+        f"global_seq_len={SEQ_LEN}, batch={ULYSSES_BATCH_SIZE}, "
+        f"heads={ULYSSES_NUM_HEADS}, head_dim={ULYSSES_HEAD_DIM}, "
+        f"causal=True, warmup={ULYSSES_WARMUP_STEPS}"
+    )
+    for cp_size in ULYSSES_CP_SIZES:
+        case_results = [result for result in results if result["cp_size"] == cp_size]
+        test_case.assertEqual(len(case_results), WORLD_SIZE)
+        test_case.assertTrue(all(result["roundtrip_ok"] for result in case_results))
+        serial_result = max(case_results, key=lambda r: float(r["serial_ms"]))
+        overlap_result = max(case_results, key=lambda r: float(r["overlap_ms"]))
+        serial_ms = float(serial_result["serial_ms"])
+        overlap_ms = float(overlap_result["overlap_ms"])
+        heads_per_group = int(case_results[0]["heads_per_group"])
+        num_groups = int(case_results[0]["num_groups"])
+        print(
+            f"CP={cp_size}: heads_per_group={heads_per_group}, "
+            f"num_groups={num_groups}, local_shape="
+            f"[{ULYSSES_BATCH_SIZE}, {SEQ_LEN // cp_size}, "
+            f"{ULYSSES_NUM_HEADS}, {ULYSSES_HEAD_DIM}] -> "
+            f"[{ULYSSES_BATCH_SIZE}, {SEQ_LEN}, "
+            f"{ULYSSES_NUM_HEADS // cp_size}, {ULYSSES_HEAD_DIM}]"
+        )
+        print(
+            f"  serial={serial_ms:.3f} ms (rank={serial_result['rank']}), "
+            f"overlap={overlap_ms:.3f} ms (rank={overlap_result['rank']})"
+        )
+        rank0 = next(r for r in case_results if int(r["rank"]) == 0)
+        if "trace_serial" in rank0:
+            print(f"  chrome serial: {rank0['trace_serial']}")
+        if "trace_overlap" in rank0:
+            print(f"  chrome overlap: {rank0['trace_overlap']}")
+        test_case.assertGreater(serial_ms, 0.0)
+        test_case.assertGreater(overlap_ms, 0.0)
+
+
+@unittest.skipUnless(_FA3_AVAILABLE, "flash_attn_interface (FA3) not installed")
 class Test1(unittest.TestCase):
     def setUp(self) -> None:
         ray.init(address="auto")
@@ -407,14 +596,10 @@ class Test1(unittest.TestCase):
     def tearDown(self) -> None:
         kill_all_actors_and_shutdown_ray()
 
-    def test_ulysses_e2e_timeline(self) -> None:
-        if shutil.which("nsys") is None:
-            self.skipTest("nsys is unavailable")
+    def test_ulysses_e2e(self) -> None:
         self.assertGreaterEqual(ULYSSES_WARMUP_STEPS, 0)
-        profile_dir = Path.cwd() / "ulysses_sp_overlap"
-        profile_dir.mkdir(exist_ok=True)
-        for path in profile_dir.glob("ulysses_rank0_*"):
-            path.unlink()
+        trace_dir = (Path.cwd() / "ulysses_sp_overlap").resolve()
+        trace_dir.mkdir(exist_ok=True)
         placement_group, bundle_indices = _create_placement_group(WORLD_SIZE)
 
         try:
@@ -426,14 +611,6 @@ class Test1(unittest.TestCase):
                     )
                 ).remote()
             )
-            nsight_config = {
-                "t": "cuda,nccl,cudnn,cublas,nvtx,osrt",
-                "capture-range": "cudaProfilerApi",
-                "capture-range-end": "stop",
-                "flush-on-cudaprofilerstop": "true",
-                "force-overwrite": "true",
-                "o": str(profile_dir / "ulysses_rank0_%p"),
-            }
             actor_env_vars = build_actor_env_vars()
             futures = [
                 _profile_ulysses_worker.options(
@@ -441,10 +618,42 @@ class Test1(unittest.TestCase):
                         placement_group=placement_group,
                         placement_group_bundle_index=bundle_indices[rank],
                     ),
-                    runtime_env={
-                        "env_vars": actor_env_vars,
-                        **({"nsight": nsight_config} if rank == 0 else {}),
-                    },
+                    runtime_env={"env_vars": actor_env_vars},
+                ).remote(
+                    rank,
+                    WORLD_SIZE,
+                    master_addr,
+                    master_port,
+                    False,
+                    str(trace_dir),
+                ) for rank in range(WORLD_SIZE)
+            ]
+            worker_results = ray.get(futures)
+        finally:
+            remove_placement_group(placement_group)
+
+        _assert_ulysses_worker_results(self, worker_results)
+
+    def test_a2a_fa3_overlap_capability(self) -> None:
+        placement_group, bundle_indices = _create_placement_group(WORLD_SIZE)
+
+        try:
+            master_addr, master_port = ray.get(
+                _get_master_endpoint.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=placement_group,
+                        placement_group_bundle_index=bundle_indices[0],
+                    )
+                ).remote()
+            )
+            actor_env_vars = build_actor_env_vars()
+            futures = [
+                _overlap_probe_worker.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=placement_group,
+                        placement_group_bundle_index=bundle_indices[rank],
+                    ),
+                    runtime_env={"env_vars": actor_env_vars},
                 ).remote(
                     rank,
                     WORLD_SIZE,
@@ -453,60 +662,41 @@ class Test1(unittest.TestCase):
                 ) for rank in range(WORLD_SIZE)
             ]
             worker_results = ray.get(futures)
-            report_path = _wait_for_report(profile_dir)
         finally:
             remove_placement_group(placement_group)
 
-        self.assertTrue(report_path.is_file())
-        self.assertGreater(report_path.stat().st_size, 0)
-        stats = subprocess.run(
-            [
-                "nsys",
-                "stats",
-                "--report=cuda_gpu_kern_sum,nvtx_sum",
-                "--format=csv",
-                "--force-export=true",
-                str(report_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        stats_output = stats.stdout + stats.stderr
-        self.assertEqual(stats.returncode, 0, stats_output)
-        self.assertNotIn("SKIPPED:", stats_output, stats_output)
-        self.assertIn(f"{_NSYS_MARKER}_cp{ULYSSES_CP_SIZES[-1]}", stats_output)
-        self.assertIn("nccl", stats_output.lower())
-
-        results = [result for rank_results in worker_results for result in rank_results]
+        results = [r for rank_results in worker_results for r in rank_results]
+        cp_size = ULYSSES_CP_SIZES[-1]
         print(
-            "\nUlysses head-pipeline overlap demo: "
-            f"global_seq_len={SEQ_LEN}, batch={ULYSSES_BATCH_SIZE}, "
-            f"heads={ULYSSES_NUM_HEADS}, head_dim={ULYSSES_HEAD_DIM}, "
-            f"causal=True, warmup={ULYSSES_WARMUP_STEPS}"
+            f"\na2a x3 vs FA3 overlap probe: cp={cp_size}, "
+            f"local=[{ULYSSES_BATCH_SIZE}, {SEQ_LEN // cp_size}, {ULYSSES_NUM_HEADS}, "
+            f"{ULYSSES_HEAD_DIM}] -> [{ULYSSES_BATCH_SIZE}, {SEQ_LEN}, "
+            f"{ULYSSES_NUM_HEADS // cp_size}, {ULYSSES_HEAD_DIM}], "
+            f"SMs={int(results[0]['sm_count'])}"
         )
-        for cp_size in ULYSSES_CP_SIZES:
-            case_results = [result for result in results if result["cp_size"] == cp_size]
-            self.assertEqual(len(case_results), WORLD_SIZE)
-            self.assertTrue(all(result["roundtrip_ok"] for result in case_results))
-            serial_result = max(case_results, key=lambda r: float(r["serial_ms"]))
-            overlap_result = max(case_results, key=lambda r: float(r["overlap_ms"]))
-            serial_ms = float(serial_result["serial_ms"])
-            overlap_ms = float(overlap_result["overlap_ms"])
-            heads_per_group = int(case_results[0]["heads_per_group"])
-            num_groups = int(case_results[0]["num_groups"])
+        print("  sm_margin    comm_ms    comp_ms    both_ms   overlap_eff")
+
+        best_eff = float("-inf")
+        for sm_margin in SM_MARGINS:
+            case = [r for r in results if int(r["sm_margin"]) == sm_margin]
+            self.assertEqual(len(case), WORLD_SIZE)
+            # 取最慢 rank：overlap 由全局最慢者决定
+            comm_ms = max(float(r["comm_ms"]) for r in case)
+            comp_ms = max(float(r["comp_ms"]) for r in case)
+            both_ms = max(float(r["both_ms"]) for r in case)
+            self.assertGreater(comm_ms, 0.0)
+            self.assertGreater(comp_ms, 0.0)
+            self.assertGreater(both_ms, 0.0)
+            eff = _overlap_eff(comm_ms, comp_ms, both_ms)
+            best_eff = max(best_eff, eff)
             print(
-                f"CP={cp_size}: heads_per_group={heads_per_group}, "
-                f"num_groups={num_groups}, local_shape="
-                f"[{ULYSSES_BATCH_SIZE}, {SEQ_LEN // cp_size}, "
-                f"{ULYSSES_NUM_HEADS}, {ULYSSES_HEAD_DIM}] -> "
-                f"[{ULYSSES_BATCH_SIZE}, {SEQ_LEN}, "
-                f"{ULYSSES_NUM_HEADS // cp_size}, {ULYSSES_HEAD_DIM}]"
+                f"  {sm_margin:>9d} {comm_ms:10.3f} {comp_ms:10.3f} "
+                f"{both_ms:10.3f} {eff:13.3f}"
             )
-            print(
-                f"  serial={serial_ms:.3f} ms (rank={serial_result['rank']}), "
-                f"overlap={overlap_ms:.3f} ms (rank={overlap_result['rank']})"
-            )
-            print(f"  nsys: {report_path}")
-            self.assertGreater(serial_ms, 0.0)
-            self.assertGreater(overlap_ms, 0.0)
+
+        self.assertGreater(
+            best_eff,
+            OVERLAP_EFF_GATE,
+            f"no sm_margin hides >{OVERLAP_EFF_GATE:.0%} of the a2a; "
+            f"best overlap_eff={best_eff:.3f} over margins {SM_MARGINS}",
+        )

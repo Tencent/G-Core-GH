@@ -25,6 +25,7 @@ def custom_apply_chat_template(
     add_generation_prompt=True,
     tools=None,
     enable_thinking: Optional[bool] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> List:
     if len(messages) == 0:
         return []
@@ -33,6 +34,11 @@ def custom_apply_chat_template(
     extra_kwargs: Dict = {}
     if enable_thinking is not None:
         extra_kwargs["enable_thinking"] = enable_thinking
+    if reasoning_effort is not None:
+        # Qwen3.8 resolves low / medium / xhigh in its tokenizer chat
+        # template. This is prompt construction, not an SGLang sampling
+        # parameter, so it must be forwarded to apply_chat_template here.
+        extra_kwargs["reasoning_effort"] = reasoning_effort
     if messages[0]["role"] == "system":
         # NOTE 非常的离谱，transformers 新版本把 return_dict 默认设置改成 Ture 了
         # 导致 apply_chat_template 返回的是一个 dict，而不是一个 list，手动处理一下

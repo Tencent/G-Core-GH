@@ -1,0 +1,83 @@
+# @package _global_
+#
+# DeepSeek-V4-Flash-0731 SFT + DSpark on NuminaMath-CoT, EP + FSDP2.
+#
+# Derived from tests/test_gpatch_v4/configs/test_yaml/test_dsv4_sft_dspark.yaml
+# (truncated 8-layer one-step smoke) and tasks/math_dsv4/yaml/math_sft_with_mtp_fsdp2.yaml.
+# Diffs vs the unittest yaml:
+#   * Full 43-layer 0731 (no debug_truncate_num_hidden_layers).
+#   * Production seq / save / wandb knobs; this example remains CP=1.
+#   * enable_mtp is mutually exclusive with enable_dspark.
+#
+# Hard constraints (FSDP2 DSpark in mixin.get_fsdp2_model):
+#   * static contiguous CP; local sequence length >= sliding_window and block_size - 1
+#   * attn_implementation == "fused"
+#   * SFT only (FinetuneConfig)
+
+training:
+  training_backend: fsdp2
+  use_fast_tokenizer: True
+  train_gbs: 512
+  train_mbs: 1
+  seq_length: 32768
+  data_parallel_random_init: False
+  save_interval: 50
+  num_train_epoches: 1
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+  exit_step: 1000
+  recompute: True
+  enable_mtp: False
+  enable_dspark: True
+  online_train_dspark: True
+  dspark_num_anchors: 2
+  freeze_router_weight: False
+  freeze_router_correction_bias: True
+  router_correction_bias_update_speed: 1e-3
+  router_correction_bias_use_abs_update: True
+
+policy:
+  dist_config:
+    nnodes: -1
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 16
+    context_parallel_size: 1
+  model_arch: "deepseek_v4"
+  ppo_pack_seq: True
+  attn_implementation: "fused"
+  indexer_backend: "fused"
+  fp8: False
+  without_ref: True
+  hf_model_path: "/mnt/wfs/mmhuizhouwfssz/project_luban_infra/luban_infra/model_factory/deepseek-ai_DeepSeek-V4-Flash-0731"
+  hf_tokenizer_path: "/mnt/wfs/mmhuizhouwfssz/project_luban_infra/luban_infra/model_factory/deepseek-ai_DeepSeek-V4-Flash-0731"
+
+checkpoint:
+  load_ckpt_path: load_dsv4_dspark_sft_0731
+  save_ckpt_path: save_dsv4_dspark_sft_0731
+  convert_mcore_to_hf_online: False
+  mbridge_distributed_filesystem: True
+  override_tokenizer_special_token:
+    eos_token: "<｜end▁of▁sentence｜>"
+
+optimizer:
+  lr: 1.0e-5
+  lr_warmup_steps: 100
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "hf-hub/AI-MO/NuminaMath-CoT-jsonl/train/"
+  py_path: "tasks/math_dsv4/finetune_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+debug:
+  save_first_rollout_data: True

@@ -36,7 +36,6 @@ try:
         DeepseekV4Config,
     )
     from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-        DeepseekV4GroupedLinear,
         DeepseekV4HashRouter,
         DeepseekV4HyperConnection,
         DeepseekV4HyperHead,
@@ -53,7 +52,6 @@ except ImportError as exc:
         "无法导入 Deepseek-V4 依赖（transformers.models.deepseek_v4.*）。依赖 transformers==5.8.1, 不是使用 dsv4 的话可以忽略"
     )
     DeepseekV4Config = None
-    DeepseekV4GroupedLinear = None
     DeepseekV4HashRouter = None
     DeepseekV4HyperConnection = None
     DeepseekV4HyperHead = None
@@ -61,6 +59,9 @@ except ImportError as exc:
     DeepseekV4RMSNorm = None
     DeepseekV4RotaryEmbedding = None
     DeepseekV4UnweightedRMSNorm = None
+    apply_rotary_pos_emb = None
+    eager_attention_forward = None
+    load_balancing_loss_func = None
 
 
 from einops import rearrange
@@ -76,15 +77,30 @@ from .cp import (
     swa_ring_kv,
 )
 from .deepep_a2a import fused_combine, fused_dispatch
-from .kernel.tilelang_indexer_fwd import _make_causal_cu_seqlens, batched_indexer_fwd
+from .kernel.hadamard_transform import rotate_activation
+from .kernel.tilelang_indexer_fwd import (
+    batched_indexer_fwd,
+    make_causal_cu_ks_and_cu_ke_for_bshd,
+)
 from .kernel.tilelang_sparse_mla import sparse_attn_tilelang
 
 try:
-    from .qat import fp4_simulate_qat, fp8_qat_linear, fp8_simulate_qat
+    from gpatch_v4.kernel.quantize.qat import (
+        fp4_simulate_qat,
+        fp8_qat_linear,
+        fp8_simulate_qat,
+        fp8_simulate_qat_128x128,
+    )
 except ImportError:
     fp4_simulate_qat = None
     fp8_qat_linear = None
     fp8_simulate_qat = None
+    fp8_simulate_qat_128x128 = None
+try:
+    from tile_kernels.quant import per_token_cast
+except ImportError:
+    per_token_cast = None
+from .fp8 import MyTeGroupedLinearFp8
 from .thd import PackedSeqParams
 
 
@@ -409,7 +425,10 @@ class DeepseekV4Indexer(nn.Module):
             positions = positions.unsqueeze(0).expand(batch, -1)
             cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
             compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
-            if self.config.fp8_qat:
+            if self.config.fp4_qat_indexer:
+                compressed = rotate_activation(compressed)
+                compressed = fp4_simulate_qat(compressed, 32)
+            elif self.config.fp8_qat:
                 # indexer compressed torch.Size([1, 32, 128])
                 idx_nope = self.head_dim - self.config.qk_rope_head_dim
                 compressed = torch.cat([fp8_simulate_qat(compressed[..., :idx_nope], 64), compressed[..., idx_nope:]], dim=-1)
@@ -430,9 +449,19 @@ class DeepseekV4Indexer(nn.Module):
         # todo 加多一个 position_ids_zz，预先计算完成。
         cos_q, sin_q = self.rotary_emb(local_hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
         # todo 这里提前交换 q_r
-        q = self.q_b_proj(q_residual).view(batch, s_local, -1, self.head_dim).transpose(1, 2)
-        q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
         if self.config.fp8_qat:
+            # indexer.wq_b is the indexer's only FP8 leaf on disk — simulate its
+            # weight quantization like the main-attention projections.
+            q = fp8_qat_linear(self.q_b_proj, q_residual, 128).view(
+                batch, s_local, -1, self.head_dim
+            ).transpose(1, 2)
+        else:
+            q = self.q_b_proj(q_residual).view(batch, s_local, -1, self.head_dim).transpose(1, 2)
+        q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
+        if self.config.fp4_qat_indexer:
+            q = rotate_activation(q)
+            q = fp4_simulate_qat(q, 32)
+        elif self.config.fp8_qat:
             # indexer q torch.Size([1, s/p, 64, 128])
             idx_nope = self.head_dim - self.config.qk_rope_head_dim
             q = torch.cat([fp8_simulate_qat(q[..., :idx_nope], 64), q[..., idx_nope:]], dim=-1)
@@ -451,7 +480,7 @@ class DeepseekV4Indexer(nn.Module):
             w_sbh = rearrange(weights, 'b s h -> s b h').contiguous()
             if packed_seq_params is None:
                 positions = position_ids[0].to(torch.int32)
-                cu_ks, cu_ke = _make_causal_cu_seqlens(
+                cu_ks, cu_ke = make_causal_cu_ks_and_cu_ke_for_bshd(
                     s_local, compressed_kv.shape[1], self.compress_rate, device, positions=positions,
                 )
             else:
@@ -475,7 +504,37 @@ class DeepseekV4Indexer(nn.Module):
                     seq_dim=0,
                     cont_to_zz=True,
                 )
-            index_scores = batched_indexer_fwd(q_sbhd, k_sbd, w_sbh, cu_ks, cu_ke)  # [B, S, T]
+
+            # dsv4 原版代码：q 是 fake quant fp4 的 bf16，kv 是 fake quant fp4 的 bf16。
+            # 目前先 fake quant 到 fp8，因为 sgl 还没有用 fp4 计算。晚点 fake quant 到 fp4。
+            # config.fp8：per-token cast → FP8 fused indexer。
+            # Caller masks future / cross-seg before top-k; skip dense clean_logits.
+            if self.config.fp8:
+                assert q_sbhd.shape == (s_local, batch, self.num_heads, self.head_dim)
+                assert k_sbd.shape[1:] == (batch, self.head_dim)
+                q_fp8, qs = per_token_cast(
+                    q_sbhd.reshape(s_local * batch * self.num_heads, self.head_dim),
+                    "e4m3",
+                    128,
+                    round_sf=True,
+                )
+                k_fp8, ks = per_token_cast(
+                    k_sbd.reshape(k_sbd.shape[0] * batch, self.head_dim),
+                    "e4m3",
+                    128,
+                    round_sf=True,
+                )
+                q_fp8 = q_fp8.view(s_local, batch, self.num_heads, self.head_dim)
+                k_fp8 = k_fp8.view(k_sbd.shape[0], batch, self.head_dim)
+                qs = qs.to(torch.float8_e8m0fnu).view(s_local, batch, self.num_heads, -1)
+                ks = ks.to(torch.float8_e8m0fnu).view(k_sbd.shape[0], batch, -1)
+                index_scores = batched_indexer_fwd(
+                    q_fp8, k_fp8, w_sbh, cu_ks, cu_ke, clean_logits=False, qs=qs, ks=ks,
+                )
+            else:
+                index_scores = batched_indexer_fwd(
+                    q_sbhd, k_sbd, w_sbh, cu_ks, cu_ke, clean_logits=False,
+                )  # [B, S, T]
 
         else:
             scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))  # [B, S, H, T]
@@ -702,11 +761,13 @@ class DeepseekV4CSACompressor(nn.Module):
         # at the valid top-k entries and leaves `-inf` everywhere else (the
         # scatter sentinel `compressed_len` falls into a one-wider tail column
         # that we drop afterwards).
-        top_k_indices = self.indexer(
-            hidden_states, q_residual, position_ids, past_key_values, layer_idx,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-        )
+        # TODO: Remove no_grad when the indexer has a differentiable training objective.
+        with torch.no_grad():
+            top_k_indices = self.indexer(
+                hidden_states, q_residual, position_ids, past_key_values, layer_idx,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+            )
         compressed_len = compressed_kv.shape[2]
 
         if self.config.attn_backend == 'eager':
@@ -728,6 +789,56 @@ COMPRESSOR_CLASSES = {
     "compressed_sparse_attention": DeepseekV4CSACompressor,
     "heavily_compressed_attention": DeepseekV4HCACompressor,
 }
+
+
+class DeepseekV4GroupedLinear(nn.Linear):
+    """Block-diagonal grouped linear used by the grouped output projection
+
+    The core attention's stacked output is `num_attention_heads* head_dim`-dim,
+    which is *very* large (V4-Flash: 32768; V4-Pro: 65536). A direct
+    `num_attention_heads*head_dim → hidden_size` projection would dominate the
+    per-token cost. The paper sidesteps that by splitting the heads into `g`
+    groups, projecting each `num_attention_heads * head_dim/g`-dim group
+    independently to a `d_g`-dim intermediate output (with
+    `d_g < num_attention_heads * head_dim/g`), and then mixing the resulting
+    `g·d_g` vector to `hidden_size` through a single follow-up linear
+    (`self_attn.o_b_proj`). This module owns the per-group block
+    (`self_attn.o_a_proj`).
+
+    Vendored from transformers 5.8.1
+    (``transformers.models.deepseek_v4.modeling_deepseek_v4``) with one local
+    modification: when ``qat_config.fp4_qat`` is enabled, the weight is passed
+    through ``fp8_simulate_qat_128x128`` (E4M3 + E8M0, 128×128 tiles) before
+    the grouped GEMM, matching official ``wo_a`` FP8 storage and the sglang
+    update path. ``qat_config`` is read at forward time because ``apply_hp``
+    patches the config object after module construction.
+    """
+
+    def __init__(
+        self,
+        in_features_per_group: int,
+        out_features: int,
+        n_groups: int,
+        bias: bool = False,
+        qat_config=None,
+    ):
+        super().__init__(in_features_per_group, out_features, bias=bias)
+        self.n_groups = n_groups
+        self.qat_config = qat_config
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_shape = x.shape[:-2]
+        hidden_dim = x.shape[-1]
+        w = self.weight
+        if self.qat_config is not None and getattr(self.qat_config, "fp4_qat", False):
+            assert fp8_simulate_qat_128x128 is not None, (
+                "fp4_qat requires fp8_simulate_qat_128x128 (tilelang)"
+            )
+            w = fp8_simulate_qat_128x128(w)
+        w = w.view(self.n_groups, -1, hidden_dim).transpose(1, 2)
+        x = x.reshape(-1, self.n_groups, hidden_dim).transpose(0, 1)
+        y = torch.bmm(x, w).transpose(0, 1)
+        return y.reshape(*input_shape, self.n_groups, -1)
 
 
 class DeepseekV4Attention(nn.Module):
@@ -768,7 +879,10 @@ class DeepseekV4Attention(nn.Module):
         self.kv_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_a_proj = DeepseekV4GroupedLinear(
-            self.num_heads * self.head_dim // config.o_groups, config.o_groups * config.o_lora_rank, config.o_groups
+            self.num_heads * self.head_dim // config.o_groups,
+            config.o_groups * config.o_lora_rank,
+            config.o_groups,
+            qat_config=config,
         )
         self.o_b_proj = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
         self._sink_holder = _Fp32ParamHolder(self.num_heads)
@@ -932,6 +1046,17 @@ class DeepseekV4Attention(nn.Module):
                 sm_scale=self.scaling,
             )
             attn_weights = None
+        elif self.config.attn_backend == "flash_mla":
+            from .kernel.flash_mla_wrapper import sparse_attn_flash_mla
+            _fsinks = self.sinks if self.config.amp_fp32 else self.sinks.float()
+            attn_output = sparse_attn_flash_mla(
+                rearrange(q, 'B H S D -> B S H D').contiguous(),
+                rearrange(kv, 'B 1 Skv D -> B Skv D').contiguous(),
+                _fsinks,
+                swa_topk,
+                sm_scale=self.scaling,
+            )
+            attn_weights = None
         elif self.config.attn_backend == "eager-topk":
             from .kernel.eager_topk_attn import eager_topk_attention_forward
             attn_output = eager_topk_attention_forward(
@@ -950,12 +1075,71 @@ class DeepseekV4Attention(nn.Module):
         attn_output = apply_rotary_pos_emb(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)
 
         grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
+        # wo_a's FP8 fake-quant (active when fp4_qat is on) is applied inside
+        # DeepseekV4GroupedLinear.forward via qat_config.
         grouped = self.o_a_proj(grouped).flatten(2)
         if self.config.fp8_qat:
             output = fp8_qat_linear(self.o_b_proj, grouped, 128)
         else:
             output = self.o_b_proj(grouped)
         return output, attn_weights
+
+
+class _EmptyExpertsWithGrad(torch.autograd.Function):
+    """S=0 expert stub that keeps params and routing weights in the autograd graph.
+
+    ``grouped_mm`` does not touch weights when there are no tokens. Without this
+    Function, empty ranks would (1) leave expert params out of the graph so
+    FSDP2 may not materialize zero grads, and (2) leave ``top_k_weights`` out
+    of the graph so dispatch-weight ``AllToAllUneven.backward`` is skipped —
+    desyncing ``mesh_ep`` collectives vs non-empty ranks under activation
+    checkpointing.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states: torch.Tensor,
+        gate_up_proj: torch.Tensor,
+        down_proj: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.gate_up_shape = gate_up_proj.shape
+        ctx.down_shape = down_proj.shape
+        ctx.gate_up_dtype = gate_up_proj.dtype
+        ctx.gate_up_device = gate_up_proj.device
+        ctx.down_dtype = down_proj.dtype
+        ctx.down_device = down_proj.device
+        ctx.weight_shape = top_k_weights.shape
+        ctx.weight_dtype = top_k_weights.dtype
+        ctx.weight_device = top_k_weights.device
+        return torch.zeros(
+            hidden_states.shape,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        gate_up_grad = torch.zeros(
+            ctx.gate_up_shape,
+            dtype=ctx.gate_up_dtype,
+            device=ctx.gate_up_device,
+        )
+        down_grad = torch.zeros(
+            ctx.down_shape,
+            dtype=ctx.down_dtype,
+            device=ctx.down_device,
+        )
+        weight_grad = torch.zeros(
+            ctx.weight_shape,
+            dtype=ctx.weight_dtype,
+            device=ctx.weight_device,
+        )
+        return grad_output, gate_up_grad, down_grad, weight_grad
 
 
 class DeepseekV4Experts(nn.Module):
@@ -993,6 +1177,7 @@ class DeepseekV4Experts(nn.Module):
         self.ep_rank = 0
         self.ep_group: Optional[dist.ProcessGroup] = None
         self.num_local_experts = self.num_experts
+        self.fp8_grouped_linear : MyTeGroupedLinearFp8 | None = None
 
     def forward(
         self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
@@ -1017,6 +1202,11 @@ class DeepseekV4Experts(nn.Module):
         Tensor, shape ``[N, H]``
             Sum of weighted expert outputs over the top-k slots, ready to be
             added to the shared-experts output by :class:`DeepseekV4SparseMoeBlock`.
+
+        TODO：
+        可能的优化：
+        1. 上一个 MegaMoE
+        2. 先量化再通信
         """
         assert self.ep_group is not None, (
             "DeepseekV4Experts.forward requires ep_group; "
@@ -1090,12 +1280,12 @@ class DeepseekV4Experts(nn.Module):
         valid = recv_expert >= 0
         row_idx, slot_idx = valid.nonzero(as_tuple=True)
         recv_out = recv_x.new_zeros(recv_x.shape[0], H)
-        if row_idx.numel() > 0:
-            local_expert_id = recv_expert[row_idx, slot_idx]
-            local_weight = recv_weight[row_idx, slot_idx]
-            expanded_x = recv_x.index_select(0, row_idx)
-            expanded_out = self.fwd_gmm(expanded_x, local_expert_id, local_weight)
-            recv_out.index_add_(0, row_idx, expanded_out)
+        # Always call fwd_gmm: empty row_idx is S=0 and must keep params/weights in graph.
+        local_expert_id = recv_expert[row_idx, slot_idx]
+        local_weight = recv_weight[row_idx, slot_idx]
+        expanded_x = recv_x.index_select(0, row_idx)
+        expanded_out = self.fwd_gmm(expanded_x, local_expert_id, local_weight)
+        recv_out.index_add_(0, row_idx, expanded_out)
         return fused_combine(recv_out, self.ep_group, handle).view(N, H)
 
     def fwd_gmm(
@@ -1128,6 +1318,14 @@ class DeepseekV4Experts(nn.Module):
         """
         device = hidden_states.device
         num_tokens, hidden_dim = hidden_states.shape
+        if num_tokens == 0:
+            # S=0: keep expert params (FSDP) and top_k_weights (EP a2a bwd) in graph.
+            return _EmptyExpertsWithGrad.apply(
+                hidden_states,
+                self.gate_up_proj,
+                self.down_proj,
+                top_k_weights,
+            )
 
         # Sort by local expert id for grouped processing.
         expert_ids_g, perm = torch.sort(local_expert_id)
@@ -1149,9 +1347,9 @@ class DeepseekV4Experts(nn.Module):
             gate_up_w = fp4_simulate_qat(gate_up_w)
             down_w = fp4_simulate_qat(down_w)
         elif self.config.fp8_qat:
-            # vllm 和 sglang 的 moe 的 fp8 block (128, 128)
-            gate_up_w = fp8_simulate_qat(gate_up_w, 128)
-            down_w = fp8_simulate_qat(down_w, 128)
+            # vllm / sglang MoE FP8 block (128, 128)
+            gate_up_w = fp8_simulate_qat_128x128(gate_up_w)
+            down_w = fp8_simulate_qat_128x128(down_w)
 
         # Up projection (gate||up packed): [S, 2I]
         if self.config.fp8:
@@ -1283,9 +1481,9 @@ class DeepseekV4SparseMoeBlock(nn.Module):
         # NOTE: deepseek v4 shared experts weights dtype is fp8, not `float4_e2m1fn`.
         se = self.shared_experts
         if self.experts.config.fp8_qat:
-            gate_w = fp8_simulate_qat(se.gate_proj.weight, 128)
-            up_w = fp8_simulate_qat(se.up_proj.weight, 128)
-            down_w = fp8_simulate_qat(se.down_proj.weight, 128)
+            gate_w = fp8_simulate_qat_128x128(se.gate_proj.weight)
+            up_w = fp8_simulate_qat_128x128(se.up_proj.weight)
+            down_w = fp8_simulate_qat_128x128(se.down_proj.weight)
             intermediate = se.act_fn(F.linear(residual, gate_w, se.gate_proj.bias)) * F.linear(residual, up_w, se.up_proj.bias)
             se_out = F.linear(intermediate, down_w, se.down_proj.bias)
         else:
@@ -1387,9 +1585,9 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
     def __init__(self, config: DeepseekV4Config):
         super().__init__(config)
         if getattr(config, "fp8_qat", False):
-            assert fp8_simulate_qat is not None, (
-                "fp8_qat enabled but fp8_simulate_qat unavailable "
-                "(tilelang/tile_kernels not installed?)"
+            assert fp8_simulate_qat is not None and fp8_simulate_qat_128x128 is not None, (
+                "fp8_qat enabled but fp8_simulate_qat / fp8_simulate_qat_128x128 "
+                "unavailable (tilelang/tile_kernels not installed?)"
             )
         if getattr(config, "fp4_qat", False):
             assert fp4_simulate_qat is not None, (
@@ -1565,6 +1763,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         *,
         packed_seq_params: PackedSeqParams | None = None,
         return_hc_hidden: bool = False,
+        return_dspark_target_hiddens: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeModelOutputWithPast:
         r"""
@@ -1572,6 +1771,9 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             THD-format packing metadata for variable-length sequences in a single batch row.
         return_hc_hidden (`bool`, *optional*, defaults to `False`):
             Whether to return the pre-head hyper-connection hidden states for MTP.
+        return_dspark_target_hiddens (`bool`, *optional*, defaults to `False`):
+            Return the mean HC stream after every layer selected by
+            ``config.dspark_target_layer_ids``.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1615,7 +1817,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
         }
 
-        for layer in self.layers:
+        dspark_target_hiddens = []
+        for layer_idx, layer in enumerate(self.layers):
             hidden_states = layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
@@ -1627,6 +1830,11 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 packed_seq_params=packed_seq_params,
                 **kwargs,
             )
+            if (
+                return_dspark_target_hiddens
+                and layer_idx in self.config.dspark_target_layer_ids
+            ):
+                dspark_target_hiddens.append(hidden_states.mean(dim=2).detach())
 
         mtp_hc_hidden = hidden_states if return_hc_hidden else None
         hidden_states = self.norm(self.hc_head(hidden_states))
@@ -1635,6 +1843,14 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         )
         if mtp_hc_hidden is not None:
             outputs.mtp_hc_hidden = mtp_hc_hidden
+        if return_dspark_target_hiddens:
+            assert len(dspark_target_hiddens) == len(
+                self.config.dspark_target_layer_ids
+            )
+            outputs.dspark_target_hidden_states = torch.cat(
+                dspark_target_hiddens,
+                dim=-1,
+            )
         return outputs
 
 
@@ -1648,6 +1864,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
         # Default for paths bypassing apply_hp; apply_hp overrides.
         super().__init__(config)
         # prevent circular import
+        from .dspark import DeepseekV4DSparkModule
         from .mtp import DeepseekV4MTPConfig, DeepseekV4MTPModule
 
         self.model = DeepseekV4Model(config)
@@ -1661,10 +1878,23 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
             num_layers=config.num_nextn_predict_layers,
             loss_scaling_factor=self.mtp_loss_scaling_factor,
         )
-        self.mtp = (
-            DeepseekV4MTPModule(config, self.mtp_config, rotary_emb=self.model.rotary_emb)
-            if self.mtp_config.enabled else None
+        self.dspark_enabled = (
+            "dspark_num_layers" in config.to_dict()
+            and config.dspark_num_layers > 0
         )
+        if self.dspark_enabled:
+            self.mtp = DeepseekV4DSparkModule(
+                config,
+                rotary_emb=self.model.rotary_emb,
+            )
+        elif self.mtp_config.enabled:
+            self.mtp = DeepseekV4MTPModule(
+                config,
+                self.mtp_config,
+                rotary_emb=self.model.rotary_emb,
+            )
+        else:
+            self.mtp = None
         if self.mtp is not None:
             # MTP-enabled training/load should not silently ignore mtp.* keys.
             self._keys_to_ignore_on_load_unexpected = []
@@ -1687,6 +1917,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
         logits_to_keep: int | torch.Tensor = 0,
         *,
         packed_seq_params: PackedSeqParams | None = None,
+        dspark_batch=None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeCausalLMOutputWithPast:
         r"""
@@ -1697,6 +1928,8 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
 
         packed_seq_params (`PackedSeqParams`, *optional*):
             THD-format packing metadata for variable-length sequences in a single batch row.
+        dspark_batch (`DSparkBatch`, *optional*):
+            Shifted-label anchor metadata prepared once by the FSDP2 train step.
 
         Example:
 
@@ -1722,8 +1955,9 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         # NOTE There is a naming issue here in transformers: this is not an attention mask [b, s, s],
         # but it's actually a padding mask [b, s].
-        use_mtp = self.mtp is not None and self.training
-        outputs: MoeModelOutputWithPast = self.model(
+        use_dspark = self.dspark_enabled and dspark_batch is not None
+        use_mtp = self.mtp is not None and self.training and not use_dspark
+        model_kwargs = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1731,10 +1965,12 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             return_hc_hidden=use_mtp,
+            return_dspark_target_hiddens=use_dspark,
             output_router_logits=output_router_logits,
             packed_seq_params=packed_seq_params,
             **kwargs,
         )
+        outputs: MoeModelOutputWithPast = self.model(**model_kwargs)
 
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
@@ -1758,6 +1994,22 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 
         mtp_per_depth_h = None
+        dspark_output = None
+        if use_dspark:
+            assert input_ids is not None
+            assert position_ids is not None
+            assert dspark_batch is not None
+            dspark_output = self.mtp(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                target_hidden_states=outputs.dspark_target_hidden_states,
+                target_last_hidden_states=hidden_states.detach(),
+                batch=dspark_batch,
+                embed_weight=self.model.embed_tokens.weight,
+                lm_head_weight=self.lm_head.weight,
+                packed_seq_params=packed_seq_params,
+                cp_group=self.model.cp_group,
+            )
         if use_mtp:
             assert input_ids is not None, "MTP training path requires input_ids."
             mtp_hc_hidden = outputs.mtp_hc_hidden
@@ -1801,6 +2053,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin, HpModule
         )
         result.mtp_per_depth_h = mtp_per_depth_h
         result.mtp_loss_scaling_factor = self.mtp_loss_scaling_factor
+        result.dspark_output = dspark_output
         return result
 
 

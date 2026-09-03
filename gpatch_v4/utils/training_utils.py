@@ -1,3 +1,56 @@
+# =============================================================================
+# ignore_cp / pre_shifted 参数使用说明
+# =============================================================================
+#
+# from_parallel_logits_to_logprobs (以及 logprobs_from_linear_ce、
+# logprobs_from_compact_ce、vocab_parallel_entropy 等同族函数) 接受两个控制 CP 行为的布尔参数：
+#
+# ignore_cp=True
+#   强制将 cp_size 视为 1，跳过 CP-aware 的 target reorder / slice /
+#   all_gather_from_context_parallel_region。适用场景：
+#
+#   ① HpModule ppo_pack_seq（static CP）
+#      gptmodel_pack_foward 已将模型输出 unpack 回 [B, S]，logits 和 target
+#      都是完整序列，CP 对本次计算不适用。
+#
+#   ② dyn_cp（动态 CP）
+#      调用方在进入本函数前已按 CP rank 将 target/logits 切片到
+#      [1, T_local]；不需要函数内部再做 reorder/slice/gather。
+#
+#   ③ mcore THD RL（_grpo_train_mcore_thd 生成的 batch）
+#      与 dyn_cp 相同：target/mask/logits 均已按 contiguous CP 切片为
+#      [1, T/cp]，函数无需再介入 CP 通信。
+#
+# pre_shifted=True
+#   跳过函数内部的 target.roll(-1) 和末尾的 [:, :-1] 截断。
+#   适用场景：调用方在构造 target 时已完成 next-token shift
+#   （即 target[t] = tokens[t+1]），具体包括：
+#
+#   ① dyn_cp：packed_labels 在 rl_reroute_data_for_dynamic_cp 中已
+#      以 shifted_labels = tokens[1:] 形式写入。
+#
+#   ② mcore THD RL（_grpo_train_mcore_thd）：
+#      tgt = tok[1:] 已在数据准备时完成 shift。
+#
+#   HpModule ppo_pack_seq 和 static CP（非 pack_seq）路径的 target 是未
+#   shift 的完整 tokens，需要函数内部做 roll(-1)，因此保持 pre_shifted=False。
+#
+# 路径汇总（此表仅针对 from_parallel_logits_to_logprobs 及同族函数的调用方）：
+#   路径                         ignore_cp   pre_shifted   说明
+#   ─────────────────────────────────────────────────────────────────────────────
+#   static CP (non pack_seq)       False       False
+#   HpModule ppo_pack_seq          True        False
+#   dyn_cp                         True        True
+#   mcore THD RL (grpo)            True        True
+#   model_forward_only (ref lp)    False       False        base class 返回未 shift 的完整
+#                                                           tokens 作为 target；函数内部做
+#                                                           CP reorder/slice/gather + roll(-1)
+#
+# 注：mcore THD SFT 的训练 loss 不经过本函数族，而是走 FinetuneLossInput /
+#   get_policy_loss_fn → CE(logits, labels) 直接计算，labels = tok[1:] 已 shift，
+#   与 logits 位置对齐，CE 内部不做 roll。因此 pre_shifted 对 SFT loss 路径无意义。
+# =============================================================================
+
 import dataclasses
 import hashlib
 import itertools
@@ -44,12 +97,44 @@ def move_to_device_if_tensor(device, item):
     return item
 
 
+def metadata_scalar(sample: Dict[str, Any], *keys: str) -> Optional[int]:
+    """Read a scalar int from sample metadata under the first matching key.
+
+    Accepts a 0-dim / single-element tensor, a length-1 list/tuple, or a plain
+    int-like value. Used by dyn-CP prepare to fetch ``prompt_length`` /
+    ``sequence_length`` (and aliases).
+    """
+    for key in keys:
+        value = sample[key]
+        if value is None:
+            continue
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                continue
+            return int(value.item())
+        if isinstance(value, (list, tuple)):
+            if len(value) != 1:
+                continue
+            value = value[0]
+        return int(value.item()) if hasattr(value, "item") else int(value)
+    return None
+
+
 def apply_func_to_dict(func, dictionary):
     return {k: func(v) for k, v in dictionary.items()}
 
 
 cuda_dict = partial(apply_func_to_dict, partial(move_to_device_if_tensor, "cuda"))
 cpu_dict = partial(apply_func_to_dict, partial(move_to_device_if_tensor, "cpu"))
+
+
+def get_scale_as_float(value: Optional[Union[float, torch.Tensor]]) -> Optional[float]:
+    # TE path of Megatron get_grad_norm_fp32 returns a 0-dim CUDA tensor.
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.detach().float().cpu().item()
+    return float(value)
 
 
 def extend_value_to_dict(data: dict, new_data: dict, prefix: str = ""):
@@ -193,7 +278,7 @@ def expand_rollout_batch(rollout_batch: Dict[str, Union[int, List[Any]]], ) -> L
         assert isinstance(vs, list), f"{k} {type(vs)}"
         if len(batch_list) == 0:
             batch_list = [{} for _ in range(len(vs))]
-        assert len(vs) == len(batch_list)
+        assert len(vs) == len(batch_list), f"{k} {len(vs)} vs {len(batch_list)}"
         for i in range(len(vs)):
             batch_list[i][k] = vs[i]
     return batch_list
@@ -235,7 +320,6 @@ def get_max_seqlen_within_dp(seqlen: int):
     )
     return t_seqlen.item()
 
-
 def get_batches_max_seqlen(batches: List[Dict[str, Any]], pad_to_multi_of: int) -> int:
     max_token_len = max([e['tokens'].shape[-1] for e in batches])
     max_token_len = ((max_token_len + pad_to_multi_of - 1) // pad_to_multi_of) * pad_to_multi_of
@@ -259,19 +343,29 @@ def update_square_averaging_token_len(batches: List[Dict[str, Any]], max_seq_len
         batch['square_averaging_weight'] = square_averaging_weight
 
 
-def get_iterator_k_split_list(batches: List[Dict[str, Any]], num_microbatches: int) -> Iterator:
+def get_iterator_k_split_list(
+    batches: List[Dict[str, Any]],
+    num_microbatches: int,
+    *,
+    vpp_size: Optional[int] = None
+):
+    """Split ``batches`` into ``num_microbatches`` microbatch lists.
+    """
     if num_microbatches == 0:
         assert len(batches) == 0, f"len(batches) = {len(batches)}"
-        return itertools.chain([])
-    assert len(
-        batches
-    ) % num_microbatches == 0, f"len(batches) = {len(batches)} {num_microbatches=}"
-    mbs = len(batches) // num_microbatches
-    microbatches = []
-    for i in range(num_microbatches):
-        microbatches.append(batches[i * mbs:(i + 1) * mbs])
-    # 这个 itertools.chain 是多余的，等价于返回 microbatches，但是先不修改了。
-    return itertools.chain(microbatches)
+        data_iterator = itertools.chain([])
+    else:
+        assert len(
+            batches
+        ) % num_microbatches == 0, f"len(batches) = {len(batches)} {num_microbatches=}"
+        mbs = len(batches) // num_microbatches
+        microbatches = [batches[i * mbs:(i + 1) * mbs] for i in range(num_microbatches)]
+        # 这个 itertools.chain 是多余的，等价于返回 microbatches，但是先不修改了。
+        data_iterator = itertools.chain(microbatches)
+    if vpp_size is None or vpp_size <= 1:
+        return data_iterator
+    microbatches = list(data_iterator)
+    return [iter(microbatches) for _ in range(vpp_size)]
 
 
 def get_k_split_list(batches: List[Dict[str, Any]], num_microbatches: int) -> Iterator:
@@ -372,8 +466,11 @@ def get_tensor_on_this_cp_rank(val, seq_dim, key_name=None):
         val.shape[seq_dim] // (2 * cp_size),
         *val.shape[(seq_dim + 1):],
     )
-    index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu",
-                         pin_memory=True).cuda(non_blocking=True)
+    index = torch.tensor(
+        [cp_rank, (2 * cp_size - cp_rank - 1)],
+        device=val.device,
+        dtype=torch.long,
+    )
     val = val.index_select(seq_dim, index)
     val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2):])
     return val
@@ -427,8 +524,9 @@ def masked_sum_per_seq(
     sample_mask : Tensor, optional
         Shape ``[B]``; ``1`` keeps the row, ``0`` drops it from the sum.
     """
-    per_seq_sum = (values * mask).sum(dim=-1)
-    per_seq_count = mask.sum(dim=-1).clamp(min=1)
+    valid_mask = mask > 0
+    per_seq_sum = torch.where(valid_mask, values, 0.0).sum(dim=-1)
+    per_seq_count = valid_mask.sum(dim=-1).clamp(min=1)
     per_seq_mean = per_seq_sum / per_seq_count
     if sample_mask is not None:
         per_seq_mean = per_seq_mean * sample_mask
@@ -443,10 +541,18 @@ def masked_mean_list(values: List[Tensor], mask: List[Tensor], dim=None) -> Tens
     return torch.stack(res)
 
 
-def masked_sum(values: Tensor, mask: Tensor) -> Tensor:
-    """Sum of ``values`` over positions where ``mask > 0``."""
+def masked_sum(values: Tensor, mask: Tensor, dim: Optional[int] = None) -> Tensor:
+    """Sum of ``values`` over positions where ``mask > 0``.
+
+    Parameters
+    ----
+    values : Tensor
+    mask : Tensor
+    dim : int, optional
+        Reduce over this axis only; ``None`` reduces every axis to a scalar.
+    """
     values = torch.where(mask > 0, values, 0.0)
-    return values.sum()
+    return values.sum(dim=dim)
 
 
 def masked_var(values: Tensor, mask: Tensor, unbiased=True) -> Tensor:
@@ -1037,14 +1143,33 @@ def from_parallel_logits_to_logprobs(
     higher_stability=False,
     ignore_cp=False,
     pre_shifted=False,
+    temperature: Optional[float] = 1.0,
 ):
     """Get log probs from a ``[B, S//CP, V//TP]`` tensor.
 
-    ``ignore_cp``: skip CP gather (already gathered by CP).
-    ``pre_shifted``: target is already next-token shifted (THD packed Dynamic
-    CP), so skip the internal roll and the trailing truncation.
+    ``ignore_cp``: treat the input as if ``cp_size=1`` — skip CP-aware target
+    reordering, slicing, and all-gather of results.  Use when:
 
-    Returns a ``[B, S-1]`` tensor, or ``[B, S]`` when ``pre_shifted``.
+    * the caller passes a **full-sequence** tensor that was never CP-split
+      (e.g. HpModule ``ppo_pack_seq`` path, where ``gptmodel_pack_foward``
+      has already unpacked the model output back to ``[B, S]``), OR
+    * the caller has already **pre-sharded** the tensor to this rank's local
+      slice and no further CP manipulation is needed
+      (e.g. ``dyn_cp``, mcore THD RL built by ``_grpo_train_mcore_thd``).
+
+    In both cases the function computes logprobs purely on whatever tensor is
+    passed in, without touching CP collective operations.
+
+    ``pre_shifted``: the ``target`` tensor is already next-token shifted
+    (i.e. ``target[t] = tokens[t+1]``), so skip the internal ``roll(-1)``
+    and the trailing ``[:, :-1]`` truncation.  Required whenever target is
+    pre-built as ``tok[1:]`` — e.g. ``dyn_cp`` and mcore THD paths.
+
+    ``temperature``: divide logits by this before CE (verl-aligned). Must match
+    rollout sampling temperature when comparing against sampler logprobs.
+
+    Returns a ``[B, S-1]`` tensor (``pre_shifted=False``), or
+    ``[B, S]`` when ``pre_shifted=True``.
     """
     cp_rank = mpu.get_context_parallel_rank() if not ignore_cp else 0
     cp_size = mpu.get_context_parallel_world_size() if not ignore_cp else 1
@@ -1064,6 +1189,13 @@ def from_parallel_logits_to_logprobs(
 
     local_target = rearrange(local_target, 'b s -> s b').contiguous()
     vocab_parallel_logits = rearrange(vocab_parallel_logits, 'b s h -> s b h').contiguous()
+    if temperature is None:
+        temperature = 1.0
+
+    assert float(temperature) > 0, f"temperature must be positive, got {temperature}"
+    if temperature != 1.0:
+        # Match verl: logits.div_(temperature) before log_softmax / CE.
+        vocab_parallel_logits = vocab_parallel_logits / temperature
     curr_log_probs = -1 * tensor_parallel.vocab_parallel_cross_entropy(
         vocab_parallel_logits, local_target
     )
@@ -1076,6 +1208,65 @@ def from_parallel_logits_to_logprobs(
     return curr_log_probs[:, :-1].contiguous()
 
 
+def build_grpo_compact_ce_mask(
+    batches: List[Dict[str, Any]],
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Pad per-sample response masks to ``[B, S - 1]`` for BSHD / static-CP ``compute_logps``.
+
+    Pair with ``build_grpo_compact_ce_mask_dyn_cp`` for Dynamic CP. Only
+    ``get_logprob_output_only_func`` calls this, before ``generate_ppo_data``.
+    ``train_step`` already has padded ``batch["mask"]`` and does not call it.
+    ``sample["mask"]`` is next-token aligned from index 0 (internal zeros are
+    holes; right-pad to ``S - 1``). Do not offset by ``prompt_lengths``.
+    Without ``mask``, reconstruct the response span from prompt/sequence
+    lengths.
+
+    Parameters
+    ----------
+    batches : list[dict[str, Any]]
+        Per-sample rollout data for the current forward-only microbatch.
+    target : torch.Tensor
+        Unshifted padded token ids with shape ``[B, S]``.
+
+    Returns
+    -------
+    torch.Tensor
+        Float32 response mask with shape ``[B, S - 1]`` on ``target``'s device.
+    """
+    assert target.ndim == 2, f"GRPO target must be 2D, got {target.shape}"
+    assert len(batches) == target.shape[0]
+    output_tokens = target.shape[1] - 1
+    mask = torch.zeros_like(target[:, :output_tokens], dtype=torch.float32)
+    for batch_index, sample in enumerate(batches):
+        if "mask" in sample:
+            source_mask = torch.as_tensor(sample["mask"]).reshape(-1)
+            assert source_mask.numel() <= output_tokens
+            if "sequence_lengths" in sample:
+                unpadded_output_tokens = (
+                    int(torch.as_tensor(sample["sequence_lengths"]).item()) - 1
+                )
+                assert source_mask.numel() == unpadded_output_tokens, (
+                    "sample['mask'] must already span the unpadded logprob axis "
+                    "[0, sequence_lengths - 1], "
+                    f"got numel={source_mask.numel()} vs {unpadded_output_tokens}"
+                )
+            mask[batch_index, :source_mask.numel()] = source_mask.to(mask)
+        else:
+            prompt_length = int(torch.as_tensor(sample["prompt_lengths"]).item())
+            sequence_length = int(torch.as_tensor(sample["sequence_lengths"]).item())
+            response_start = prompt_length - 1
+            response_end = sequence_length - 1
+            assert 0 <= response_start <= response_end <= output_tokens
+            mask[batch_index, response_start:response_end] = 1
+
+        if "sample_mask" in sample:
+            sample_mask = torch.as_tensor(sample["sample_mask"])
+            assert sample_mask.numel() == 1
+            mask[batch_index] *= sample_mask.to(mask).reshape(())
+    return mask
+
+
 def logprobs_from_linear_ce(
     linear_ce_backend,
     linear_ce_output: Dict[str, Any],
@@ -1084,6 +1275,8 @@ def logprobs_from_linear_ce(
     pre_shifted=False,
     mask: Optional[torch.Tensor] = None,
     return_entropy: bool = False,
+    temperature: Optional[float] = 1.0,
+    token_compaction: bool = False,
 ) -> torch.Tensor:
     """Compute per-token logprobs from linear_ce model output.
 
@@ -1094,6 +1287,8 @@ def logprobs_from_linear_ce(
         ``output_layer``.
     target : torch.Tensor
         Token ids ``[B, S]`` (unshifted).
+    temperature : Optional[float]
+        Softmax temperature (verl-aligned). Default 1.0.
 
     Returns
     -------
@@ -1138,21 +1333,79 @@ def logprobs_from_linear_ce(
     if weight is None:
         weight = output_layer.weight
 
-    linear_ce_output = linear_cross_entropy(
-        hidden_states,
-        weight,
-        local_target,
-        1.0,
-        "none",
-        tp_group,
-        return_entropy=return_entropy,
-    )
+    if temperature is None:
+        temperature = 1.0
+    assert float(temperature) > 0, f"temperature must be positive, got {temperature}"
+    if not token_compaction:
+        linear_ce_output = linear_cross_entropy(
+            hidden_states,
+            weight,
+            local_target,
+            float(temperature),
+            "none",
+            tp_group,
+            return_entropy=return_entropy,
+        )
 
-    if return_entropy:
-        curr_log_probs, curr_entropy = linear_ce_output
+        if return_entropy:
+            curr_log_probs, curr_entropy = linear_ce_output
+        else:
+            curr_log_probs = linear_ce_output
+            curr_entropy = None
     else:
-        curr_log_probs = linear_ce_output
-        curr_entropy = None
+        assert mask is not None, "linear CE token compaction requires a response mask"
+        expected_mask_shape = (target.shape[0], s if pre_shifted else s - 1)
+        assert mask.shape == expected_mask_shape
+        # The response mask must follow target into CE's full CP-local hidden layout.
+        kernel_mask = (mask if pre_shifted else torch.nn.functional.pad(mask, (0, 1), value=0))
+        if not ignore_cp:
+            kernel_mask = reorder_target_for_cp(kernel_mask)
+        local_kernel_mask = kernel_mask[:, cp_rank * local_s:(cp_rank + 1) * local_s]
+        local_kernel_mask = local_kernel_mask.transpose(0, 1).contiguous().to(hidden_states.device)
+        assert hidden_states.shape[:-1] == local_target.shape == local_kernel_mask.shape
+
+        flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+        flat_target = local_target.reshape(-1)
+        keep_indices = local_kernel_mask.reshape(-1).nonzero(as_tuple=False).flatten()
+        num_valid_tokens = keep_indices.numel()
+        if num_valid_tokens == 0:
+            # Preserve zero gradients without launching linear CE.
+            zero_output = (flat_hidden[:0].sum() + weight.reshape(-1)[:0].sum()).float()
+            curr_log_probs = zero_output.expand(local_target.numel()).view_as(local_target)
+            curr_entropy = (
+                zero_output.expand(local_target.numel()).view_as(local_target)
+                if return_entropy else None
+            )
+        else:
+            linear_ce_hidden = flat_hidden.index_select(0, keep_indices)
+            linear_ce_target = flat_target.index_select(0, keep_indices)
+            if num_valid_tokens == 1:
+                # Triton specializes a single token to a scalar.
+                linear_ce_hidden = torch.cat((linear_ce_hidden, linear_ce_hidden), dim=0)
+                linear_ce_target = torch.cat((linear_ce_target, linear_ce_target))
+            linear_ce_result = linear_cross_entropy(
+                linear_ce_hidden,
+                weight,
+                linear_ce_target,
+                float(temperature),
+                "none",
+                tp_group,
+                return_entropy=return_entropy,
+            )
+
+            if return_entropy:
+                compact_log_probs, compact_entropy = linear_ce_result
+                curr_entropy = compact_entropy.new_zeros(
+                    local_target.numel()
+                ).scatter(0, keep_indices,
+                          compact_entropy[:num_valid_tokens]).view_as(local_target)
+            else:
+                compact_log_probs = linear_ce_result
+                curr_entropy = None
+            # Downstream GRPO consumers still expect tensors in the original token layout.
+            curr_log_probs = compact_log_probs.new_zeros(
+                local_target.numel()
+            ).scatter(0, keep_indices, compact_log_probs[:num_valid_tokens]).view_as(local_target)
 
     curr_log_probs = -1 * curr_log_probs
     # [local_S, B] -> [B, local_S]
@@ -1184,12 +1437,139 @@ def logprobs_from_linear_ce(
     return curr_log_probs
 
 
+def logprobs_from_compact_ce(
+    linear_ce_output: Dict[str, Any],
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    ignore_cp=False,
+    pre_shifted=False,
+    return_entropy: bool = False,
+    temperature: Optional[float] = 1.0,
+) -> torch.Tensor:
+    """Ordinary vocab-parallel logprobs on compacted hidden states."""
+    cp_rank = mpu.get_context_parallel_rank() if not ignore_cp else 0
+    cp_size = mpu.get_context_parallel_world_size() if not ignore_cp else 1
+
+    s = target.shape[1]
+    assert s % cp_size == 0, f'{s=} {cp_size=}'
+    local_s = s // cp_size
+    if not pre_shifted:
+        target = target.roll(shifts=-1, dims=-1)
+    if not ignore_cp:
+        target = reorder_target_for_cp(target)
+    local_target = target[:, cp_rank * local_s:(cp_rank + 1) * local_s]
+
+    hidden_states = linear_ce_output["hidden_states"]
+    local_target = local_target.transpose(0, 1).contiguous().to(hidden_states.device)
+
+    output_layer = linear_ce_output["output_layer"]
+    tp_group = output_layer.tp_group
+    if output_layer.sequence_parallel:
+        hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+            hidden_states,
+            tensor_parallel_output_grad=False,
+        )
+    weight = linear_ce_output["weight"]
+    if weight is None:
+        weight = output_layer.weight
+    assert output_layer.bias is None, (
+        "CE compaction requires an output projection without bias"
+    )
+    assert not output_layer.gather_output
+    assert not linear_ce_output["runtime_gather_output"]
+
+    if temperature is None:
+        temperature = 1.0
+    assert float(temperature) > 0, f"temperature must be positive, got {temperature}"
+
+    expected_mask_shape = (target.shape[0], s if pre_shifted else s - 1)
+    assert mask.shape == expected_mask_shape
+    # The response mask must follow target into CE's full CP-local hidden layout.
+    kernel_mask = (mask if pre_shifted else torch.nn.functional.pad(mask, (0, 1), value=0))
+    if not ignore_cp:
+        kernel_mask = reorder_target_for_cp(kernel_mask)
+    local_kernel_mask = kernel_mask[:, cp_rank * local_s:(cp_rank + 1) * local_s]
+    local_kernel_mask = local_kernel_mask.transpose(0, 1).contiguous().to(hidden_states.device)
+    assert hidden_states.shape[:-1] == local_target.shape == local_kernel_mask.shape
+
+    flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+    flat_target = local_target.reshape(-1)
+    keep_indices = local_kernel_mask.reshape(-1).nonzero(as_tuple=False).flatten()
+    num_valid_tokens = keep_indices.numel()
+    if num_valid_tokens == 0:
+        zero_output = (flat_hidden[:0].sum() + weight.reshape(-1)[:0].sum()).float()
+        curr_log_probs = zero_output.expand(local_target.numel()).view_as(local_target)
+        curr_entropy = (
+            zero_output.expand(local_target.numel()).view_as(local_target)
+            if return_entropy else None
+        )
+    else:
+        compact_hidden = flat_hidden.index_select(0, keep_indices).unsqueeze(1)
+        compact_target = flat_target.index_select(0, keep_indices)
+        assert compact_hidden.shape[-1] == weight.shape[-1]
+        if tp_group is not None and dist.get_world_size(tp_group) > 1:
+            # Enter TP region so vocab-parallel CE all-reduces d_hidden.
+            compact_hidden = tensor_parallel.copy_to_tensor_model_parallel_region(
+                compact_hidden,
+                group=tp_group,
+            )
+        compact_logits = torch.nn.functional.linear(compact_hidden, weight)
+        if float(temperature) != 1.0:
+            compact_logits = compact_logits / float(temperature)
+        compact_log_probs = tensor_parallel.vocab_parallel_cross_entropy(
+            compact_logits.float(),
+            compact_target.unsqueeze(1),
+        ).reshape(-1)
+        if return_entropy:
+            from gpatch_v4.training_backend.vocab_parallel_entropy import vocab_parallel_entropy
+            # Compact logits are already [K, 1, V/TP]; skip the outer CP/shift protocol.
+            _, compact_entropy = vocab_parallel_entropy(
+                compact_logits.float(),
+                ignore_cp=True,
+                pre_shifted=True,
+            )
+            curr_entropy = compact_entropy.new_zeros(local_target.numel()).scatter(
+                0, keep_indices, compact_entropy.reshape(-1)
+            ).view_as(local_target)
+        else:
+            curr_entropy = None
+        # Downstream GRPO consumers still expect tensors in the original token layout.
+        curr_log_probs = compact_log_probs.new_zeros(local_target.numel()).scatter(
+            0, keep_indices, compact_log_probs
+        ).view_as(local_target)
+
+    curr_log_probs = -1 * curr_log_probs
+    curr_log_probs = curr_log_probs.transpose(0, 1).contiguous()
+    if return_entropy:
+        curr_entropy = curr_entropy.transpose(0, 1).contiguous()
+
+    if cp_size > 1:
+        curr_log_probs = all_gather_from_context_parallel_region(curr_log_probs)
+        if return_entropy:
+            curr_entropy = all_gather_from_context_parallel_region(curr_entropy)
+
+    if pre_shifted:
+        curr_log_probs = curr_log_probs.contiguous()
+        if return_entropy:
+            curr_entropy = curr_entropy.contiguous()
+    else:
+        curr_log_probs = curr_log_probs[:, :-1].contiguous()
+        if return_entropy:
+            curr_entropy = curr_entropy[:, :-1].contiguous()
+
+    if return_entropy:
+        scaled_entropy = masked_mean(curr_entropy, mask)
+        return curr_log_probs, scaled_entropy, curr_entropy
+    return curr_log_probs
+
+
 @torch.no_grad()
 def from_parallel_logits_to_topk_logprobs(
     vocab_parallel_logits: torch.Tensor,
     topk: int,
     eps: float = 1e-10,
     ignore_cp: bool = False,
+    temperature: Optional[float] = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute global Top-K logprobs + token_ids under Vocab Parallel (TP).
 
@@ -1197,10 +1577,17 @@ def from_parallel_logits_to_topk_logprobs(
         vocab_parallel_logits: 单 TP 卡的 logits 切片，shape=[B, S//CP, V_p]
         topk: 全局 Top-K
         eps: 避免 log(0)
+        temperature: must be 1.0; temperature scaling is not implemented.
     Returns:
         global_topk_logprobs: shape=[B, S, k]
         global_topk_token_ids: shape=[B, S, k]
     """
+    if temperature is None:
+        temperature = 1.0
+    assert float(temperature) == 1.0, (
+        f"from_parallel_logits_to_topk_logprobs does not support temperature != 1.0, "
+        f"got {temperature}"
+    )
     cp_size = mpu.get_context_parallel_world_size() if not ignore_cp else 1
     tp_group = mpu.get_tensor_model_parallel_group()
     tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -1335,6 +1722,7 @@ def from_parallel_logits_to_opd_topk_logprobs(
     target_ids: torch.Tensor,
     eps: float = 1e-10,
     ignore_cp: bool = False,
+    temperature: Optional[float] = 1.0,
 ) -> torch.Tensor:
     """在指定的 token ids 上 gather log-probs（支持 TP + CP，保留梯度）。
 
@@ -1347,10 +1735,17 @@ def from_parallel_logits_to_opd_topk_logprobs(
             predict-next 位移和 response 截取。
         eps: log 内的数值稳定常数。
         ignore_cp: 跳过 CP 切分（如 ``ppo_pack_seq`` 已拼接序列时设为 True）。
+        temperature: must be 1.0; temperature scaling is not implemented.
 
     Returns:
         ``[B, S, K]`` log-probs，所有 TP rank 一致，连接 autograd。
     """
+    if temperature is None:
+        temperature = 1.0
+    assert float(temperature) == 1.0, (
+        f"from_parallel_logits_to_opd_topk_logprobs does not support temperature != 1.0, "
+        f"got {temperature}"
+    )
     cp_size = 1 if ignore_cp else mpu.get_context_parallel_world_size()
     cp_rank = 0 if ignore_cp else mpu.get_context_parallel_rank()
     tp_group = mpu.get_tensor_model_parallel_group()
@@ -1412,6 +1807,7 @@ def opd_topk_logprobs_from_linear_ce(
     linear_ce_output: Dict[str, Any],
     target_ids: torch.Tensor,
     ignore_cp: bool = False,
+    temperature: Optional[float] = 1.0,
 ) -> torch.Tensor:
     """在指定 token ids 上 gather log-probs（linear_ce 融合版，不物化完整 logits）。
 
@@ -1436,12 +1832,20 @@ def opd_topk_logprobs_from_linear_ce(
         截取（约定同 :func:`from_parallel_logits_to_opd_topk_logprobs`）。``K >= 1``。
     ignore_cp : bool
         跳过 CP 切分（如 ``ppo_pack_seq`` 已拼接序列时设 True）。
+    temperature : float, optional
+        Must be 1.0; temperature scaling is not implemented.
 
     Returns
     -------
     torch.Tensor
         ``[B, S, K]`` log-probs，所有 TP rank 一致，连接 autograd。
     """
+    if temperature is None:
+        temperature = 1.0
+    assert float(temperature) == 1.0, (
+        f"opd_topk_logprobs_from_linear_ce does not support temperature != 1.0, "
+        f"got {temperature}"
+    )
     set_linear_ce_backend(linear_ce_backend)
 
     cp_rank = mpu.get_context_parallel_rank() if not ignore_cp else 0
@@ -1553,6 +1957,10 @@ def get_dump_moe_metrics(is_full_recompute=False, num_samples=None):
 
         layer_keys = list(gathered_routing_info.keys())  # eg.["layer1", "layer2", ...]
         num_samples = len(gathered_routing_info[layer_keys[0]])
+        assert all(len(gathered_routing_info[k]) == num_samples for k in layer_keys), (
+            f"MoE dump sample counts differ across layers: "
+            f"{ {k: len(gathered_routing_info[k]) for k in layer_keys} }"
+        )
         all_sample_topk_info = [
             {
                 layer_key: gathered_routing_info[layer_key][idx]
@@ -1850,5 +2258,9 @@ def align_sampler_num_samples(sampler, train_step_per_epoch: int, mbs: int, gas:
         return
     aligned = train_step_per_epoch * gas * mbs
     assert sampler.num_samples >= aligned, f"sampler.num_samples={sampler.num_samples} < aligned={aligned}"
+    # Truncating leftovers requires drop_last; else total_size < len(dataset)
+    # makes DistributedSampler padding_size negative and doubles indices.
+    if aligned < sampler.num_samples:
+        sampler.drop_last = True
     sampler.num_samples = aligned
     sampler.total_size = aligned * sampler.num_replicas

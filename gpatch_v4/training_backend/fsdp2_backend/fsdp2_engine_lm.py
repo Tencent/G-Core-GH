@@ -432,6 +432,10 @@ class Fsdp2EngineLm(
         return metric
 
     @override
+    def pretrain_step(self, batch: List[Dict[str, Any]], num_microbatches: int, step: int):
+        raise NotImplementedError("pretrain_step is not implemented")
+
+    @override
     def set_model_eval(self, model=None):
         if model is not None:
             model.eval()

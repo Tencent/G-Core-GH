@@ -9,7 +9,9 @@ try:
 except ImportError:
     qwen3vl_parallel_split = None
 from megatron.core import mpu
+from megatron.core.packed_seq_params import PackedSeqParams
 
+from gpatch_v4.core.constants import MODEL_ARCH
 from gpatch_v4.extended_model.base import PrepareDataForward
 from gpatch_v4.utils import (
     get_tensor_on_this_cp_rank,
@@ -41,7 +43,13 @@ class Wemm3EmbeddingPrepareDataForward(PrepareDataForward):
 
         # not support padding image now
         hw_factor = 4
-        cp_size = mpu.get_context_parallel_world_size()
+        if self.config.policy.model_arch in (
+            MODEL_ARCH.WEMM3_5_EMBEDDING,
+            MODEL_ARCH.WEMM3_5_MOE_EMBEDDING,
+        ):
+            cp_size = mpu.get_tensor_and_context_parallel_world_size()
+        else:
+            cp_size = mpu.get_context_parallel_world_size()
         vision_data, vision_grid_thw, cp_img_num, images_padded = qwen2vl_pad_and_split(
             cp_size,
             hw_factor,
@@ -55,6 +63,14 @@ class Wemm3EmbeddingPrepareDataForward(PrepareDataForward):
             images_padded[i] = bool(images_padded[i])
             assert not images_padded[i], "not support padding image now"
         return cp_img_num, images_padded, vision_data, vision_grid_thw
+
+    @override
+    def prepare_loss_weights(
+        self,
+        loss_weights: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        raise NotImplementedError("prepare_loss_weights is not implemented")
 
     @override
     def model_forward_only(
@@ -117,99 +133,83 @@ class Wemm3EmbeddingPrepareDataForward(PrepareDataForward):
         pad_with_random_token: bool = False,
         **kwargs,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        tokens_l = []
-        labels_l = []
-        loss_mask_l = []
-        position_ids_l = []
-        attention_mask_l = []
-        image_input_mask_l = []
-        vision_grid_thw_l = []
-        vision_data_l = []
-        input_features_l = []
-        feature_attention_mask_l = []
-        video_second_per_grid_l = []
-        audio_feature_l = []
-        meta_info_l = []
-        for batch in batches:
-            attention_mask = pad_or_truncate_last_dim(batch["attention_mask"], seq_len, 0)
-            tokens, labels = self._shift_label(
-                batch["tokens"],
-                batch["labels"],
-                seq_len,
-                pad_token_id,
-                pad_with_random_token,
-            )
+        """Consume collator-prepacked THD batches (one packed sample per list item).
 
-            tokens_l.append(tokens)
-            labels_l.append(labels)
-            loss_mask = torch.ones(labels.size(), dtype=torch.float)
-            loss_mask[labels == -100] = 0.0
-            loss_mask_l.append(pad_or_truncate_last_dim(loss_mask, seq_len, 0))
-            assert batch["position_ids"].shape[-1] >= seq_len, "小于 seq_len 时, 不能 pad 0"
-            position_ids_l.append(pad_or_truncate_last_dim(batch["position_ids"], seq_len, 0))
-            attention_mask_l.append(attention_mask)
-
-            if "vision_data" in batch and batch["vision_data"] is not None:
-                vision_grid_thw_l.append(batch["vision_grid_thw"])
-                vision_data_l.append(batch["vision_data"])
-            if "image_input_mask" in batch and batch["image_input_mask"] is not None:
-                image_input_mask = pad_or_truncate_last_dim(batch["image_input_mask"], seq_len, 0)
-                image_input_mask_l.append(image_input_mask)
-
-            if "input_features" in batch and batch["input_features"] is not None:
-                input_features = pad_or_truncate_last_dim(
-                    batch["input_features"], seq_len, pad_token_id
-                )
-                input_features_l.append(input_features)
-                feature_attention_mask = pad_or_truncate_last_dim(
-                    batch["feature_attention_mask"], seq_len, 0
-                )
-                feature_attention_mask_l.append(feature_attention_mask)
-                video_second_per_grid_l.append(batch["video_second_per_grid"])
-
-            if "audio_feature" in batch and batch["audio_feature"] is not None:
-                # audio_feature = pad_or_truncate_last_dim(batch["audio_feature"], seq_len, pad_token_id)
-                audio_feature = batch["audio_feature"]
-                audio_feature_l.append(audio_feature)
-
-            if "meta_info" in batch:
-                meta_info_l.append(batch["meta_info"])
+        Collator already packed ``tokens``/``labels`` (labels already
+        next-token shifted)/``cu_seqlens_padded``/``eos_positions``.
+        Here we only H2D + build ``PackedSeqParams``. Do **not** call
+        ``_shift_label``, and do **not** pad to a uniform ``seq_len`` —
+        flash THD uses the packed tensor length as-is.
+        """
+        assert mpu.get_context_parallel_world_size(
+        ) == 1, ("embedding pack_seq requires context_parallel_size == 1")
+        assert len(batches) == 1, (
+            f"pack_seq expects one packed sample per microbatch, got {len(batches)}"
+        )
+        sample = batches[0]
+        assert "cu_seqlens_padded" in sample and "eos_positions" in sample, (
+            "pack_seq batch missing cu_seqlens_padded/eos_positions from collator"
+        )
 
         non_blocking = True
-        tokens = torch.cat(tokens_l, dim=0).cuda(non_blocking=non_blocking)
-        labels = torch.cat(labels_l, dim=0).cuda(non_blocking=non_blocking)
-        loss_mask = torch.cat(loss_mask_l, dim=0).cuda(non_blocking=non_blocking)
-        position_ids = torch.cat(position_ids_l, dim=1).cuda(non_blocking=non_blocking)
-        attention_mask = torch.cat(attention_mask_l, dim=0).cuda(non_blocking=non_blocking)
+        tokens = sample["tokens"].cuda(non_blocking=non_blocking)
+        labels = sample["labels"].cuda(non_blocking=non_blocking)
+        attention_mask = sample["attention_mask"].cuda(non_blocking=non_blocking)
+        position_ids = sample["position_ids"].cuda(non_blocking=non_blocking)
+        cu_seqlens_padded = sample["cu_seqlens_padded"].cuda(non_blocking=non_blocking)
+        eos_positions = sample["eos_positions"].cuda(non_blocking=non_blocking)
+        max_seqlen = int(sample["max_seqlen"].item()) if "max_seqlen" in sample else int(
+            (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]).max().item()
+        )
+
+        cur_len = tokens.shape[-1]
+        # if cur_len > seq_len:
+        #     raise RuntimeError(
+        #         f"packed tokens length {cur_len} exceeds seq_len={seq_len}; "
+        #         "raise training.seq_length or reduce train_mbs"
+        #     )
+        assert int(cu_seqlens_padded[-1].item()) == cur_len, (
+            f"cu_seqlens_padded[-1]={int(cu_seqlens_padded[-1].item())} != tokens length {cur_len}"
+        )
+
+        loss_mask = (labels != -100).to(torch.float)
+        full_loss_mask = loss_mask
 
         image_input_mask = None
         cp_img_num, images_padded, vision_data, vision_grid_thw = None, None, None, None
-        if len(vision_data_l) > 0:
+        if sample.get("vision_data") is not None:
             cp_img_num, images_padded, vision_data, vision_grid_thw = self._padding_images(
-                vision_data_l, vision_grid_thw_l
+                [sample["vision_data"]], [sample["vision_grid_thw"]]
             )
-            image_input_mask = torch.cat(image_input_mask_l, dim=0).cuda(non_blocking=non_blocking)
+            image_input_mask = sample["image_input_mask"].cuda(non_blocking=non_blocking)
             vision_data = vision_data.cuda(non_blocking=non_blocking)
             vision_grid_thw = vision_grid_thw.cuda(non_blocking=non_blocking)
 
-        full_loss_mask = loss_mask
-        if mpu.get_context_parallel_world_size() > 1:
-            labels = get_tensor_on_this_cp_rank(labels, 1, key_name="labels")
-            loss_mask = get_tensor_on_this_cp_rank(loss_mask, 1, key_name="loss_mask")
+        is_source = sample.get("is_source").cuda(non_blocking=non_blocking)
 
-        input_features = None
-        feature_attention_mask = None
-        video_second_per_grid = None
-        if len(input_features_l) > 0:
-            input_features = torch.cat(input_features_l, dim=0).cuda(non_blocking=non_blocking)
-            feature_attention_mask = torch.cat(feature_attention_mask_l,
-                                               dim=0).cuda(non_blocking=non_blocking)
-            video_second_per_grid = torch.cat(video_second_per_grid_l,
-                                              dim=0).cuda(non_blocking=non_blocking)
+        # GradCache 阶段2 (use_gbs_embedding_in_loss) 写入 sample 的回放数据:
+        # embedding 梯度切片 / logit_scale 梯度 / 阶段2 真实指标。
+        embeddings_grad = sample.get("embeddings_grad")
+        logit_scale_grad = sample.get("logit_scale_grad")
+        cache_metrics = sample.get("cache_metrics")
 
-        audio_feature = None
-        if len(audio_feature_l) > 0:
-            audio_feature = torch.cat(audio_feature_l, dim=0).cuda(non_blocking=non_blocking)
+        # HF PairQwen35EmbCollator 对齐：batch 级监督信号（可选）
+        relevant_score = sample.get("relevant_score")
+        if relevant_score is not None:
+            relevant_score = relevant_score.cuda(non_blocking=non_blocking)
+        teacher_scores = sample.get("teacher_scores")
+        if teacher_scores is not None:
+            teacher_scores = teacher_scores.cuda(non_blocking=non_blocking)
+
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_padded,
+            cu_seqlens_kv=cu_seqlens_padded,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+        )
 
         batch = {
             "tokens": tokens,
@@ -223,16 +223,22 @@ class Wemm3EmbeddingPrepareDataForward(PrepareDataForward):
             "pixel_values": vision_data,
             "cp_img_num": cp_img_num,
             "images_padded": images_padded,
-            "input_features": input_features,
-            "feature_attention_mask": feature_attention_mask,
-            "video_second_per_grid": video_second_per_grid,
-            "audio_feature": audio_feature,
-            "meta_info": meta_info_l if len(meta_info_l) > 0 else None,
+            "input_features": None,
+            "feature_attention_mask": None,
+            "video_second_per_grid": None,
+            "audio_feature": None,
+            "is_source": is_source,
+            "embeddings_grad": embeddings_grad,
+            "logit_scale_grad": logit_scale_grad,
+            "cache_metrics": cache_metrics,
+            "cu_seqlens_padded": cu_seqlens_padded,
+            "eos_positions": eos_positions,
+            "max_seqlen": max_seqlen,
+            "packed_seq_params": packed_seq_params,
+            "relevant_score": relevant_score,
+            "teacher_scores": teacher_scores,
         }
 
-        only_return_last_hidden_state = batches[0]['only_return_last_hidden_state'
-                                                  ] if 'only_return_last_hidden_state' in batches[
-                                                      0] else False
         fwd_kwargs = dict(
             input_ids=batch["tokens"],
             position_ids=batch["position_ids"],
@@ -243,14 +249,6 @@ class Wemm3EmbeddingPrepareDataForward(PrepareDataForward):
             image_input_mask=batch["image_input_mask"],
             images_padded=batch["images_padded"],
             cp_img_num=batch["cp_img_num"],
-            only_return_last_hidden_state=only_return_last_hidden_state,
+            packed_seq_params=packed_seq_params,
         )
-        if batch["input_features"] is not None:
-            fwd_kwargs["input_features"] = batch["input_features"]
-            fwd_kwargs["feature_attention_mask"] = batch["feature_attention_mask"]
-            fwd_kwargs["video_second_per_grid"] = batch["video_second_per_grid"]
-
-        if audio_feature is not None:
-            fwd_kwargs["audio_feature"] = audio_feature
-
         return batch, fwd_kwargs

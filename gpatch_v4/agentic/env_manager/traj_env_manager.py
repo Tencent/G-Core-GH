@@ -28,6 +28,47 @@ from gpatch_v4.utils.data_manipulate_utils import aggregate_metrics
 from gpatch_v4.utils.str_utils import contains_renderable_field
 
 
+def make_invalid_traj_dummy_batch(
+    metric_schema=(),
+    pad_token_id=None,
+    routed_experts_shape=None,
+):
+    """Build a THD/BSHD-safe placeholder for empty or failed trajectories.
+
+    GRPO THD packing requires ``sequence_lengths == tokens.numel() >= 2``.
+    The response mask is all-False so the sample contributes no PPO loss.
+    A length-2 placeholder also gets a non-zero padded budget in
+    ``convert_mbs_for_pack_seq`` (unlike the old ``sequence_lengths=0`` dummy).
+    """
+    pad_id = 0 if pad_token_id is None else int(pad_token_id)
+    # 2 tokens → shifted axis length 1 for mask / rollout_log_probs.
+    tokens = torch.tensor([pad_id, pad_id], dtype=torch.long)
+    result = {
+        "tokens": [tokens],
+        "prompt_lengths": [torch.tensor(1, dtype=torch.long)],
+        "sequence_lengths": [torch.tensor(2, dtype=torch.long)],
+        "rewards": [torch.tensor(0.0, dtype=torch.float)],
+        "mask": [torch.tensor([False], dtype=torch.bool)],
+        "position_ids": [
+            torch.arange(2, dtype=torch.long).view(1, 1, 2).expand(3, 1, 2).contiguous()
+        ],
+        "image_input_mask": [torch.zeros(1, 2, dtype=torch.bool)],
+        "rollout_log_probs": [torch.tensor([0.0], dtype=torch.float)],
+    }
+    if routed_experts_shape is not None:
+        num_layers, moe_router_topk = routed_experts_shape
+        assert num_layers > 0 and moe_router_topk > 0, routed_experts_shape
+        dummy_experts = torch.arange(moe_router_topk, dtype=torch.int32)
+        result["routed_experts"] = [
+            dummy_experts.view(1, 1, moe_router_topk).expand(
+                2, num_layers, moe_router_topk
+            ).contiguous()
+        ]
+    for name in metric_schema or ():
+        result[name] = [torch.tensor(0.0, dtype=torch.float)]
+    return result
+
+
 class TrajEnvManager(EnvManagerStrMixin):
     """Lightweight env manager that runs exactly one trajectory.
 
@@ -71,6 +112,21 @@ class TrajEnvManager(EnvManagerStrMixin):
     #  Public API
     # ------------------------------------------------------------------ #
 
+    def _router_replay_shape(self) -> Optional[tuple[int, int]]:
+        """Return sampler routing ``(num_layers, topk)`` when replay is enabled."""
+        if not self.rl_config.training.moe_router_replay:
+            return None
+
+        num_layers = self.rl_config.training.moe_router_replay_num_layers
+        moe_router_topk = self.rl_config.training.moe_router_replay_topk
+        if num_layers is None or moe_router_topk is None:
+            raise ValueError(
+                "MoE router replay layout was not resolved before agentic rollout; "
+                "RolloutController.setup must populate "
+                "training.moe_router_replay_num_layers/topk"
+            )
+        return int(num_layers), int(moe_router_topk)
+
     def run(self, seed: int, ppo_step: int, data: Dict[str, Any]) -> Dict[str, List[Any]]:
         """Run a single trajectory and return a rollout_batch dict."""
         self.sampling_seed_offset = seed * 10 + self.env_config["env_id"]
@@ -80,9 +136,17 @@ class TrajEnvManager(EnvManagerStrMixin):
         while not rollout_cache.terminated:
             lm_output = self._make_decision(rollout_cache)
             stop_reason = lm_output.get("stop_reason")
-            if stop_reason == GenerateStopReason.FINISH:
+            if stop_reason in (
+                GenerateStopReason.FINISH,
+                GenerateStopReason.MAX_GEN_LENGTH,
+            ):
+                # Both reasons contain a sampled response. Let env.step decide
+                # whether consuming that response terminates the trajectory.
                 rollout_cache = self._step(lm_output)
-            if stop_reason == GenerateStopReason.MAX_LENGTH or stop_reason == GenerateStopReason.ABORT:
+            elif stop_reason in (
+                GenerateStopReason.MAX_LENGTH,
+                GenerateStopReason.ABORT,
+            ):
                 break
 
         return self._formulate_rollout_batch(rollout_cache)
@@ -199,6 +263,39 @@ class TrajEnvManager(EnvManagerStrMixin):
 
         content = rollout_cache.history[-1]
 
+        if self.rl_config.training.moe_router_replay:
+            routed_experts = lm_output.pop("routed_experts", None)
+            assert routed_experts is not None, (
+                "moe_router_replay is enabled, but the agentic sampler response "
+                "does not contain routed_experts"
+            )
+            assert torch.is_tensor(routed_experts) and routed_experts.ndim == 3, (
+                "routed_experts must be a [seq, layer, topk] tensor, got "
+                f"{type(routed_experts)=}, "
+                f"shape={getattr(routed_experts, 'shape', None)}"
+            )
+            expected_seq_len = input_ids.shape[1] + len(response_ids)
+            assert routed_experts.shape[0] == expected_seq_len, (
+                "agentic routing must cover the complete sampler request: "
+                f"{routed_experts.shape[0]=} != {expected_seq_len=}"
+            )
+            expected_shape = self._router_replay_shape()
+            assert expected_shape is not None
+            assert tuple(routed_experts.shape[1:]) == expected_shape, (
+                "agentic routing layer/topk shape mismatch: "
+                f"{tuple(routed_experts.shape[1:])=} != {expected_shape=}"
+            )
+
+            # The sampler returns routing for the complete request prefix plus
+            # this turn's response. Keep only the current turn's suffix here so
+            # every history item remains self-contained when a trajectory is
+            # truncated or branched. clone() avoids retaining the full tensor's
+            # backing storage through a view.
+            current_turn_seq_len = len(content["prompt_ids"]) + len(response_ids)
+            current_turn_start = expected_seq_len - current_turn_seq_len
+            assert current_turn_start >= 0
+            content["routed_experts"] = routed_experts[current_turn_start:].clone()
+
         output_logprobs = lm_output.get("output_logprobs")
         if output_logprobs is not None:
             content["rollout_log_probs"] = (
@@ -219,7 +316,15 @@ class TrajEnvManager(EnvManagerStrMixin):
         log_debug(
             f"make decision output content: {self.tokenizer.decode(response_ids, skip_special_tokens=False)}"
         )
-        lm_output["stop_reason"] = GenerateStopReason.FINISH
+        engine_finish_reason = lm_output.get("engine_finish_reason")
+        if engine_finish_reason == "length":
+            lm_output["stop_reason"] = GenerateStopReason.MAX_GEN_LENGTH
+        elif engine_finish_reason == "abort":
+            lm_output["stop_reason"] = GenerateStopReason.ABORT
+        else:
+            # SGLang uses "stop" for EOS / a configured stop token. Keep the
+            # historical fallback for backends that do not expose a reason.
+            lm_output["stop_reason"] = GenerateStopReason.FINISH
         return lm_output
 
     def _step(self, lm_output: Dict) -> RolloutCache:
@@ -335,15 +440,15 @@ class TrajEnvManager(EnvManagerStrMixin):
             rollout_cache.history.pop(-1)
 
         if len(rollout_cache.history) == 0:
-            dummy_result = {
-                "tokens": [torch.tensor([0], dtype=torch.long)],
-                "prompt_lengths": [torch.tensor(0, dtype=torch.long)],
-                "sequence_lengths": [torch.tensor(0, dtype=torch.long)],
-                "rewards": [torch.tensor([0], dtype=torch.float)],
-                "mask": [torch.tensor([0], dtype=torch.bool)],
-                "rollout_log_probs": [torch.tensor([0.0], dtype=torch.float)],
-            }
-            return dummy_result
+            assert self.tokenizer is not None
+            tokenizer = self.tokenizer
+            pad_token_id = getattr(tokenizer, "pad_token_id", 0)
+            metric_schema = getattr(self, "metric_schema", ())
+            return make_invalid_traj_dummy_batch(
+                metric_schema,
+                pad_token_id,
+                routed_experts_shape=self._router_replay_shape(),
+            )
 
         scores = [item["reward"] for item in rollout_cache.history]
 
@@ -392,6 +497,36 @@ class TrajEnvManager(EnvManagerStrMixin):
             "position_ids": [position_ids],
             "image_input_mask": [image_input_mask],
         }
+
+        if self.rl_config.training.moe_router_replay:
+            expected_shape = self._router_replay_shape()
+            assert expected_shape is not None
+            routed_experts_by_turn = []
+            for turn_idx, item in enumerate(rollout_cache.history):
+                turn_routed_experts = item.get("routed_experts")
+                assert turn_routed_experts is not None, (
+                    "moe_router_replay is enabled, but trajectory turn "
+                    f"{turn_idx} has no routed_experts"
+                )
+                assert torch.is_tensor(turn_routed_experts) and turn_routed_experts.ndim == 3
+                turn_seq_len = len(item["prompt_ids"]) + len(item["response_ids"])
+                assert turn_routed_experts.shape[0] == turn_seq_len, (
+                    "agentic routing is not token-aligned for trajectory turn "
+                    f"{turn_idx}: {turn_routed_experts.shape[0]=} != {turn_seq_len=}"
+                )
+                assert tuple(turn_routed_experts.shape[1:]) == expected_shape, (
+                    "agentic routing layer/topk shape mismatch for trajectory turn "
+                    f"{turn_idx}: {tuple(turn_routed_experts.shape[1:])=} != "
+                    f"{expected_shape=}"
+                )
+                routed_experts_by_turn.append(turn_routed_experts)
+
+            routed_experts = torch.cat(routed_experts_by_turn, dim=0)
+            assert routed_experts.shape[0] == seq_len, (
+                "final agentic routing is not token-aligned: "
+                f"{routed_experts.shape[0]=} != {seq_len=}"
+            )
+            result["routed_experts"] = [routed_experts]
 
         if rollout_log_probs:
             rlp = torch.tensor(rollout_log_probs, dtype=torch.float)

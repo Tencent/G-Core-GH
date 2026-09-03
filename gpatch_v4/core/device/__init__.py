@@ -45,6 +45,12 @@ def get_device_backend_name() -> str:
     return _DEVICE_BACKEND.name
 
 
+def get_kernel_device_name() -> str:
+    # 调用 kernel 的 device name
+    # 同是 cuda，也可以有不同的 name
+    return _DEVICE_BACKEND.kernel_device_name
+
+
 def get_dist_backend() -> str:
     return _DEVICE_BACKEND.dist_backend
 
@@ -59,6 +65,14 @@ def get_visible_devices_env_var() -> str:
 
 def get_propagate_env_keys() -> list[str]:
     return _DEVICE_BACKEND.propagate_env_keys
+
+
+def sync_param_offload() -> bool:
+    return _DEVICE_BACKEND.sync_param_offload
+
+
+def preprocess_before_build_sgl_engine() -> None:
+    return _DEVICE_BACKEND.preprocess_before_build_sgl_engine()
 
 
 def get_flash_attn_varlen_func(max_segment_len=4096):

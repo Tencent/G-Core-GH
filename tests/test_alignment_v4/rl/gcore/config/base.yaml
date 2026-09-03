@@ -17,7 +17,7 @@ training:
   use_bt_rm_reward: True
   use_fast_tokenizer: True
   # determinism + fresh-start switches for the alignment (apply_deterministic_mode
-  # also forces GPATCH_DISABLE_FA3 when attention_backend=flash; auto_load=False so a
+  # also sets disable_flash_attn_3 when attention_backend=flash; auto_load=False so a
   # leftover save_*/iter_* is never auto-resumed).
   apply_deterministic_mode: True
   attention_backend: flash

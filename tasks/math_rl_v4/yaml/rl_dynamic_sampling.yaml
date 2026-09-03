@@ -1,0 +1,22 @@
+# @package _global_
+
+defaults:
+  - rl_no_dynamic_sampling_baseline
+  - _self_
+
+training:
+  dynamic_sampling:
+    oversampling_ratio: 1.2
+    ema_decay: 0.9
+    init_expansion_ratio: 1.0
+    max_expansion_ratio: 10.0
+    max_refill_times: 3
+    # consumed_data_epochs: stop after actually consuming max_epochs of prompts
+    # (DS oversamples, so ppo step count will be smaller than fixed_ppo_steps).
+    epoch_mode: fixed_ppo_steps
+
+checkpoint:
+  save_ckpt_path: save_qwen_2_5_1_5b_grpo_dynamic_sampling_eval
+
+policy:
+  rollout_gen_type: dynamic_sampling

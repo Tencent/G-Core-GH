@@ -24,6 +24,15 @@ class BaseExternalReward(ABC):
         for rb, upd in zip(rollout_batches, reward_updates):
             rb.update(upd)
     """
+
+    # Whether several ``calc_external_reward`` calls may overlap on this instance.
+    # The batched pipeline awaits each call before issuing the next, so per-call
+    # state on the instance, the class or a module singleton is safe there;
+    # ``training.stream_external_reward`` overlaps them and is declined unless a
+    # reward sets this, meaning every client, buffer and singleton it touches
+    # tolerates concurrent callers.
+    supports_concurrent_calls: bool = False
+
     def __init__(self, config=None, tokenizer=None):
         self.config = config
         self.tokenizer = tokenizer
@@ -58,3 +67,27 @@ class BaseExternalReward(ABC):
             One update dict per rollout batch.
         """
         ...
+
+
+def declares_concurrent_calls(reward) -> bool:
+    """Whether ``reward`` has opted in to overlapping ``calc_external_reward`` calls.
+
+    Reads the field ``BaseExternalReward`` declares, which defaults to off:
+    inheriting it and saying nothing means no.  A reward that never subclassed
+    the base class -- ``_setup_external_reward`` requires only a
+    ``calc_external_reward`` attribute -- raises here instead, which is where
+    a config asking for streaming should stop.
+    """
+    return bool(reward.supports_concurrent_calls)
+
+
+def stream_external_reward_declined_reason(reward) -> Optional[str]:
+    """Why ``training.stream_external_reward`` must be declined, or None to proceed."""
+    if declares_concurrent_calls(reward):
+        return None
+    return (
+        f"{type(reward).__name__} has not set supports_concurrent_calls=True; "
+        "streaming keeps several calc_external_reward calls in flight on one "
+        "instance, so any per-call state it parks on the class or in a "
+        "singleton is shared between them"
+    )

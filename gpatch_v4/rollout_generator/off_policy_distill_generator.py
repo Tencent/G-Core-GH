@@ -7,6 +7,7 @@ import torch
 import torch.distributed
 import torch.distributed as dist
 from torch.distributed.tensor import DeviceMesh
+from typing_extensions import override
 
 from megatron.core import mpu
 
@@ -19,6 +20,11 @@ from gpatch_v4.core.parallel_state import (
     is_mp_and_cp_head,
 )
 from gpatch_v4.rollout_generator.base_generator import BaseRolloutGenerator
+from gpatch_v4.transfer.utils import (
+    TqPayloadType,
+    async_offload_to_tq,
+    async_restore_from_tq,
+)
 from gpatch_v4.utils import (
     BroadcastUtils,
     clear_memory,
@@ -51,7 +57,7 @@ def build_cuda_mesh_from_group(group, mesh_dim_names):
     return mesh, group_ranks
 
 
-class OffPolicyDistillRolloutGenerator:
+class OffPolicyDistillRolloutGenerator(BaseRolloutGenerator):
     """Rollout generator for off-policy distillation.
 
     Supports both teacher-generated and data-driven rollouts, optionally
@@ -75,21 +81,23 @@ class OffPolicyDistillRolloutGenerator:
         gen_rm_client,
         bt_rm_client,
         run_eval=False,
-        teacher_client=None
+        teacher_client=None,
     ):
-        self.config = config
-        self.sampler_client = sampler_client
-        self.teacher_client = teacher_client
-        self.run_eval = run_eval
         assert gen_rm_client is None
         assert bt_rm_client is None
-
+        super().__init__(config, sampler_client, gen_rm_client, bt_rm_client, run_eval)
+        self.teacher_client = teacher_client
         self.training_config = config.training
         self.sampling_repeat = 1
         self.process_prefix = 'eval_' if run_eval else ''
         self.sample_idx = 0
         self.is_mp_and_cp_head = is_mp_and_cp_head()
 
+    @override
+    def _init_sampling_repeat(self) -> int:
+        return 1
+
+    @override
     async def sampler_gen_out(
         self, rbs: List[Dict[str, List[Any]]], sampler_idx, curr_train_step, sidx, repeat_n
     ):
@@ -103,10 +111,12 @@ class OffPolicyDistillRolloutGenerator:
                 rollout_batch,
                 repeat_n=repeat_n,
                 load_aware=self.config.training.load_aware_sampler_routing,
+                is_eval=self.run_eval,
             )
             cos.append(co)
         return await asyncio.gather(*cos)
 
+    @override
     async def rollout_samples(self, data_iter, num_microbatches, curr_train_step, dp_rank=None):
         """Generate rollout samples using the sampler.
 
@@ -182,53 +192,65 @@ class OffPolicyDistillRolloutGenerator:
         cpu_barrier()
         return rbs
 
-    async def issue_teacher_logits(self, rbs: List[Dict[str, List[Any]]], curr_ppo_step):
-        """Submit teacher logit computation requests."""
+    async def issue_teacher_hidden_states(self, rbs: List[Dict[str, List[Any]]], curr_ppo_step):
+        """Submit Teacher hidden-state computation requests."""
         s_idx = self.sample_idx
-        cos = []
-        for rbi, rollout_batch in enumerate(rbs):
-            co = self.teacher_client.issue_calc_logits(rollout_batch, curr_ppo_step, s_idx + rbi)
-            cos.append(co)
-        return await asyncio.gather(*cos)
 
-    async def get_teacher_logits(self, curr_ppo_step, num_microbatches):
-        """Retrieve teacher logit results."""
+        async def issue_one(batch, sample_idx):
+            payload = await async_offload_to_tq(
+                batch,
+                curr_ppo_step,
+                TqPayloadType.DICT,
+            )
+            return await self.teacher_client.issue_calc_hidden_states(
+                payload, curr_ppo_step, sample_idx
+            )
+
+        return await asyncio.gather(
+            *[issue_one(rollout_batch, s_idx + rbi) for rbi, rollout_batch in enumerate(rbs)]
+        )
+
+    async def get_teacher_hidden_states(
+        self,
+        rbs: List[Dict[str, List[Any]]],
+        curr_ppo_step,
+    ):
+        """Fetch Teacher TQ slots and restore hidden states into ``rbs``."""
         s_idx = self.sample_idx
-        cos = []
-        for rbi in range(num_microbatches):
-            co = self.teacher_client.get_calc_logits_result(curr_ppo_step, s_idx + rbi)
-            cos.append(co)
-        return await asyncio.gather(*cos)
 
-    async def calc_teacher_logits(self, rbs, num_microbatches, curr_train_step):
-        """Compute teacher logits by issuing and retrieving results.
+        async def get_one(rollout_batch, sample_idx):
+            result = await self.teacher_client.get_calc_hidden_states_result(
+                curr_ppo_step, sample_idx
+            )
+            restored = await async_restore_from_tq(result["teacher_hidden_states"])
+            hidden_states = restored["teacher_hidden_states"]
+            assert len(hidden_states) == len(next(iter(rollout_batch.values())))
+            rollout_batch["teacher_hidden_states"] = hidden_states
 
-        Parameters
-        ----------
-        rbs : list of dict
-        num_microbatches : int
-        curr_train_step : int
+        return await asyncio.gather(
+            *[get_one(rollout_batch, s_idx + rbi) for rbi, rollout_batch in enumerate(rbs)]
+        )
 
-        Returns
-        -------
-        tuple[list of dict, object]
-            ``(rollout_batches, teacher_logits)``.
-        """
+    async def calc_teacher_hidden_states(
+        self,
+        rbs: List[Dict[str, List[Any]]],
+        curr_train_step: int,
+    ) -> None:
+        """Issue Teacher compute, then restore hidden states from TQ."""
         await self.teacher_client.mark_ppo_step_begin(0, curr_train_step)
         cpu_barrier()
+
         if self.is_mp_and_cp_head:
-            await self.issue_teacher_logits(rbs, curr_train_step)
+            await self.issue_teacher_hidden_states(rbs, curr_train_step)
         cpu_barrier()
-        if self.is_mp_and_cp_head:
-            #TODO: 这里估计不好直接把所有结果一次性全拿回来，后面考虑拆掉
-            teacher_logits = await self.get_teacher_logits(curr_train_step, num_microbatches)
-        else:
-            teacher_logits = None
+
+        await self.get_teacher_hidden_states(rbs, curr_train_step)
         cpu_barrier()
+
         await self.teacher_client.mark_ppo_step_end(0, curr_train_step)
         cpu_barrier()
-        return rbs, teacher_logits
 
+    @override
     async def __call__(self, data_iter, num_microbatches, curr_train_step):
         #TODO: support timer record times per stage
         dp_rank = mpu.get_data_parallel_rank()
@@ -244,10 +266,12 @@ class OffPolicyDistillRolloutGenerator:
         else:
             rbs = self.gen_data_from_data_iter(data_iter, num_microbatches, curr_train_step)
 
+        logging_memory_usage_details("memory tracking before bcast data", rank=0)
+        rbs = BroadcastUtils.broadcast_rollout_batch(rbs)
+        logging_memory_usage_details("memory tracking after bcast data", rank=0)
+
         if self.config.training.enable_teacher_kl_loss and self.config.training.setup_teacher_in_independent_topo:
-            rbs, teacher_logits = await self.calc_teacher_logits(
-                rbs, num_microbatches, curr_train_step
-            )
+            await self.calc_teacher_hidden_states(rbs, curr_train_step)
 
         if self.is_mp_and_cp_head:
             assert check_rollout_batches(rbs), f"rbs format error, may need pop('ready'): {rbs=}"
@@ -255,20 +279,7 @@ class OffPolicyDistillRolloutGenerator:
         if offload_process_group:
             reload_process_groups()
 
-        logging_memory_usage_details("memory tracking before bcast data", rank=0)
-        # 这里单独处理
-        rollout_batches = BroadcastUtils.broadcast_rollout_batch(rbs)
         clear_memory()
-        logging_memory_usage_details("memory tracking after bcast data", rank=0)
-
-        if self.config.training.enable_teacher_kl_loss and self.config.training.setup_teacher_in_independent_topo:
-            # logits 太大
-            # 先只在 mp_and_cp_head 上面获得 teacher_logits，且只能在 cpu 上
-            if self.is_mp_and_cp_head:
-                for rbi, (rollout_batch, b_teacher_logits) in enumerate(
-                    zip(rollout_batches, teacher_logits)
-                ):
-                    rollout_batch.update(b_teacher_logits)
 
         self.sample_idx += num_microbatches
-        return rollout_batches
+        return rbs

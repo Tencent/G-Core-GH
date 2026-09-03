@@ -173,6 +173,7 @@ class SamplerClient(
         repeat_n: int,
         load_aware: bool = False,
         busy_sleep_s: float = 10.0,
+        is_eval: bool = False,
     ) -> Dict[str, List[Any]]:
         """Send a generation request to the sampler.
 
@@ -192,6 +193,8 @@ class SamplerClient(
         busy_sleep_s : float
             Seconds to sleep when all clusters are busy (only used when
             ``load_aware=True``).
+        is_eval : bool
+            When True, sampler uses ``eval_*`` sampling overrides if set.
 
         Returns
         -------
@@ -234,6 +237,7 @@ class SamplerClient(
             'sample_idx': sidx,
             'sampling_repeat': repeat_n,
             'batched_data': batched_data,
+            'is_eval': is_eval,
         }
         fut = self.rpc_client_lst[sampler_idx].call(target_ep, 'generate', req_dict)
         resp = await fut
@@ -335,6 +339,18 @@ class SamplerClient(
         if self._is_rpc_leader():
             await self._batch_rpc_call(sampler_idx, 'flush_cache', {})
 
+    async def abort_all(self, sampler_idx: int = 0):
+        """Abort all in-flight generation requests on every cluster of a sampler.
+
+        Parameters
+        ----------
+        sampler_idx : int, optional
+            Sampler index (defaults to 0; current code only supports a
+            single homogeneous sampler).
+        """
+        if self._is_rpc_leader():
+            await self._batch_rpc_call(sampler_idx, 'abort_all_requests', {})
+
     async def get_all_loads(self, sampler_idx: int = 0) -> List[Dict[str, Any]]:
         """Query sglang load metrics from all clusters in parallel.
 
@@ -369,6 +385,7 @@ class SamplerClient(
         repeat_n: int,
         load_aware: bool = False,
         busy_sleep_s: float = 10.0,
+        is_eval: bool = False,
     ):
         """Send a generation request without awaiting the result.
 
@@ -390,6 +407,8 @@ class SamplerClient(
         busy_sleep_s : float
             Seconds to sleep when all clusters are busy (only used when
             ``load_aware=True``).
+        is_eval : bool
+            When True, sampler uses ``eval_*`` sampling overrides if set.
 
         Returns
         -------
@@ -430,6 +449,7 @@ class SamplerClient(
             'sample_idx': sidx,
             'sampling_repeat': repeat_n,
             'batched_data': batched_data,
+            'is_eval': is_eval,
         }
         return self.rpc_client_lst[sampler_idx].fire(target_ep, 'generate', req_dict)
 

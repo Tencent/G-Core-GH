@@ -1,0 +1,245 @@
+# @package _global_
+# DeepSeek-V4 end-to-end smoke config for two FrozenLake environments routed
+# to two OPD teachers. GPU layout: policy 16 nodes + sampler 4 nodes +
+# teachers 4 + 4 nodes, with 8 GPUs per node (28 nodes / 224 GPUs total).
+
+placement_type: disaggregated
+
+training:
+  training_backend: fsdp2
+  use_gen_rm_reward: false
+  use_bt_rm_reward: false
+  use_external_reward: false
+  use_fast_tokenizer: true
+  enable_thinking: false
+  seq_length: 16384
+  rollout_gbs: 64
+  rollout_mbs: 1
+  sampling_repeat_n: 1
+  sampling_keep_n: 1
+  train_gbs: 64
+  train_mbs: 1
+  num_train_epoches: 1
+  # MultiEnvSeedDataset uses this value as its row count. With rollout_gbs=256
+  # and num_train_epoches=1, 256 rows produce exactly one PPO step.
+  total_ppo_step: 64
+  save_interval: 5
+  eval_interval: 0
+  eval_rollout_gbs: 16
+  eval_rollout_mbs: 1
+  eval_before_train: false
+  build_from_mbridge: true
+  single_controller: true
+  async_rollout: true
+  rollout_max_staleness: 0
+  ppo_max_epochs_2: 1
+  data_parallel_random_init: false
+  moe_pad_with_random_tokens: true
+  auto_load_from_save_ckpt: true
+  early_swap_model: true
+  recompute: true
+  num_agent_loop_workers: 8
+  agent_loop_actor_cls: >-
+    gpatch_v4.rollout_generator.async_rollout.env_agent_loop_actor.EnvAgentLoopActor
+  metrics_report:
+    - format_penalty
+    - action_is_effective
+    - action_is_valid
+    - success
+    - num_actions
+  agentic:
+    train_env_manager:
+      max_traj_per_env: 32
+      group_per_worker: 32
+      llm_proxy:
+        proxy_type: engine
+    env_cfg_templates:
+      - env_type: frozen_lake_teacher_a
+        custom_env_cls: >-
+          gpatch_v4.agentic.env.frozenlake.frozenlake_env:FrozenLakeEnv
+        env_manager_cls: >-
+          tasks.agentic_rl.dsv4_traj_env_manager.Dsv4TrajEnvManager
+        env_weight: 1.0
+        max_steps: 1
+        max_tokens_per_step: 32
+        agent_system_template: >-
+          You solve FrozenLake by replying with exactly one move.
+        agent_template: |
+          Observation:
+          {observation}
+          Reply with <answer>Left</answer>, <answer>Down</answer>,
+          <answer>Right</answer>, or <answer>Up</answer>.
+        env_config:
+          teacher_type: teacher_a
+          render_mode: text
+          size: 4
+          p: 1.0
+          is_slippery: false
+          max_steps: 1
+          format_penalty: -0.01
+          action_pattern: "<answer>(.*?)</answer>"
+      - env_type: frozen_lake_teacher_b
+        custom_env_cls: >-
+          gpatch_v4.agentic.env.frozenlake.frozenlake_env:FrozenLakeEnv
+        env_manager_cls: >-
+          tasks.agentic_rl.dsv4_traj_env_manager.Dsv4TrajEnvManager
+        env_weight: 1.0
+        max_steps: 1
+        max_tokens_per_step: 32
+        agent_system_template: >-
+          You solve FrozenLake by replying with exactly one move.
+        agent_template: |
+          Observation:
+          {observation}
+          Reply with <answer>Left</answer>, <answer>Down</answer>,
+          <answer>Right</answer>, or <answer>Up</answer>.
+        env_config:
+          teacher_type: teacher_b
+          render_mode: text
+          size: 4
+          p: 1.0
+          is_slippery: false
+          max_steps: 1
+          format_penalty: -0.01
+          action_pattern: "<answer>(.*?)</answer>"
+
+data:
+  py_path: tasks/agentic_rl/multi_teacher_opd/multi_env_dataset.py
+  fn_name: get_dataset_and_dataloader
+  dataloader_num_workers: 1
+  dataloader_pin_memory: true
+
+policy:
+  dist_config:
+    nnodes: 16
+    num_gpus_per_node: 8
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8
+    context_parallel_size: 2
+  model_arch: deepseek_v4
+  attn_implementation: fused
+  indexer_backend: fused
+  hf_model_path: /mnt/wfs/mmhuizhouwfssz/project_luban_infra/luban_infra/model_factory/lucasbai_DeepSeek-V4-Flash-FP8
+  hf_tokenizer_path: /mnt/wfs/mmhuizhouwfssz/project_luban_infra/luban_infra/model_factory/lucasbai_DeepSeek-V4-Flash-FP8
+  ref_hf_model_path: /mnt/wfs/mmhuizhouwfssz/project_luban_infra/luban_infra/model_factory/lucasbai_DeepSeek-V4-Flash-FP8
+  rollout_gen_type: on_policy_distill
+  fp8_qat: true
+  sampler_client:
+    rpc_type: ray
+    update_weight_max_size_mb: 256
+    update_weight_use_bucketed_ipc: true
+  teacher_client:
+    rpc_type: ray
+  gen_rm_client:
+    rpc_type: ray
+  bt_rm_client:
+    rpc_type: ray
+
+teachers:
+  teacher_a:
+    dist_config:
+      nnodes: 2
+      num_gpus_per_node: 8
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 8
+      context_parallel_size: 2
+    model_arch: deepseek_v4
+    attn_implementation: fused
+    indexer_backend: fused
+    hf_model_path: /mnt/wfs/mmhuizhouwfssz/project_luban_infra/luban_infra/model_factory/lucasbai_DeepSeek-V4-Flash-FP8
+    hf_tokenizer_path: /mnt/wfs/mmhuizhouwfssz/project_luban_infra/luban_infra/model_factory/lucasbai_DeepSeek-V4-Flash-FP8
+    forward_only_mbs: 1
+    wrap_with_ddp: false
+  teacher_b:
+    dist_config:
+      nnodes: 2
+      num_gpus_per_node: 8
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 8
+      context_parallel_size: 2
+    model_arch: deepseek_v4
+    attn_implementation: fused
+    indexer_backend: fused
+    hf_model_path: /mnt/wfs/mmhuizhouwfssz/project_luban_infra/luban_infra/model_factory/lucasbai_DeepSeek-V4-Flash-FP8
+    hf_tokenizer_path: /mnt/wfs/mmhuizhouwfssz/project_luban_infra/luban_infra/model_factory/lucasbai_DeepSeek-V4-Flash-FP8
+    forward_only_mbs: 1
+    wrap_with_ddp: false
+
+sampler:
+  backend: sglang
+  dist_config:
+    nnodes: 4
+    num_gpus_per_node: 8
+  model_info:
+    - model_arch: deepseek_v4
+      hf_model_path: ${policy.hf_model_path}
+      gen_rollout_py_path: gpatch_v4/agentic/generate_func.py
+      gen_rollout_fn_name: generate_func
+  infer_engine_configs:
+    - dist_config:
+        nnodes: 4
+        num_gpus_per_node: 8
+        tensor_model_parallel_size: 8
+      use_fast_tokenizer: true
+      gpu_memory_utilization: 0.5
+      max_running_requests: 64
+      temperature: 1.0
+      top_p: 0.9
+      generate_max_tokens: 2048
+      seed: null
+      override_infer_engine_config:
+        tokenizer_mode: deepseek_v4
+        reasoning_parser: deepseek_v4
+        swa_full_tokens_ratio: 0.3
+        prefill_max_requests: 16
+
+gen_rm:
+  dist_config:
+    nnodes: 0
+
+bt_rm:
+  dist_config:
+    nnodes: 0
+
+checkpoint:
+  load_ckpt_path: unittest_frozen_lake_mopd
+  save_ckpt_path: unittest_frozen_lake_mopd
+  convert_mcore_to_hf_online: false
+  mbridge_distributed_filesystem: true
+  no_load_optim: true
+  no_save_optim: true
+  override_tokenizer_special_token:
+    eos_token: "<｜end▁of▁sentence｜>"
+
+optimizer:
+  lr: 1.0e-6
+  lr_warmup_steps: 2
+  lr_decay_steps: 400
+  lr_decay_style: cosine
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+ppo:
+  advantage_type: g_opd
+  loss_func: opd
+  g_opd_use_base_model: false
+  g_opd_lambda: 1.0
+  g_opd_mix_reward_advantage: false
+  g_opd_teacher_routing_field: teacher_type
+  log_prob_top_k: 0
+  ppo_ratio_eps: 0.2
+  opd_teacher_kl_loss_beta: 0.0
+  grpo_kl_loss_beta: 0.0
+  ppo_entropy_bonus: 0.0
+  enable_off_policy_correction: true
+
+debug:
+  save_first_rollout_data: false
+  debug_engine_update_weight: false
+  trainer_return_ppo_step_metrics: true
+  disable_save_checkpoint: true

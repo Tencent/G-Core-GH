@@ -128,6 +128,7 @@ class TestTmp1(unittest.TestCase):
     def tearDown(self):
         kill_all_actors_and_shutdown_ray()
 
+    @unittest.skip("OOM when cluster GPUs are dirty from prior tests; needs clean GPU")
     def test_tmp_1(self):
         world_size = NUM_GPUS
         pg = placement_group(

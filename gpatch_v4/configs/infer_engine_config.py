@@ -6,6 +6,25 @@ from gpatch_v4.configs.utils import MappingProtocol
 
 
 @dataclass
+class GenerateParams(MappingProtocol):
+    """Decode sampling hyperparameters for train or eval generation.
+
+    Attributes
+    ----------
+    temperature : float
+    top_k : int
+        ``-1`` / ``0`` disables top-k (engine maps non-positive to ``-1``).
+    top_p : float
+    min_p : float
+        ``0.0`` disables min-p.
+    """
+    temperature: float = field(default=1.0, metadata={"help": "sampling temperature"})
+    top_k: int = field(default=-1, metadata={"help": "top-k; <=0 disables"})
+    top_p: float = field(default=1.0, metadata={"help": "top-p"})
+    min_p: float = field(default=0.0, metadata={"help": "min-p; 0 disables"})
+
+
+@dataclass
 class BaseInferEngineConfig(MappingProtocol):
     """Base inference engine configuration.
 
@@ -30,11 +49,18 @@ class InferEngineConfig(BaseInferEngineConfig):
     gpu_memory_utilization : float
     max_running_requests : int or None
     temperature : float
+        Legacy flat field; copied into ``generate_params`` when that is unset.
     top_k : int
-        ``-1`` disables top-k.
+        Legacy flat field; ``-1`` disables top-k.
     top_p : float
+        Legacy flat field.
     min_p : float
-        ``0.0`` disables min-p.
+        Legacy flat field; ``0.0`` disables min-p.
+    generate_params : GenerateParams or None
+        Canonical train sampling params. ``None`` → filled from legacy flat
+        fields at startup via :meth:`ensure_generate_params`.
+    eval_generate_params : GenerateParams or None
+        Eval sampling params. ``None`` → reuse ``generate_params``.
     generate_max_tokens : int
     engine_seed: int
     seed : int
@@ -90,10 +116,25 @@ class InferEngineConfig(BaseInferEngineConfig):
     max_running_requests: Optional[int] = field(
         default=None, metadata={"help": "max running request"}
     )
-    temperature: float = field(default=1.0, metadata={"help": "ppo temperature"})
-    top_k: int = field(default=-1, metadata={"help": "ppo top-k"})
-    top_p: float = field(default=1.0, metadata={"help": "ppo top-p"})
-    min_p: float = field(default=0.0, metadata={"help": "min-p sampling, 0 disables"})
+    temperature: float = field(default=1.0, metadata={"help": "ppo temperature (legacy)"})
+    top_k: int = field(default=-1, metadata={"help": "ppo top-k (legacy)"})
+    top_p: float = field(default=1.0, metadata={"help": "ppo top-p (legacy)"})
+    min_p: float = field(default=0.0, metadata={"help": "min-p sampling, 0 disables (legacy)"})
+    generate_params: Optional[GenerateParams] = field(
+        default=None,
+        metadata={
+            "help":
+                "Canonical train generate sampling params. "
+                "If unset, filled from legacy temperature/top_k/top_p/min_p at startup."
+        },
+    )
+    eval_generate_params: Optional[GenerateParams] = field(
+        default=None,
+        metadata={
+            "help": "Eval generate sampling params. "
+                    "If unset, eval reuses generate_params."
+        },
+    )
     generate_max_tokens: int = field(default=128, metadata={"help": "generate max tokens"})
     seed: Optional[int] = field(default=42, metadata={"help": "prompt seed"})
     engine_seed: Optional[int] = field(default=42, metadata={"help": "engine seed"})
@@ -177,7 +218,44 @@ class InferEngineConfig(BaseInferEngineConfig):
         default=False,
         metadata={"help": "Set SGLANG_ENABLE_SPEC_V2=1 before starting sglang."},
     )
+    model_override_args: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help":
+                "Key-value pairs that override HuggingFace model config fields before the "
+                "inference engine loads the model. Passed as ``json_model_override_args`` "
+                "to sglang (e.g. ``{\\\"num_hidden_layers\\\": 10}`` to load only the first "
+                "10 layers). Ignored silently for vllm (not supported)."
+        },
+    )
     override_infer_engine_config: dict[str, Any] = field(default_factory=dict)
+
+    def ensure_generate_params(self) -> None:
+        """Fill ``generate_params`` from legacy flat fields when unset."""
+        if self.generate_params is None:
+            self.generate_params = GenerateParams(
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                min_p=self.min_p,
+            )
+
+    def resolve_generate_params(self, is_eval: bool = False) -> GenerateParams:
+        """Return train or eval :class:`GenerateParams`.
+
+        Parameters
+        ----------
+        is_eval : bool
+            Prefer ``eval_generate_params`` when set; otherwise ``generate_params``.
+
+        Returns
+        -------
+        GenerateParams
+        """
+        self.ensure_generate_params()
+        if is_eval and self.eval_generate_params is not None:
+            return self.eval_generate_params
+        return self.generate_params
 
     def __post_init__(self):
         assert self.load_format in [
@@ -188,3 +266,4 @@ class InferEngineConfig(BaseInferEngineConfig):
             "no_buffer",
             "extra_buffer",
         ], f"sgl_mamba_scheduler_strategy {self.sgl_mamba_scheduler_strategy} not supported"
+        self.ensure_generate_params()

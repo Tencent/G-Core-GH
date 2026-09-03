@@ -42,6 +42,10 @@ class ApplySamplingRolloutAttrLLM(ApplySamplingRolloutAttrBase):
         return rollout_batch
 
     @override
+    def cached_rollout_attrs(self) -> Dict[str, Dict[str, Any]]:
+        return self.data_cache
+
+    @override
     def remove_rollout_attr(self, rollout_batch: Dict[str, Any]) -> Dict[str, Any]:
         #TODO: 文本训练暂时用不着，后面再说
         return rollout_batch

@@ -15,6 +15,8 @@
 #     path already produces an HF-compatible directory by construction.
 #   * Dataset is a byte copy of math_rl_v4's; py_path points to the local copy
 #     so this task is self-contained.
+#   * mcore FP8: set fp8 / fp8_recipe / fp8_param_gather under
+#     override_transformer_config; ddp/optimizer are synced in code.
 
 training:
   training_backend: mcore
@@ -54,6 +56,11 @@ policy:
     csa_compress_ratios: [0, 0, 4, 128, 0]
     moe_layer_freq: [1, 1, 1, 1]
     dsa_indexer_loss_coeff: 0.0
+    # FP8 (ddp/optimizer synced in McoreEngine)
+    fp8: e4m3
+    fp8_recipe: blockwise
+    fp8_param_gather: True
+  post_wrap_with_ddp: True
 
 
 checkpoint:

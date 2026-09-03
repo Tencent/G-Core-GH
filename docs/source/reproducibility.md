@@ -48,7 +48,7 @@ What it does under the hood:
 
 5. **配置校验与冲突处理**：
    - 禁止 `checkpoint.skip_save_mcore_model=True`（HF bridge 来回转换有精度损失，破坏断点续训的确定性）。
-   - 若 `attention_backend=flash`，自动设 `GPATCH_DISABLE_FA3=1` 回退到 FA2（FA3 的确定性 backward 在 Hopper 上因全局 atomics 不可靠）。
+   - 若 `attention_backend=flash`，自动设 `training.disable_flash_attn_3=True` 回退到 FA2（FA3 的确定性 backward 在 Hopper 上因全局 atomics 不可靠）。
 
 ## Seed：不需要手动设置 / Seeds: no manual setup needed
 
@@ -85,7 +85,7 @@ The deterministic switch only guarantees "same input + same runtime → same out
 - **模型与数据**：相同的模型权重、tokenizer、数据集与顺序。
 - **seed 一致**：两次用同一个 seed（默认都是 42 即一致）。
 - **确定性开关常开**：两次都保持 `apply_deterministic_mode=True`。
-- **写死 attention backend**：`training.attention_backend` 默认是 `auto`，TE 会**根据环境（GPU 架构、序列长度、dtype 等）自动挑选** attention 后端，不同机器/不同 batch 选到的 kernel 可能不一样，从而破坏复现。复现时务必显式指定，例如 `+training.attention_backend=flash`（确定性模式下 gcore 会自动把 FA3 回退到 FA2），不要用 `auto`。
+- **写死 attention backend**：`training.attention_backend` 默认是 `auto`，TE 会**根据环境（GPU 架构、序列长度、dtype 等）自动挑选** attention 后端，不同机器/不同 batch 选到的 kernel 可能不一样，从而破坏复现。复现时务必显式指定，例如 `+training.attention_backend=flash`（确定性模式下 gcore 会自动把 FA3 回退到 FA2），不要用 `auto`。NVIDIA RTX PRO 5000 上还会自动 `training.disable_flash_attn_4=True`（FA4 packed-THD 训练不稳定）。
 
 ## 断点续训的注意事项 / Notes on resume
 

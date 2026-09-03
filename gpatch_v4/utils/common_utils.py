@@ -791,6 +791,15 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
+class GenerationAborted(RuntimeError):
+    """A generation request was cancelled by ``abort_all_requests``.
+
+    Raised by inference engines instead of failing on the missing logprobs
+    of a cancelled request, so callers can tell a deliberate abort from a
+    real generation failure.
+    """
+
+
 class Envelope:
     """
     从 slime 参考来的写法，防止 Ray 自动解引用 ObjectRef。

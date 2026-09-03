@@ -201,3 +201,13 @@ class GenRmClient(BaseClientAbc, RmClientMixin):
         """
         if self._is_rpc_leader():
             await self._batch_rpc_call(rm_idx, 'flush_cache', {})
+
+    async def abort_all(self, rm_idx: int):
+        """Abort all in-flight scoring requests on every cluster of a gen-RM.
+
+        Parameters
+        ----------
+        rm_idx : int
+        """
+        if self._is_rpc_leader():
+            await self._batch_rpc_call(rm_idx, 'abort_all_requests', {})

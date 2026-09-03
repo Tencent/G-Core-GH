@@ -10,6 +10,12 @@ from gpatch_v4.core.advantage_helper import (
     register_custom_advantage,
     register_custom_post_advantage,
 )
+from gpatch_v4.core.post_compute_logprobs import (
+    BUILDIN_POST_COMPUTE_LOGPROBS,
+    PostComputeLogprobsRegistry,
+    noop_post_compute_logprobs,
+    register_custom_post_compute_logprobs,
+)
 
 BUILDIN_ADVANTAGE_TYPE = list(ADVANTAGE_DISPATCH.keys())
 BUILDIN_POST_ADVANTAGE_TYPE = list(POST_ADVANTAGE_DISPATCH.keys())

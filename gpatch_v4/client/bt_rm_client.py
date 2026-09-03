@@ -163,7 +163,11 @@ class BtRmClient(BaseBtRmClient):
         assert resp["ret"] is True
         return resp
 
-    async def get_bt_rm_result(self, rm_idx, ppo_step, sample_idx) -> Dict[str, Any]:
+    async def get_bt_rm_result(self,
+                               rm_idx,
+                               ppo_step,
+                               sample_idx,
+                               sampling_repeat_n: int = None) -> Dict[str, Any]:
         """Retrieve BT reward model results.
 
         Parameters
@@ -171,12 +175,18 @@ class BtRmClient(BaseBtRmClient):
         rm_idx : int
         ppo_step : int
         sample_idx : int
+        sampling_repeat_n : int, optional
+            Samples per prompt for this request. Use train
+            ``sampling_repeat_n`` or eval ``eval_sampling_repeat_n`` as
+            appropriate. Defaults to training ``sampling_repeat_n``.
 
         Returns
         -------
         dict[str, Any]
             Reward results with ``'rewards'``, ``'values'``, etc.
         """
+        if sampling_repeat_n is None:
+            sampling_repeat_n = self.config.training.sampling_repeat_n
         target_ep = self.rpc_client_lst[rm_idx].get_target_endpoint(
             sample_idx=sample_idx, ep_idx=None
         )
@@ -184,7 +194,7 @@ class BtRmClient(BaseBtRmClient):
             "actor_dp_rank": self.dp_rank,
             "sample_idx": sample_idx,
             "ppo_step": ppo_step,
-            "sampling_repeat_n": self.config.training.sampling_repeat_n
+            "sampling_repeat_n": sampling_repeat_n,
         }
         rpc_co = self.rpc_client_lst[rm_idx].call(target_ep, 'get_bt_rm_result', req_dict)
         resp = await rpc_co

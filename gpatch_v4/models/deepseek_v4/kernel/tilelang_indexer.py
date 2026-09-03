@@ -7,7 +7,10 @@ Provides both a low-level per-sample interface and a batched autograd Function.
 import torch
 
 from .tilelang_indexer_bwd import batched_indexer_bwd
-from .tilelang_indexer_fwd import _make_causal_cu_seqlens, batched_indexer_fwd
+from .tilelang_indexer_fwd import (
+    batched_indexer_fwd,
+    make_causal_cu_ks_and_cu_ke_for_bshd,
+)
 
 
 def pytorch_extract_topk_scores(logits, topk_indices, dim=-1):
@@ -39,7 +42,7 @@ class V4IndexerFunction(torch.autograd.Function):
         seqlen_q = index_q.shape[0]
         seq_len_kv = index_k.shape[0]
 
-        cu_seqlen_ks, cu_seqlen_ke = _make_causal_cu_seqlens(
+        cu_seqlen_ks, cu_seqlen_ke = make_causal_cu_ks_and_cu_ke_for_bshd(
             seqlen_q, seq_len_kv, compress_ratio, index_q.device
         )
 

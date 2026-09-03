@@ -153,6 +153,8 @@ class T2iGrpoGenRmActor(BaseActor, T2iTokenizerMixin):
             sgl_mamba_full_memory_ratio=infer_engine_config.sgl_mamba_full_memory_ratio,
             sgl_mamba_scheduler_strategy=infer_engine_config.sgl_mamba_scheduler_strategy,
             sgl_enable_spec_v2=infer_engine_config.sgl_enable_spec_v2,
+            return_original_logprob=config.ppo.use_original_logprob,
+            model_override_args=infer_engine_config.model_override_args,
             apply_deterministic_mode=getattr(config.training, "apply_deterministic_mode", False),
             placement_type=config.placement_type,
             pg_bundle_indices=pg_bundle_indices,

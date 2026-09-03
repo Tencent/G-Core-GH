@@ -1,8 +1,9 @@
 import asyncio
 import os
 import time
+from collections.abc import Callable, Iterator
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -14,7 +15,7 @@ from gpatch_v4.configs.config import RlConfig
 from gpatch_v4.core.parallel_state import cpu_barrier, is_mp_and_cp_head
 from gpatch_v4.extended_model import ApplySamplingRolloutAttrFactory
 from gpatch_v4.rollout_generator.generator_abc import RolloutGeneratorAbc
-from gpatch_v4.rollout_generator.mixin import SendRequestMixin
+from gpatch_v4.rollout_generator.mixin import SendRequestMixin, build_stream_ready_view
 from gpatch_v4.utils import (
     TimerSingleton,
     destroy_process_groups,
@@ -49,6 +50,7 @@ class BaseRolloutGenerator(RolloutGeneratorAbc, SendRequestMixin):
         )
 
         self.is_mp_and_cp_head = is_mp_and_cp_head()
+        self.handle_external_reward_in_generator = False
 
     def assign_unique_id_to_batches(self, batched_data: Dict[str, Any], dp_rank: int,
                                     rbi: int) -> Dict[str, Any]:
@@ -63,7 +65,9 @@ class BaseRolloutGenerator(RolloutGeneratorAbc, SendRequestMixin):
         return batched_data
 
     @override
-    async def rollout_samples(self, data_iter, num_microbatches, curr_ppo_step, dp_rank=None):
+    async def rollout_samples(
+        self, data_iter, num_microbatches, curr_ppo_step, dp_rank=None, on_ready=None
+    ):
         num_samplers = self.sampler_client.num_samplers
         assert num_samplers == 1, f"当前只能是一个 sampler, 但保留扩展异构 sampler 的能力，如果要扩展到异构 sampler 的话，注意 tokenizer 的使用"
 
@@ -87,8 +91,22 @@ class BaseRolloutGenerator(RolloutGeneratorAbc, SendRequestMixin):
                     batched_data = self.assign_unique_id_to_batches(batched_data, dp_rank, rbi)
 
                     rollout_batches[rbi] = self.remove_rollout_attr_before_sampling(batched_data)
+
+                stream_ready = None
+                if on_ready is not None:
+                    # on_ready fires before add_back_rollout_attr_after_sampling, so
+                    # hand the consumer the stripped attrs from the handler's cache
+                    def stream_ready(rbi, rb):
+                        cached = self.apply_sampling_rollout_attr.cached_rollout_attrs()
+                        on_ready(rbi, build_stream_ready_view(rb, cached))
+
                 rbs = await self.sampler_gen_out(
-                    rollout_batches, sampler_idx, curr_ppo_step, sidx, self.sampling_repeat
+                    rollout_batches,
+                    sampler_idx,
+                    curr_ppo_step,
+                    sidx,
+                    self.sampling_repeat,
+                    on_ready=stream_ready
                 )
             else:
                 rbs = rollout_batches
@@ -185,7 +203,7 @@ class BaseRolloutGenerator(RolloutGeneratorAbc, SendRequestMixin):
 
             if self.is_mp_and_cp_head:
                 bt_rm_resp_dicts = await self.get_bt_rm_result(
-                    curr_ppo_step, num_microbatches, rm_idx
+                    curr_ppo_step, num_microbatches, rm_idx, self.sampling_repeat
                 )
                 for rbi, (rollout_batch, bt_rm_resp_dict) in enumerate(zip(rbs, bt_rm_resp_dicts)):
                     rollout_batch.update(bt_rm_resp_dict)
@@ -201,7 +219,7 @@ class BaseRolloutGenerator(RolloutGeneratorAbc, SendRequestMixin):
         return rbs
 
     @override
-    async def __call__(self, data_iter, num_microbatches, curr_ppo_step):
+    async def __call__(self, data_iter, num_microbatches, curr_ppo_step, on_ready=None):
         #TODO: support timer record times per stage
         timers = TimerSingleton.get_timer()
         dp_rank = mpu.get_data_parallel_rank()
@@ -212,7 +230,7 @@ class BaseRolloutGenerator(RolloutGeneratorAbc, SendRequestMixin):
 
         timers("sampler_generate", log_level=0).start(barrier=True)
         rbs = await self.rollout_samples(
-            data_iter, num_microbatches, curr_ppo_step, dp_rank=dp_rank
+            data_iter, num_microbatches, curr_ppo_step, dp_rank=dp_rank, on_ready=on_ready
         )
         if self.is_mp_and_cp_head:
             rbs = self._hook_after_sampling(rbs, curr_ppo_step)
@@ -300,3 +318,28 @@ class BaseRolloutGenerator(RolloutGeneratorAbc, SendRequestMixin):
     @override
     def clear_data_cache(self):
         return self.apply_sampling_rollout_attr.clear_data_cache()
+
+    @override
+    def set_external_reward(self, external_reward) -> None:
+        return
+
+    @override
+    def setup_data_source(
+        self,
+        dataloader,
+        reset_iter: Callable[..., Iterator],
+        resume_step: int = 0,
+    ) -> Tuple[Optional[Any], bool, bool]:
+        return None, False, False
+
+    @override
+    def should_stop_for_consumed_data_epochs(self) -> bool:
+        return False
+
+    @override
+    def save_resume_state(self, step: int) -> None:
+        return
+
+    @override
+    def pop_step_metrics(self) -> Dict[str, float]:
+        return {}

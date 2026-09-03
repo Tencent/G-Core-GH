@@ -617,11 +617,18 @@ def _estimate_deepseek_v4_flops(config, tokens_sum, batch_seqlens, delta_time):
     mla_proj_per_layer = FBE * FMA * (q_term + kv_term + o_term)
 
     # ---- 2. Sparse attention (replaces full core attention) ----
+    # Use the first seqlen as representative for the effective topk
+    # causal correction.  Megatron uses args.seq_length; we approximate
+    # with the max seqlen in the batch.
+    seq_len = max(batch_seqlens)
+    w_cap = min(W, seq_len)
+    w_eff = w_cap * (1 - w_cap / (2 * seq_len))
+
     # r=0: window-only, fixed per-token cost
-    sparse_attn_r0 = n_layers_r0 * n_head * W * d * 2
+    sparse_attn_r0 = n_layers_r0 * n_head * w_eff * d * 2
 
     # r=128 (HCA): window (token-linear) + all compressed KV (L²)
-    sparse_attn_r128_window = n_layers_r128 * n_head * W * d * 2
+    sparse_attn_r128_window = n_layers_r128 * n_head * w_eff * d * 2
     sparse_attn_r128_core = n_layers_r128 * n_head * d / r_hca
 
     # r=4 (CSA): window + learned-topk compressed entries
@@ -630,13 +637,9 @@ def _estimate_deepseek_v4_flops(config, tokens_sum, batch_seqlens, delta_time):
     idx_topk = getattr(config, "index_topk", 512)
 
     if n_layers_r4 > 0:
-        # Use the first seqlen as representative for the effective topk
-        # causal correction.  Megatron uses args.seq_length; we approximate
-        # with the max seqlen in the batch.
-        seq_len = max(batch_seqlens) if batch_seqlens else 4096
         effective_topk = min(idx_topk, seq_len // r_csa)
         avg_comp_4 = effective_topk * (1 - effective_topk * r_csa / (2 * seq_len))
-        sparse_attn_r4 = n_layers_r4 * n_head * (W + avg_comp_4) * d * 2
+        sparse_attn_r4 = n_layers_r4 * n_head * (w_eff + avg_comp_4) * d * 2
     else:
         sparse_attn_r4 = 0
 
@@ -689,6 +692,255 @@ def _estimate_deepseek_v4_flops(config, tokens_sum, batch_seqlens, delta_time):
     return flops_total / delta_time / 1e12
 
 
+def _estimate_welm_v4_flops(config, tokens_sum, batch_seqlens, delta_time):
+    """Estimate WeLM-v4/v4.5 Megatron training TFLOPs/s."""
+    total_flops = _welm_v4_total_flops(config, tokens_sum, batch_seqlens)
+    return total_flops / delta_time / 1e12
+
+
+def _welm_v4_total_flops(config, tokens_sum, batch_seqlens):
+    """Raw WeLM-v4/v4.5 Megatron training FLOPs for the text backbone.
+
+    This follows Megatron's ``transformer_flops()`` convention: count GEMMs in
+    forward, weight-gradient, and data-gradient passes, while omitting
+    embedding lookups, normalization, activation, routing, and softmax FLOPs.
+    WeLM-specific OE projection, head-wise attention gate, GQA dimensions, MoE
+    layout, shared experts, and per-layer sliding windows are included.
+
+    MTP is intentionally excluded because ``Welm4MoeBridge`` currently builds
+    the Megatron model with ``mtp_block_spec=None`` and ignores checkpoint MTP
+    layers.
+    """
+    hidden_size = config.hidden_size
+    vocab_size = config.vocab_size
+    num_layers = config.num_hidden_layers
+    num_attention_heads = config.num_attention_heads
+    num_query_groups = config.num_key_value_heads or num_attention_heads
+    head_dim = config.head_dim or hidden_size // num_attention_heads
+
+    query_projection_size = num_attention_heads * head_dim
+    kv_projection_size = num_query_groups * head_dim
+
+    # A GEMM costs 2mnk FLOPs and is run in forward, wgrad, and dgrad.
+    fwd_bwd_gemm_factor = 6
+
+    # QKV and output projections. WeLM's head-wise gate is H -> num_heads,
+    # rather than the H -> query_projection_size gate used by standard MCore
+    # gated attention.
+    attention_linear_size = hidden_size * (
+        query_projection_size + 2 * kv_projection_size + query_projection_size
+    )
+    if config.gated_self_attention_headwise:
+        attention_linear_size += hidden_size * num_attention_heads
+    attention_linear_flops = (fwd_bwd_gemm_factor * attention_linear_size * tokens_sum * num_layers)
+
+    # A KV-mirror layer first computes its regular fused QKV projection, then
+    # invokes the same fused QKV projection again on the mirrored hidden
+    # states and keeps only K/V. The discarded Q is still computed.
+    kv_mirror_imitated_layers = list(config.kv_mirror_imitated_layers or [])
+    kv_mirror_layers = list(config.kv_mirror_layers or [])
+    valid_kv_mirror_layers = {
+        layer_idx
+        for layer_idx in kv_mirror_layers[:len(kv_mirror_imitated_layers)]
+        if 0 <= layer_idx < num_layers
+    }
+    mirrored_qkv_linear_size = (hidden_size * (query_projection_size + 2 * kv_projection_size))
+    attention_linear_flops += (
+        fwd_bwd_gemm_factor * mirrored_qkv_linear_size * tokens_sum * len(valid_kv_mirror_layers)
+    )
+
+    # WeLM-v4.5 uses a layerwise causal window. Values absent, non-positive, or
+    # at least max_position_embeddings mean full attention in the MCore path.
+    layerwise_windows = list(config.sliding_window_size_layerwise or [])
+    max_positions = config.max_position_embeddings
+    attention_pairs = 0.0
+    seqlen_sq_sum = sum(seqlen * seqlen for seqlen in batch_seqlens)
+    aggregate_only = not math.isclose(
+        float(sum(batch_seqlens)),
+        float(tokens_sum),
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    )
+    if aggregate_only and seqlen_sq_sum > 0:
+        # ``estimate_flops_from_sums`` represents ΣS² as one synthetic
+        # sqrt(ΣS²) sequence. Recover an effective sequence count so a
+        # sliding-window layer still scales with ΣS rather than sqrt(ΣS²).
+        effective_num_sequences = tokens_sum * tokens_sum / seqlen_sq_sum
+        effective_seqlen = tokens_sum / effective_num_sequences
+    else:
+        effective_num_sequences = 0
+        effective_seqlen = 0
+
+    for layer_idx in range(num_layers):
+        window = layerwise_windows[layer_idx] if layer_idx < len(layerwise_windows) else None
+        is_full_attention = (
+            window is None or window <= 0 or
+            (max_positions is not None and window >= max_positions)
+        )
+        if aggregate_only:
+            if is_full_attention or window >= effective_seqlen:
+                attention_pairs += seqlen_sq_sum / 2
+            else:
+                attention_pairs += window * (tokens_sum - window * effective_num_sequences / 2)
+            continue
+
+        for seqlen in batch_seqlens:
+            if is_full_attention or window >= seqlen:
+                # Megatron approximates the causal triangle as S² / 2.
+                attention_pairs += seqlen * seqlen / 2
+            else:
+                # Number of entries in a left-causal band, using the same
+                # continuous approximation as the full-attention formula.
+                attention_pairs += window * (seqlen - window / 2)
+
+    # Per attended Q/K pair: QK^T and AV each cost 2 FLOPs per head dim;
+    # both backward GEMMs add another 2x over the forward computation.
+    core_attention_flops = (2 * fwd_bwd_gemm_factor * query_projection_size * attention_pairs)
+
+    # HF WeLM chooses dense vs MoE per layer with decoder_sparse_step and
+    # mlp_only_layers. The 80B-A3B checkpoint has MoE on every decoder layer,
+    # but retaining the source rule makes the estimator work for reduced and
+    # mixed checkpoints as well.
+    num_experts = config.num_experts or 0
+    sparse_step = config.decoder_sparse_step or 1
+    mlp_only_layers = set(config.mlp_only_layers or [])
+    num_moe_layers = sum(
+        1 for layer_idx in range(num_layers)
+        if num_experts > 0 and layer_idx not in mlp_only_layers and (layer_idx + 1) %
+        sparse_step == 0
+    )
+    num_dense_layers = num_layers - num_moe_layers
+
+    ffn_hidden_size = config.intermediate_size
+    moe_ffn_hidden_size = config.moe_intermediate_size or ffn_hidden_size
+    experts_per_token = config.num_experts_per_tok or 1
+    shared_expert_hidden_size = (
+        (config.shared_expert_intermediate_size or 0) * (config.num_shared_experts or 0)
+    )
+
+    # WeLM uses SwiGLU: gate/up/down are three matrix multiplications.
+    ffn_linear_size = hidden_size * 3 * (
+        ffn_hidden_size * num_dense_layers +
+        (moe_ffn_hidden_size * experts_per_token + shared_expert_hidden_size) * num_moe_layers
+    )
+    ffn_flops = fwd_bwd_gemm_factor * ffn_linear_size * tokens_sum
+
+    # OE embedding tables are lookups. Only the concatenated OE embedding
+    # projection is a GEMM in the Megatron model.
+    num_oe_embeddings = len(config.oe_vocab_sizes or [])
+    oe_projection_size = (hidden_size * (config.oe_dim or 0) * num_oe_embeddings)
+    oe_projection_flops = fwd_bwd_gemm_factor * oe_projection_size * tokens_sum
+
+    # Input token embeddings are lookups; only the output vocabulary projection
+    # is counted, matching Megatron's transformer_flops().
+    logit_flops = fwd_bwd_gemm_factor * hidden_size * vocab_size * tokens_sum
+
+    total_flops = (
+        attention_linear_flops + core_attention_flops + ffn_flops + oe_projection_flops +
+        logit_flops
+    )
+    return total_flops
+
+
+def _audio_feat_extract_output_lengths(input_lengths, n_window):
+    """Post-CNN output-token counts of the Qwen3-Omni audio encoder.
+
+    Matches HF ``Qwen3OmniMoeAudioEncoder`` (and mbridge
+    ``get_feat_extract_output_lengths``): every full chunk of
+    ``2 * n_window`` mel frames yields 13 tokens, and the tail frames go
+    through three stride-2 Conv2d layers.
+    """
+    chunk_len = n_window * 2
+    output_lengths = []
+    for length in input_lengths:
+        leave = length % chunk_len
+        feat_length = (leave - 1) // 2 + 1
+        tail_tokens = ((feat_length - 1) // 2 + 1 - 1) // 2 + 1
+        output_lengths.append(tail_tokens + (length // chunk_len) * 13)
+    return output_lengths
+
+
+def _estimate_welm_omni_audio_flop(audio_seqlens, config):
+    """Estimate the FLOPs of the WeLM-Omni-V4.5 audio tower.
+
+    The tower is Qwen3-Omni's Whisper-like audio encoder: three stride-2
+    Conv2d layers (channels ``downsample_hidden_size``), a ``conv_out``
+    projection to ``d_model``, ``encoder_layers`` bidirectional transformer
+    layers (MHA + GELU MLP) with attention windowed to ``n_window_infer``
+    mel frames, and a two-layer projector to ``output_dim``.
+
+    Args:
+        audio_seqlens: per-audio mel frame counts in the batch.
+        config: ``Qwen3OmniMoeAudioEncoderConfig`` (``config.audio_config``).
+    """
+    if config is None:
+        return 0
+
+    dim = config.d_model
+    num_heads = config.encoder_attention_heads
+    depth = config.encoder_layers
+    mlp_hidden_dim = config.encoder_ffn_dim
+    downsample_dim = config.downsample_hidden_size
+    n_window = config.n_window
+    head_dim = dim // num_heads
+
+    # fwd + wgrad + dgrad = 3; each GEMM m*n*k = 2mnk FLOPs.
+    fwd_bwd_gemm_factor = 6
+
+    # Three k=3 s=2 p=1 Conv2d layers halve mel freq 128 -> 64 -> 32 -> 16
+    # and time T -> T/2 -> T/4 -> T/8. ``conv_N`` counts k^2 * Cin * Cout
+    # multiply-accumulates over the output elements produced per mel frame.
+    conv_N = 9 * (
+        1 * downsample_dim * (64 // 2) + downsample_dim * downsample_dim *
+        (32 // 4) + downsample_dim * downsample_dim * (16 // 8)
+    )
+    conv_flops = fwd_bwd_gemm_factor * conv_N * sum(audio_seqlens)
+
+    audio_token_lens = _audio_feat_extract_output_lengths(audio_seqlens, n_window)
+    tokens_sum = sum(audio_token_lens)
+    if tokens_sum == 0:
+        return 0
+
+    # conv_out projects (downsample_dim * freq_out=16) -> d_model per token.
+    conv_out_N = downsample_dim * 16 * dim
+    # Encoder layer: QKV+O projections and a GELU MLP (fc1 + fc2, no GLU).
+    attn_linear_N = dim * (4 * dim)
+    mlp_N = dim * mlp_hidden_dim * 2
+    # ln_post is not a GEMM; proj1 (d -> d) and proj2 (d -> output_dim) are.
+    projector_N = dim * dim + dim * config.output_dim
+    dense_N = conv_out_N + (attn_linear_N + mlp_N) * depth + projector_N
+    dense_N_flops = fwd_bwd_gemm_factor * dense_N * tokens_sum
+
+    # Attention is bidirectional inside independent windows of
+    # ``n_window_infer`` mel frames, i.e. ``window_tokens`` encoder tokens.
+    window_tokens = (config.n_window_infer // (n_window * 2)) * 13
+    window_sq_sum = 0
+    for token_len in audio_token_lens:
+        n_full, remainder = divmod(token_len, window_tokens)
+        window_sq_sum += n_full * window_tokens * window_tokens + remainder * remainder
+    # Same convention as the ViT estimator: bidirectional QK^T and AV,
+    # forward plus both backward GEMMs.
+    attn_qkv_flops = 12 * window_sq_sum * head_dim * num_heads * depth
+
+    return conv_flops + dense_N_flops + attn_qkv_flops
+
+
+def _estimate_welm_omni_v4_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
+    """Estimate WeLM-Omni-V4.5 Megatron training TFLOPs/s.
+
+    The composite HF config nests the WeLM4.5 text backbone in
+    ``config.text_config`` (identical to the ``welmv4_moe`` estimator) and
+    the Qwen3-Omni audio tower in ``config.audio_config``. Audio FLOPs are
+    only counted when ``kargs["audio_seqlens"]`` (per-audio mel frame
+    counts) is provided.
+    """
+    total_flops = _welm_v4_total_flops(config.text_config, tokens_sum, batch_seqlens)
+    audio_seqlens = kargs.get("audio_seqlens", None)
+    if audio_seqlens:
+        total_flops += _estimate_welm_omni_audio_flop(audio_seqlens, config.audio_config)
+    return total_flops / delta_time / 1e12
+
+
 def _estimate_unknown_flops(config, tokens_sum, batch_seqlens, delta_time):
     return 0
 
@@ -705,6 +957,8 @@ ESTIMATE_FUNC = {
     MODEL_ARCH.QWEN3_VL_MOE: _estimate_qwen3_vl_moe_flops,
     MODEL_ARCH.DEEPSEEK_V3: _estimate_deepseek_v3_flops,
     MODEL_ARCH.DEEPSEEK_V4: _estimate_deepseek_v4_flops,
+    MODEL_ARCH.WELMV4_MOE: _estimate_welm_v4_flops,
+    MODEL_ARCH.WELM_OMNI_V4_5: _estimate_welm_omni_v4_5_flops,
     MODEL_ARCH.MISTRAL: _estimate_qwen2_flops,
     MODEL_ARCH.GEMMA3_TEXT: _estimate_gemma3_flops,
     MODEL_ARCH.SEED_OSS: _estimate_qwen2_flops,

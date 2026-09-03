@@ -6,9 +6,9 @@
 # 本文件来自 Megatron-LM：https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/utils.py
 # ，仅仅包含了简单的 helper 函数，避免直接依赖具体版本的 Megatron。
 
+import random
 from datetime import datetime
 from typing import Tuple
-import random
 
 import torch
 
@@ -208,3 +208,72 @@ def random_pad_list(lst, pad_len, ban_token_ids=None):
         else:
             padding = random.choices(lst, k=pad_len)
         return lst + padding
+
+
+# Random padding must not emit these multimodal placeholders. Qwen3-VL /
+# Qwen3.5 keep them on the top-level HF config; Qwen3-Omni-MoE nests image /
+# video / audio / audio_start on thinker_config and vision_start on
+# talker_config (see transformers configuration_qwen3_omni_moe.py).
+_MM_FORBIDDEN_TOKEN_KEYS = (
+    "image_token_id",
+    "video_token_id",
+    "vision_start_token_id",
+    "vision_end_token_id",
+    "audio_token_id",
+    "audio_start_token_id",
+    "audio_end_token_id",
+)
+_MM_NESTED_CONFIG_KEYS = (
+    "thinker_config",
+    "talker_config",
+)
+
+
+def _is_token_id(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _iter_mm_token_configs(hf_config):
+    if hf_config is None:
+        return
+    seen = set()
+    stack = [hf_config]
+    while stack:
+        cfg = stack.pop()
+        ident = id(cfg)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        yield cfg
+        for name in _MM_NESTED_CONFIG_KEYS:
+            nested = getattr(cfg, name, None)
+            if nested is not None:
+                stack.append(nested)
+
+
+def build_forbidden_token_ids(hf_config) -> list:
+    """Collect multimodal special token ids skipped by random padding.
+
+    Walks the top-level HF config plus Omni nested ``thinker_config`` /
+    ``talker_config``. Missing fields, ``None``, and modular
+    ``AttributeError`` sentinels are ignored.
+
+    Parameters
+    ----------
+    hf_config : object
+        HuggingFace config. May be a composite Omni config or an already
+        unwrapped thinker config.
+
+    Returns
+    -------
+    list of int
+        Sorted unique token ids. Empty if ``hf_config`` has none of the
+        multimodal fields.
+    """
+    ids = set()
+    for cfg in _iter_mm_token_configs(hf_config):
+        for key in _MM_FORBIDDEN_TOKEN_KEYS:
+            tid = getattr(cfg, key, None)
+            if _is_token_id(tid):
+                ids.add(int(tid))
+    return sorted(ids)

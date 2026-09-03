@@ -478,74 +478,24 @@ def _round_up(x, m):
 
 
 @lru_cache(maxsize=None)
-def _get_varlen_fwd_kernel(
-    HQ,
-    HK,
-    D,
-    scaling,
-    is_causal,
-    window_size,
-    has_sinks,
-    dtype,
-    BLOCK_Q,
-    BLOCK_K,
-    num_stages,
-    threads,
-):
-    return myfa_varlen_sw_sinks_fwd.compile(
-        HQ=HQ,
-        HK=HK,
-        D=D,
-        scaling=scaling,
-        is_causal=is_causal,
-        window_size=window_size,
-        has_sinks=has_sinks,
-        dtype=dtype,
-        BLOCK_Q=BLOCK_Q,
-        BLOCK_K=BLOCK_K,
-        num_stages=num_stages,
-        threads=threads,
-    )
+def _get_varlen_fwd_kernel(*args, **kwargs):
+    return myfa_varlen_sw_sinks_fwd.compile(*args, **kwargs)
 
 
 # TODO(astrachang): 看下为什么tilelang自带的cache比这个lru cache慢的
 @lru_cache(maxsize=None)
-def _get_varlen_bwd_pre_kernel(HQ, D, BLOCK_Q, dtype):
-    return myfa_varlen_sw_sinks_bwd_pre.compile(HQ=HQ, D=D, BLOCK_Q=BLOCK_Q, dtype=dtype)
+def _get_varlen_bwd_pre_kernel(*args, **kwargs):
+    return myfa_varlen_sw_sinks_bwd_pre.compile(*args, **kwargs)
 
 
 @lru_cache(maxsize=None)
-def _get_varlen_bwd_kernel(
-    HQ,
-    HK,
-    D,
-    scaling,
-    is_causal,
-    window_size,
-    dtype,
-    BLOCK_Q,
-    BLOCK_K,
-    num_stages,
-    threads,
-):
-    return myfa_varlen_sw_sinks_bwd.compile(
-        HQ=HQ,
-        HK=HK,
-        D=D,
-        scaling=scaling,
-        is_causal=is_causal,
-        window_size=window_size,
-        BLOCK_Q=BLOCK_Q,
-        BLOCK_K=BLOCK_K,
-        num_stages=num_stages,
-        threads=threads,
-        dtype=dtype,
-    )
+def _get_varlen_bwd_kernel(*args, **kwargs):
+    return myfa_varlen_sw_sinks_bwd.compile(*args, **kwargs)
 
 
 @lru_cache(maxsize=None)
-def _get_varlen_dsink_kernel(HQ, dtype):
-    return myfa_varlen_sw_sinks_bwd_dsink.compile(HQ=HQ, dtype=dtype)
+def _get_varlen_dsink_kernel(*args, **kwargs):
+    return myfa_varlen_sw_sinks_bwd_dsink.compile(*args, **kwargs)
 
 
 def myfa_varlen_sw_sinks_forward(
@@ -574,8 +524,18 @@ def myfa_varlen_sw_sinks_forward(
         block_k = min(block_k, window_size)
     dt = q.dtype
     fwd_kernel = _get_varlen_fwd_kernel(
-        HQ, HK, d, scaling, is_causal, window_size, has_sinks, dt, block_q, block_k, num_stages,
-        threads
+        HQ=HQ,
+        HK=HK,
+        D=d,
+        scaling=scaling,
+        is_causal=is_causal,
+        window_size=window_size,
+        has_sinks=has_sinks,
+        dtype=dt,
+        BLOCK_Q=block_q,
+        BLOCK_K=block_k,
+        num_stages=num_stages,
+        threads=threads,
     )
     batch_size = cu_seqlens_q.numel() - 1
     max_l = _round_up(max_seqlen, block_q)
@@ -598,6 +558,8 @@ def myfa_varlen_sw_sinks_backward(
     is_causal=True,
     window_size=None,
     scaling=None,
+    *,
+    max_seqlen_k,
 ):
     has_sinks = sinks is not None
     if not has_sinks:
@@ -610,7 +572,7 @@ def myfa_varlen_sw_sinks_backward(
     dt = q.dtype
 
     block_q_fwd, _, _, _ = _get_fwd_block_config(d)
-    bwd_pre_kernel = _get_varlen_bwd_pre_kernel(HQ, d, block_q_fwd, dt)
+    bwd_pre_kernel = _get_varlen_bwd_pre_kernel(HQ=HQ, D=d, BLOCK_Q=block_q_fwd, dtype=dt)
     delta = torch.zeros_like(lse)
     bwd_pre_kernel(output, doutput, cu_seqlens_q, max_seqlen, delta)
 
@@ -618,19 +580,29 @@ def myfa_varlen_sw_sinks_backward(
     if window_size is not None:
         block_k = min(block_k, window_size)
     bwd_kernel = _get_varlen_bwd_kernel(
-        HQ,
-        HK,
-        d,
-        scaling,
-        is_causal,
-        window_size,
-        dt,
-        block_q,
-        block_k,
-        num_stages,
-        threads,
+        HQ=HQ,
+        HK=HK,
+        D=d,
+        scaling=scaling,
+        is_causal=is_causal,
+        window_size=window_size,
+        dtype=dt,
+        BLOCK_Q=block_q,
+        BLOCK_K=block_k,
+        num_stages=num_stages,
+        threads=threads,
     )
     dQ = torch.zeros_like(q, dtype=torch.float32)
+    # bwd kernel is tiled over K. Packed CP / prefix-K has LK >> LQ; SWA
+    # then attends only the tail of K, so a Q-sized K grid zeros dQ.
+    # max_seqlen_k must be a host int (caller: max(k_lens)); do not .item().
+    assert max_seqlen_k is not None, (
+        "max_seqlen_k is required; pass a host int from max(k_lens)"
+    )
+    assert not torch.is_tensor(max_seqlen_k), (
+        "max_seqlen_k must be a host int, not a Tensor (no .item() fallback)"
+    )
+    max_seqlen_k = int(max_seqlen_k)
     dK = torch.zeros_like(k, dtype=torch.float32)
     dV = torch.zeros_like(v, dtype=torch.float32)
     bwd_kernel(
@@ -639,7 +611,7 @@ def myfa_varlen_sw_sinks_backward(
         v,
         cu_seqlens_q,
         cu_seqlens_k,
-        max_seqlen,
+        max_seqlen_k,
         lse,
         doutput,
         delta,
@@ -653,7 +625,7 @@ def myfa_varlen_sw_sinks_backward(
 
     dsinks = None
     if has_sinks:
-        dsink_kernel = _get_varlen_dsink_kernel(HQ, dt)
+        dsink_kernel = _get_varlen_dsink_kernel(HQ=HQ, dtype=dt)
         dsinks = dsink_kernel(sinks, delta, lse, cu_seqlens_q, max_seqlen).sum(0).sum(1)
 
     return dQ, dK, dV, dsinks
@@ -670,6 +642,7 @@ class MyfaVarlenSwSinks(torch.autograd.Function):
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen,
+        max_seqlen_k,
         is_causal,
         window_size,
         scaling=None,
@@ -696,6 +669,7 @@ class MyfaVarlenSwSinks(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, sinks_for_backward, cu_seqlens_q, cu_seqlens_k, o, lse)
         ctx.scaling = scaling
         ctx.max_seqlen = max_seqlen
+        ctx.max_seqlen_k = max_seqlen_k
         ctx.is_causal = is_causal
         ctx.window_size = window_size
         ctx.has_sinks = has_sinks
@@ -721,9 +695,10 @@ class MyfaVarlenSwSinks(torch.autograd.Function):
             is_causal=is_causal,
             window_size=window_size,
             scaling=ctx.scaling,
+            max_seqlen_k=ctx.max_seqlen_k,
         )
 
-        return dQ, dK, dV, dsinks, None, None, None, None, None, None
+        return dQ, dK, dV, dsinks, None, None, None, None, None, None, None
 
 
 def myfa_varlen_sw_sinks(
@@ -733,12 +708,19 @@ def myfa_varlen_sw_sinks(
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen,
+    max_seqlen_k,
     sinks=None,
     is_causal=True,
     window_size=None,
     scaling=None,
 ):
     """Autograd-aware entry used by tests / callers."""
+    assert max_seqlen_k is not None, (
+        "max_seqlen_k is required; pass a host int from max(k_lens)"
+    )
+    assert not torch.is_tensor(max_seqlen_k), (
+        "max_seqlen_k must be a host int, not a Tensor (no .item() fallback)"
+    )
     return MyfaVarlenSwSinks.apply(
         q,
         k,
@@ -747,6 +729,7 @@ def myfa_varlen_sw_sinks(
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen,
+        max_seqlen_k,
         is_causal,
         window_size,
         scaling,

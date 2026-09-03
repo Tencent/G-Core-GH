@@ -96,9 +96,10 @@ class PpoCriticValuePathTest(unittest.TestCase):
 
         with patch.object(mcore_swap_impl, "clear_memory"), \
             patch.object(mcore_swap_impl, "logging_memory_usage_details"), \
-            patch.object(mcore_swap_impl, "offload_megatron_copy_params"), \
+            patch.object(mcore_swap_impl, "offload_megatron_copy_params", return_value=[]), \
             patch.object(mcore_swap_impl, "onload_megatron_copy_params"), \
             patch.object(mcore_swap_impl, "offload_tensor_to_cpu", side_effect=offloaded.append), \
+            patch.object(mcore_swap_impl, "sync_and_resize_offloaded_tensors"), \
             patch.object(mcore_swap_impl, "onload_tensor_to_gpu", side_effect=onloaded.append):
             swap_impl = mcore_swap_impl.McoreSwapImpl()
             swap_impl.offload_optimizer(optimizer)

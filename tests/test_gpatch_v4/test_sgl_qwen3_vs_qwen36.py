@@ -244,23 +244,30 @@ def _run_throughput(
     print(f"{'='*72}", flush=True)
 
     port = 10000 + os.getpid() % 1000
+    from gpatch_v4.generation_backend.sglang_engine import filter_server_args_kwargs
     server_args = sgl.ServerArgs(
-        model_path=model_path,
-        tp_size=tp_size,
-        ep_size=ep_size,
-        dp_size=1,
-        pp_size=1,
-        enable_dp_attention=False,
-        dist_init_addr=f"127.0.0.1:{port}",
-        nnodes=1,
-        node_rank=0,
-        base_gpu_id=0,
-        mem_fraction_static=mem_fraction,
-        trust_remote_code=True,
-        context_length=context_length,
-        mamba_full_memory_ratio=0.05,
-        disable_cuda_graph=bool(os.environ.get("SGLANG_PROFILE_LAYERS")),
-        disable_piecewise_cuda_graph=bool(os.environ.get("SGLANG_PROFILE_LAYERS")),
+        **filter_server_args_kwargs(
+            dict(
+                model_path=model_path,
+                tp_size=tp_size,
+                ep_size=ep_size,
+                dp_size=1,
+                pp_size=1,
+                enable_dp_attention=False,
+                dist_init_addr=f"127.0.0.1:{port}",
+                nnodes=1,
+                node_rank=0,
+                base_gpu_id=0,
+                mem_fraction_static=mem_fraction,
+                trust_remote_code=True,
+                context_length=context_length,
+                mamba_full_memory_ratio=0.05,
+                disable_cuda_graph=bool(os.environ.get("SGLANG_PROFILE_LAYERS")),
+                disable_piecewise_cuda_graph=bool(
+                    os.environ.get("SGLANG_PROFILE_LAYERS")
+                ),
+            )
+        )
     )
     llm = sgl.Engine(server_args=server_args)
 

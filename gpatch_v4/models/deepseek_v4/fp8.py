@@ -4,13 +4,8 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
-
-# 这样写未必合理，小心有坑...
-os.environ.setdefault("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
-
+import torch.nn.functional as F
 import transformer_engine_torch as _tex
 from transformer_engine.common.recipe import Float8BlockScaling, Format
 from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
@@ -21,9 +16,19 @@ from transformer_engine.pytorch.quantized_tensor import (
 )
 from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
     Float8BlockQuantizer,
+    Float8BlockwiseQTensor,
 )
 
-__all__ = ["MyGroupedLinearFp8", "_pad_m_splits"]
+from .fp8_tensor import Fp8TensorTrain
+
+__all__ = ["MyTeGroupedLinearFp8", "_pad_m_splits"]
+
+# NOTE
+# ```
+# os.environ.setdefault("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
+# ```
+# 这样写会导致 fp8 实际上 scaling 必须是 power of 2，如果 scale 是 E8M0，没问题，但是实际上又是 fp32，虽然
+# 我们是通过 quantizer 来保证 ceil(log2(l))，不会有实际问题，但还是要小心点。
 
 
 def _fp8_dtype_e4m3():
@@ -36,6 +41,7 @@ def _make_recipe():
 
 # Megatron ``get_fp8_align_size``：非 MXFP8 为 16；覆盖 cuBLAS block-scaling 的 m%8。
 _FP8_BLOCK_ALIGN = 16
+_FP8_WEIGHT_BLOCK_SIZE = (128, 128)
 
 
 def _pad_m_splits(m_splits: list, align_size: int = _FP8_BLOCK_ALIGN) -> list:
@@ -117,11 +123,66 @@ def _make_grouped_fp8_quantizers(num_gemms: int, recipe):
     return input_qs, weight_qs, grad_out_qs
 
 
+def _e8m0_to_te_scale_inv(scale: torch.Tensor) -> torch.Tensor:
+    assert scale.ndim == 2, scale.shape
+    scale = scale.to(torch.float32)
+    pad_k = (-scale.shape[1]) % 4
+    if pad_k:
+        # TODO 这里写得非常反直觉，有空 check 下。
+        scale = F.pad(scale, (0, pad_k))
+    return scale.contiguous()
+
+
+def _verify_prequantized_fp8_weight(
+    weight: Fp8TensorTrain,
+    recipe,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert recipe.w_block_scaling_dim == 2, recipe.w_block_scaling_dim
+    data = weight._data
+    scale = weight._scale
+    num_gemms, out_features, in_features = weight.shape
+    assert data.shape == weight.shape, (data.shape, weight.shape)
+    assert data.dtype in (torch.uint8, torch.float8_e4m3fn), data.dtype
+    assert scale.dtype == torch.float8_e8m0fnu, scale.dtype
+    bm, bn = _FP8_WEIGHT_BLOCK_SIZE
+    assert out_features % bm == 0, out_features
+    assert in_features % bn == 0, in_features
+    expected_scale_shape = (
+        num_gemms,
+        out_features // bm,
+        in_features // bn,
+    )
+    assert scale.shape == expected_scale_shape, (scale.shape, expected_scale_shape)
+    return data, scale
+
+
+def _wrap_fp8_weight(
+    data: torch.Tensor,
+    scale: torch.Tensor,
+    quantizer: Float8BlockQuantizer,
+    dtype: torch.dtype,
+) -> Float8BlockwiseQTensor:
+    quantizer.set_usage(rowwise=True, columnwise=False)
+    return Float8BlockwiseQTensor(
+        shape=tuple(data.shape),
+        dtype=dtype,
+        fp8_dtype=_fp8_dtype_e4m3(),
+        rowwise_data=data.view(torch.uint8).contiguous(),
+        rowwise_scale_inv=_e8m0_to_te_scale_inv(scale),
+        columnwise_data=None,
+        columnwise_scale_inv=None,
+        quantizer=quantizer,
+        is_2D_scaled=True,
+        data_format=_tex.Float8BlockScaleTensorFormat.GEMM_READY,
+        requires_grad=False,
+    )
+
+
 class _TeGroupedGemmFp8(torch.autograd.Function):
     """TE ``split_quantize`` + ``general_grouped_gemm`` 的精简 FP8 grouped linear.
 
     Weight 布局对齐 DSV4：``weight`` shape ``[E, N, K]``（``y = x @ W^T`` per expert）。
-    quantizer / recipe 由外层 ``MyGroupedLinearFp8`` 持有并传入，避免每步重建。
+    quantizer / recipe 由外层 ``MyTeGroupedLinearFp8`` 持有并传入，避免每步重建。
 
     内部自动按 ``_FP8_BLOCK_ALIGN``(=16) pad/unpad 每个 expert 的 token 数，
     对齐 Megatron ``Fp8Padding`` / ``moe_router_padding_for_quantization``。
@@ -139,23 +200,18 @@ class _TeGroupedGemmFp8(torch.autograd.Function):
     ):
         m_splits = [int(x) for x in m_splits]
         num_gemms = len(m_splits)
-        if weight.dim() != 3 or weight.size(0) != num_gemms:
-            raise ValueError(
-                f"weight shape {tuple(weight.shape)} incompatible with m_splits={m_splits}"
-            )
+        assert weight.dim() == 3 and weight.size(0) == num_gemms, (weight.shape, m_splits)
         in_features = weight.size(-1)
         out_features = weight.size(1)
-        if inp.size(-1) != in_features:
-            raise ValueError(f"inp last dim {inp.size(-1)} != weight K {in_features}")
-        if sum(m_splits) != inp.numel() // in_features:
-            raise ValueError(
-                f"sum(m_splits)={sum(m_splits)} != inp rows={inp.numel() // in_features}"
-            )
-        if len(input_qs) != num_gemms or len(weight_qs) != num_gemms:
-            raise ValueError(
-                f"quantizer count mismatch: input={len(input_qs)} weight={len(weight_qs)} "
-                f"num_gemms={num_gemms}"
-            )
+        assert inp.size(-1) == in_features, (inp.size(-1), in_features)
+        assert sum(m_splits
+                  ) == inp.numel() // in_features, (sum(m_splits), inp.numel() // in_features)
+        assert len(input_qs) == num_gemms and len(weight_qs) == num_gemms, (
+            len(input_qs), len(weight_qs), num_gemms
+        )
+        weight_is_fp8 = isinstance(weight, Fp8TensorTrain)
+        if weight_is_fp8:
+            fp8_weight_data, fp8_weight_scale = _verify_prequantized_fp8_weight(weight, recipe)
 
         padded_m_splits = _pad_m_splits(m_splits)
 
@@ -165,14 +221,25 @@ class _TeGroupedGemmFp8(torch.autograd.Function):
                 rowwise=True,
                 columnwise=weight_requires_grad,
             )
-        columnwise_w = inp.requires_grad
-        for q in weight_qs:
-            q.set_usage(rowwise=True, columnwise=columnwise_w)
+        if not weight_is_fp8:
+            columnwise_w = inp.requires_grad
+            for q in weight_qs:
+                q.set_usage(rowwise=True, columnwise=columnwise_w)
 
         inp_view = inp.reshape(-1, in_features)
         inp_padded = _pad_rows(inp_view, m_splits, padded_m_splits)
         inputmats = _tex.split_quantize(inp_padded, padded_m_splits, input_qs)
-        weights_fp8 = [wq(w) for wq, w in zip(weight_qs, weight.unbind(0))]
+        if not weight_is_fp8:
+            weights_fp8 = [wq(w) for wq, w in zip(weight_qs, weight.unbind(0))]
+        else:
+            weights_fp8 = [
+                _wrap_fp8_weight(data, scale, quantizer, weight.dtype)
+                for data, scale, quantizer in zip(
+                    fp8_weight_data.unbind(0),
+                    fp8_weight_scale.unbind(0),
+                    weight_qs,
+                )
+            ]
 
         activation_dtype = inp.dtype
         out_padded = torch.empty(
@@ -255,17 +322,16 @@ class _TeGroupedGemmFp8(torch.autograd.Function):
 
         wgrad = None
         if ctx.requires_wgrad:
-            wgrad_list = [
-                torch.empty(
-                    (ctx.weight_shape[1], ctx.weight_shape[2]),
-                    dtype=ctx.activation_dtype,
-                    device=grad_output.device,
-                ) for _ in range(N)
-            ]
+            # GEMM 直接写进 [E, N, K] 的 per-expert 视图，省掉 torch.stack 的整块拷贝。
+            wgrad = torch.empty(
+                ctx.weight_shape,
+                dtype=ctx.activation_dtype,
+                device=grad_output.device,
+            )
             general_grouped_gemm(
                 inputmats,
                 grad_output_fp8,
-                wgrad_list,
+                list(wgrad.unbind(0)),
                 ctx.activation_dtype,
                 layout="NT",
                 grad=True,
@@ -273,13 +339,11 @@ class _TeGroupedGemmFp8(torch.autograd.Function):
                 use_bias=False,
                 use_split_accumulator=ctx.recipe.fp8_gemm_wgrad.use_split_accumulator,
             )
-            wgrad = torch.stack(wgrad_list, dim=0)
 
-        # inp, weight, m_splits, input_qs, weight_qs, grad_out_qs, recipe
         return dgrad, wgrad, None, None, None, None, None
 
 
-class MyGroupedLinearFp8(torch.nn.Module):
+class MyTeGroupedLinearFp8(torch.nn.Module):
     """无 Parameter 的 FP8 grouped linear：weight 外部传入，quantizer 常驻复用。
 
     对齐 DSV4 ``gate_up_proj`` / ``down_proj`` 的 stacked ``[E, N, K]`` 布局，
@@ -289,6 +353,8 @@ class MyGroupedLinearFp8(torch.nn.Module):
         super().__init__()
         self.num_gemms = num_gemms
         self.recipe = _make_recipe() if recipe is None else recipe
+        assert isinstance(self.recipe, Float8BlockScaling), type(self.recipe)
+        assert self.recipe.fp8_format == Format.E4M3, self.recipe.fp8_format
         self.input_qs, self.weight_qs, self.grad_out_qs = _make_grouped_fp8_quantizers(
             num_gemms,
             self.recipe,
@@ -297,11 +363,26 @@ class MyGroupedLinearFp8(torch.nn.Module):
     def forward(
         self,
         inp: torch.Tensor,
-        weight: torch.Tensor,
+        weight: torch.Tensor | Fp8TensorTrain,
         m_splits: list,
     ) -> torch.Tensor:
-        if len(m_splits) != self.num_gemms:
-            raise ValueError(f"len(m_splits)={len(m_splits)} != num_gemms={self.num_gemms}")
+        """Use a logical weight tensor with optional prequantized FP8 storage.
+
+        Parameters
+        ----------
+        inp : torch.Tensor
+            Shape ``(..., K)`` with rows concatenated in expert order.
+        weight : torch.Tensor
+            BF16/FP32 weight or `Fp8TensorTrain`, with logical shape ``(E, N, K)``.
+        m_splits : list
+            Number of input rows assigned to each of the ``E`` experts.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(..., N)``.
+        """
+        assert len(m_splits) == self.num_gemms, (len(m_splits), self.num_gemms)
         return _TeGroupedGemmFp8.apply(
             inp,
             weight,

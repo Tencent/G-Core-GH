@@ -194,7 +194,7 @@ LAUNCHER=mpirun bash tests/test_alignment_v4/rl/verl/scripts/run.sh
 
 两侧都需要在进程/通信初始化前固定 kernel 与 RNG 的确定性：torch 确定性算法、cuBLAS
 workspace、NCCL 算法、FlashAttention 确定性、以及 `PYTHONHASHSEED`。gcore 由
-`training.apply_deterministic_mode` 统一开启（同时强制禁用不稳定的 FA3），verl 侧由
+`training.apply_deterministic_mode` 统一开启（flash 后端时自动 `disable_flash_attn_3=True`），verl 侧由
 `GCORE_VERL_DETERMINISTIC=1` 触发一个 `sitecustomize.py` 引导：在解释器启动最早期启用
 torch 确定性并卸载 FA3。这层保证单框架内「同配置跑两遍曲线一致」。
 

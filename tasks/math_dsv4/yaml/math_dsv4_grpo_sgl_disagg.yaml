@@ -21,13 +21,15 @@ training:
   ppo_max_epochs_2: 1
   seq_length: 10240
   moe_pad_with_random_tokens: True
-  moe_router_replay: False
+  moe_router_replay: True
   auto_load_from_save_ckpt: True
   early_swap_model: True
   recompute: True
+  use_linear_ce: True
+  linear_ce_backend: separate
   single_controller: True
   async_rollout: True
-  rollout_max_staleness: 0
+  rollout_max_staleness: 1
   metrics_report:
     - "acc_reward"
     - "fmt_reward"
@@ -60,12 +62,13 @@ data:
 
 policy:
   dist_config:
-    nnodes: 16
+    nnodes: 8
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     expert_model_parallel_size: 8
-    context_parallel_size: 2
+    context_parallel_size: 4
   model_arch: "deepseek_v4"
+  ppo_pack_seq: True
   attn_implementation: "fused"
   indexer_backend: "fused"
   hf_model_path: "hf-hub/sgl-project/DeepSeek-V4-Flash-FP8"
@@ -94,7 +97,7 @@ sampler:
       max_running_requests: 16
       temperature: 1.0
       top_p: 0.9
-      generate_max_tokens: 8192
+      generate_max_tokens: 2048
       override_infer_engine_config:
         tokenizer_mode: deepseek_v4
         reasoning_parser: deepseek_v4

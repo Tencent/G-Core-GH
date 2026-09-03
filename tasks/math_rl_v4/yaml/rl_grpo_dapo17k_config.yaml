@@ -18,7 +18,8 @@ training:
   build_from_mbridge: True
   num_train_epoches: 1
   ppo_max_epochs_2: 1
-  seq_length: 10240
+  seq_length: 16384
+  attention_backend: flash
   metrics_report:
     - "acc_reward"
     - "fmt_reward"
@@ -52,6 +53,7 @@ policy:
   dist_config:
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 1
+    context_parallel_size: 2
   model_arch: qwen3
   hf_model_path: "hf-hub/Qwen/Qwen3-4B"
   hf_tokenizer_path: "hf-hub/Qwen/Qwen3-4B"
@@ -62,7 +64,6 @@ policy:
     rpc_type: ray
   bt_rm_client:
     rpc_type: ray
-  balance_dp_seqlen: True
   smart_pad_infer: True
   smart_pad_train: True
   override_transformer_config:
@@ -108,6 +109,11 @@ ppo:
   ppo_dual_clip_ratio_c: 10.0
   ppo_entropy_bonus: 0.0
   ppo_logps_ratio_clamp: 20.0
+  # Exercise response-padded path: TIS sequence uses masked_sum_expand, not THD.
+  enable_off_policy_correction: True
+  off_policy_correction_level: "sequence"
+  off_policy_correction_mode: "truncate"
+  off_policy_correction_upper_bound: 2.0
 
 debug:
   save_first_rollout_data: True

@@ -15,6 +15,8 @@ class DebugConfig(MappingProtocol):
     debug_engine_save_path : str
     save_first_rollout_data : bool
     save_every_rollout_data : bool
+    save_decode_jsonl : bool
+        Also save decoded rollout trajectories as JSONL when rollout data is saved.
     skip_rollout_load_from_disk : bool
         DEBUG: skip RolloutController fire/collect AND actor process_rollout;
         load saved batches/metrics from ``load_rollout_path`` instead.
@@ -31,11 +33,22 @@ class DebugConfig(MappingProtocol):
     trainer_return_ppo_step_metrics : bool
     debug_no_optim : bool
         Disable optimizer updates entirely.
+    synthetic_generation_prompt_expansion : bool
+        Repeat each SFT generation prompt by a deterministic per-sample factor.
     debug_dump_first_n_ppo_step_moe_token_dist : int
         DEBUG: dump per-layer MoE per-expert token counts. ``0`` disables;
         ``-1`` every PPO step; ``N>0`` only first ``N`` PPO steps.
     debug_moe_dist_dump_dir : str
         DEBUG: root for ``step_{n}/pp{pp_rank}.jsonl`` dumps. Created on demand.
+    debug_dump_expert_token_counts: bool
+        DEBUG: dump one global-batch per-expert token counts then sys.exit(0).
+        Forces freeze_router_correction_bias=False to activate the counting hooks.
+        Feeds the offline expert re-permutation pipeline.
+    debug_dump_expert_token_counts_path: str
+        DEBUG: path to dump expert token counts.
+    log_thd_pack_layout : bool
+        Rank-0 first microbatch of each step. Dumps per-segment
+        ``raw_lens`` / ``pad_lens``, which grow with pack occupancy.
     """
     debug_engine_update_weight: bool = field(
         default=False, metadata={"help": "Whether to do debug."}
@@ -48,6 +61,24 @@ class DebugConfig(MappingProtocol):
     )
     save_every_rollout_data: bool = field(
         default=False, metadata={"help": "Whether to save every rollout data."}
+    )
+    save_decode_jsonl: bool = field(
+        default=False,
+        metadata={"help": "Whether to additionally save decoded rollout trajectories as JSONL."},
+    )
+    dump_agentic_trajectory: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "DEBUG: dump decoded agentic per-turn prompt/response and final "
+                    "concatenated trajectory sequence to JSONL files with special tokens kept."
+                )
+        },
+    )
+    agentic_trajectory_dump_dir: str = field(
+        default="debug-tmp/agentic_trajectory",
+        metadata={"help": "DEBUG: root dir for per-trajectory agentic JSONL dumps."},
     )
     skip_rollout_load_from_disk: bool = field(
         default=False,
@@ -85,6 +116,16 @@ class DebugConfig(MappingProtocol):
     )
     debug_no_optim: bool = field(
         default=False, metadata={"help": "disable optim for debugging purpose"}
+    )
+    synthetic_generation_prompt_expansion: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "DEBUG: repeat each SFT generation prompt by a deterministic "
+                    "per-sample factor in [40, 100], capped at training.seq_length."
+                )
+        },
     )
     debug_dump_first_n_ppo_step_moe_token_dist: int = field(
         default=0,
@@ -174,3 +215,47 @@ class DebugConfig(MappingProtocol):
         default=False,
         metadata={"help": "DEBUG: enable alignment debug mode."},
     )
+    debug_dump_expert_token_counts: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "DEBUG: dump one global-batch per-expert token counts "
+                    "([num_topk_layers, num_experts]) then sys.exit(0). Forces "
+                    "freeze_router_correction_bias=False to activate the counting hooks. "
+                    "Feeds the offline expert re-permutation pipeline."
+                )
+        },
+    )
+    debug_dump_expert_token_counts_path: str = field(
+        default="debug-tmp/debug_moe_router/counts.pt",
+        metadata={"help": ("DEBUG: path to dump expert token counts.")},
+    )
+    log_thd_pack_layout: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "DEBUG: rank-0 first microbatch dumps THD pack/CP layout "
+                    "(raw_lens / pad_lens / n_cross). Off by default; lists "
+                    "grow with pack occupancy."
+                )
+        },
+    )
+    ppo_padding_check_mode: str = field(
+        default="off",
+        metadata={
+            "help":
+                (
+                    "GDEBUG: check the PPO policy/critic config at actor init. "
+                    "off | warn | abort."
+                )
+        },
+    )
+
+    def __post_init__(self):
+        # keep the modes literal here: loading a config must not import gdebug
+        assert self.ppo_padding_check_mode in ["off", "warn", "abort"], (
+            f"debug.ppo_padding_check_mode={self.ppo_padding_check_mode!r}, "
+            "expected one of ('off', 'warn', 'abort')"
+        )

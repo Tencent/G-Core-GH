@@ -1,5 +1,6 @@
 from gpatch_v4.utils.common_utils import (
     Envelope,
+    GenerationAborted,
     assert_hf_metadata_cache_exists,
     cache_hf_metadata_files,
     clear_memory,
@@ -31,8 +32,10 @@ from gpatch_v4.utils.communication_utils import (
 from gpatch_v4.utils.data_manipulate_utils import aggregate_metrics, pad_to_length
 from gpatch_v4.utils.filter_samplings import (
     BUILDIN_FILTER_SAMPLING_STRATEGIES,
+    DynamicBatchFilterRegistry,
     FilterSamplingRegistry,
     best_and_worst,
+    filter_rollout_samples,
     register_custom_filter_sampling,
     truncated_test,
 )

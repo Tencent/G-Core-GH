@@ -14,12 +14,12 @@ python3 -u gpatch_v4/entry/train_lm_grpo.py \
     policy.ppo_pack_seq=True \
     training.auto_load_from_save_ckpt=False \
     +policy.fp8_qat=True \
+    +policy.fp4_qat=True \
+    +policy.sglang_export_fp4_qdq=True \
     +training.linear_ce_backend=separate \
-    +training.use_linear_ce=True
+    +training.use_linear_ce=True \
+    report.wandb_exp_name="math_dsv4_grpo_sgl_0517"
 
     # debug.debug_engine_update_weight=True \
     # +policy.fp8_qat=True \
     # +policy.fp4_qat=True
-
-    # +training.ppo_dump_metrics_interval=1 \
-    # +training.ppo_dump_metrics_dir=debug-tmp/grpo_thd_alignment \

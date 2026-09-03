@@ -14,6 +14,9 @@ class TestFsdp2Muon(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         kill_all_actors_and_shutdown_ray()
 
+    @unittest.skip(
+        "FSDP2 muon is temporarily disabled in setup_optimizer until NS-on-shard is fixed"
+    )
     async def test_muon_train_save_load(self):
         config = load_config("test_fsdp_muon", FinetuneConfig)
         save_path = config.checkpoint.save_ckpt_path

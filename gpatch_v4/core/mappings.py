@@ -16,24 +16,34 @@ from megatron.core.parallel_state import (
 )
 
 
-def _all_reduce_of_cp(input_):
-    # All-reduce.
-    torch.distributed.all_reduce(input_, group=get_context_parallel_group())
+def _all_reduce_of_cp(input_, group=None):
+    """All-reduce over a static or dynamically selected CP group."""
+    if group is None:
+        group = get_context_parallel_group()
+    torch.distributed.all_reduce(input_, group=group)
     return input_
 
 
 class _AllReduceOfContextParallel(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input_):
-        return _all_reduce_of_cp(input_)
+    def forward(ctx, input_, group):
+        return _all_reduce_of_cp(input_, group)
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output
+        # CP loss scaling and DP×CP gradient synchronization are handled by
+        # Megatron's outer training schedule. Each CP rank must therefore
+        # retain its local gradient contribution rather than all-reducing it.
+        return grad_output, None
 
 
-def reduce_from_context_parallel_region(input_):
-    return _AllReduceOfContextParallel.apply(input_)
+def reduce_from_context_parallel_region(input_, group=None):
+    """Sum forward values over a CP group with identity local backward.
+
+    ``group`` is optional for the existing static-CP callers. Dynamic CP
+    callers pass their per-microbatch subgroup explicitly.
+    """
+    return _AllReduceOfContextParallel.apply(input_, group)
 
 
 class _AllGatherToContextParallelRegion(torch.autograd.Function):

@@ -25,6 +25,7 @@ try:
 except ImportError:
     DeepseekV4Config = None
 
+from .freeze_csa_indexer import freeze_csa_indexer_params
 from .hp import apply_hp
 from .modeling_deepseek_v4 import DeepseekV4ForCausalLM
 from .router_replay import (
@@ -46,6 +47,7 @@ __all__ = [
     "disable_router_replay",
     "enable_router_replay",
     "extract_topk_layers",
+    "freeze_csa_indexer_params",
     "get_topk_layer_indices",
     "router_replay_ctx",
 ]

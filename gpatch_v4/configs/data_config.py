@@ -16,6 +16,10 @@ class DataConfig(MappingProtocol):
         Python file containing the dataset implementation.
     fn_name : str or None
         Function returning the dataloader.
+    custom_rollout_data_source_path : str or None
+        Python file containing a custom rollout data source class.
+    custom_rollout_data_source_name : str or None
+        Class name to import from ``custom_rollout_data_source_path``.
     get_batch_fn_name : str or None
     data_pathes : list of str or None
     eval_data_pathes : list of str or None
@@ -37,6 +41,14 @@ class DataConfig(MappingProtocol):
     """
     py_path: Optional[str] = field(default=None, metadata={"help": "dataset impl python file"})
     fn_name: Optional[str] = field(default=None, metadata={"help": "get dataloader function name"})
+    custom_rollout_data_source_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to a custom DataSourceBase implementation."},
+    )
+    custom_rollout_data_source_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Class name to import from custom_rollout_data_source_path."},
+    )
 
     get_batch_fn_name: Optional[str] = field(
         default=None, metadata={"help": "get batch function name"}
@@ -79,4 +91,12 @@ class DataConfig(MappingProtocol):
     )
 
     def __post_init__(self):
-        assert self.multiprocessing_method in ["fork", "forkserver", "spawn"], "multiprocessing_method must be 'fork' or 'forkserver' or 'spawn'"
+        assert self.multiprocessing_method in [
+            "fork", "forkserver", "spawn"
+        ], "multiprocessing_method must be 'fork' or 'forkserver' or 'spawn'"
+        assert bool(self.custom_rollout_data_source_path) == bool(
+            self.custom_rollout_data_source_name
+        ), (
+            "custom_rollout_data_source_path and "
+            "custom_rollout_data_source_name must be configured together"
+        )

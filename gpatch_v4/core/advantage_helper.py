@@ -210,6 +210,7 @@ def prepare_and_compute_grpo_advantages(ctx: AdvantageContext) -> AdvantageResul
         grpo_sampling_times=ctx.config.training.sampling_keep_n,
         grpo_advantage_epsilon=ctx.config.ppo.grpo_advantage_epsilon,
         sample_mask=ctx.sample_mask,
+        norm_adv_by_std_in_grpo=ctx.config.ppo.norm_adv_by_std_in_grpo,
     )
     return AdvantageResult(advantages=advantages, returns=returns)
 
@@ -338,6 +339,15 @@ def prepare_and_compute_opd_advantages(ctx: AdvantageContext) -> AdvantageResult
 
     log_prob_top_k = ctx.config.ppo.log_prob_top_k
 
+    # Pure-OPD switch: drop reward before KL-only advantage so the env reward
+    # (still recorded in the rollout batch for metrics) does not contribute to
+    # the policy gradient. Without this flag, calculate_reverse_kl_advantages
+    # adds a GRPO reward term whenever ``rewards`` is non-None — fine for
+    # PG-loss OPD, but not for "pure OPD".
+    rewards_for_adv = (
+        None if getattr(ctx.config.ppo, "opd_ignore_env_reward", False) else ctx.rewards
+    )
+
     if log_prob_top_k > 0:
         # Top-K path: 3D ``[S-1, K]`` advantages replace the 2D label-based KL advantages.
         # The loss layer detects this via ``advantages.dim() == 3``.
@@ -350,7 +360,7 @@ def prepare_and_compute_opd_advantages(ctx: AdvantageContext) -> AdvantageResult
         returns = None
     else:
         advantages, returns, distill_metrics = calculate_reverse_kl_advantages(
-            rewards=ctx.rewards,
+            rewards=rewards_for_adv,
             mask_lst=ctx.mask,
             logprobs=ctx.logprobs,
             teacher_logprobs=teacher_logprobs,
@@ -482,8 +492,7 @@ def _compute_topk_advantages(
 
     multi_teacher_topk_lp: Dict[str, List[torch.Tensor]] = {}
     prefix = (
-        "teacher_topk_logprobs_" if strategy == "only_tch"
-        else "teacher_on_stu_topk_logprobs_"
+        "teacher_topk_logprobs_" if strategy == "only_tch" else "teacher_on_stu_topk_logprobs_"
     )
     for key, val in rollout_batch.items():
         if key.startswith(prefix):

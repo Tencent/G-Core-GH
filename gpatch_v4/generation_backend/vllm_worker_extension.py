@@ -13,7 +13,18 @@ from gpatch_v4.generation_backend.vllm_model_specific import (
     restore_moe_after_wakeup,
     save_moe_for_sleep,
 )
+from gpatch_v4.generation_backend.vllm_routed_experts_runtime_patch import (
+    apply_vllm_routed_experts_capacity_patch,
+    is_vllm_r3_engine_core_patch_enabled,
+)
 from gpatch_v4.utils import log
+
+# ``worker_extension_cls`` is resolved inside every vLLM TP worker before
+# the concrete GPU worker is constructed. Install the opt-in v0.19.1
+# compatibility patch here so spawn/forkserver workers do not rely on parent
+# process state.
+if is_vllm_r3_engine_core_patch_enabled():
+    apply_vllm_routed_experts_capacity_patch()
 
 
 class GCoreVllmWorkerExtension:

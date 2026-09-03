@@ -18,13 +18,10 @@ Usage::
 测试 docker image：mirrors.tencent.com/wepsdl/rl-sglang:v2.25.55.55.7-cuda-12.9-cudnn-9-py-3.10-torch-2.11.0-fa-2.8.3-te-2.10-mlm-wxdev-hf-5.8.1-sglang-wx0.5.14
 """
 
-import os
 import unittest
 
 import torch
 import pytest
-
-os.environ.setdefault("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
 
 _HAS_TE = False
 try:
@@ -406,17 +403,22 @@ class TestTeGroupedLinearFp8(unittest.TestCase):
 
 
 # ======================================================================
-# Part 2c: MyGroupedLinearFp8（实现见 gpatch_v4.models.deepseek_v4.fp8）
+# Part 2c: MyTeGroupedLinearFp8（实现见 gpatch_v4.models.deepseek_v4.fp8）
 # ======================================================================
 
 try:
+    from gpatch_v4.kernel.quantize.eager_quant_kernels import (
+        quant_fp8_e4m3_scale_e8m0,
+    )
     from gpatch_v4.models.deepseek_v4.fp8 import (  # noqa: E402
-        MyGroupedLinearFp8,
+        MyTeGroupedLinearFp8,
         _pad_m_splits,
     )
+    from gpatch_v4.models.deepseek_v4.fp8_tensor import Fp8TensorTrain
 except ImportError:
-    MyGroupedLinearFp8 = None  # type: ignore[misc,assignment]
+    MyTeGroupedLinearFp8 = None  # type: ignore[misc,assignment]
     _pad_m_splits = None  # type: ignore[misc,assignment]
+    Fp8TensorTrain = None  # type: ignore[misc,assignment]
 
 
 def _bench_cuda_ms(fn, warmup: int = 5, iters: int = 20) -> float:
@@ -435,9 +437,9 @@ def _bench_cuda_ms(fn, warmup: int = 5, iters: int = 20) -> float:
 
 @pytest.mark.skipif(_SKIP_TE, reason=_SKIP_TE_REASON)
 @pytest.mark.skipif(_SKIP_CC, reason=_SKIP_CC_REASON)
-@pytest.mark.skipif(MyGroupedLinearFp8 is None, reason="MyGroupedLinearFp8 import failed")
+@pytest.mark.skipif(MyTeGroupedLinearFp8 is None, reason="MyTeGroupedLinearFp8 import failed")
 class TestTeGroupedGemmFp8CustomOp(unittest.TestCase):
-    """``MyGroupedLinearFp8`` vs ``te.GroupedLinear`` FP8 对齐 + perf。"""
+    """``MyTeGroupedLinearFp8`` vs ``te.GroupedLinear`` FP8 对齐 + perf。"""
 
     device = "cuda"
     dtype = torch.bfloat16
@@ -447,6 +449,11 @@ class TestTeGroupedGemmFp8CustomOp(unittest.TestCase):
     M_SPLITS = [8192, 16, 2048, 256]
     # 含非 16 对齐 split；custom op 应自动 pad，te.GroupedLinear 裸调会挂。
     M_SPLITS_UNEVEN = [32, 1, 2000, 323]
+
+    def test_rejects_non_e4m3_recipe(self):
+        recipe = Float8BlockScaling(fp8_format=Format.HYBRID)
+        with self.assertRaises(AssertionError):
+            MyTeGroupedLinearFp8(num_gemms=self.NUM_EXPERTS, recipe=recipe)
 
     def _make_inputs(self, m_splits=None):
         m_splits = self.M_SPLITS if m_splits is None else m_splits
@@ -478,7 +485,7 @@ class TestTeGroupedGemmFp8CustomOp(unittest.TestCase):
             for i in range(self.NUM_EXPERTS):
                 getattr(gl, f"weight{i}").copy_(weight[i])
 
-        custom = MyGroupedLinearFp8(num_gemms=self.NUM_EXPERTS)
+        custom = MyTeGroupedLinearFp8(num_gemms=self.NUM_EXPERTS)
 
         recipe = _make_recipe()
         with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
@@ -558,7 +565,7 @@ class TestTeGroupedGemmFp8CustomOp(unittest.TestCase):
         ref_out = torch.cat(outs, dim=0)
         ref_out.sum().backward()
 
-        custom = MyGroupedLinearFp8(num_gemms=self.NUM_EXPERTS)
+        custom = MyTeGroupedLinearFp8(num_gemms=self.NUM_EXPERTS)
         custom_out = custom(x, weight, m_splits)
         custom_out.sum().backward()
 
@@ -578,3 +585,48 @@ class TestTeGroupedGemmFp8CustomOp(unittest.TestCase):
         self.assertTrue(torch.isfinite(custom_out).all())
         self.assertTrue(torch.isfinite(x.grad).all())
         self.assertTrue(torch.isfinite(weight.grad).all())
+
+    def test_prequantized_weight_matches_internal_quantization(self):
+        m_splits = [16] * self.NUM_EXPERTS
+        x, storage_weight = self._make_inputs(m_splits)
+        x_ref = x.detach().clone().requires_grad_(True)
+        weight_ref = storage_weight.detach().clone().requires_grad_(True)
+        weight_data, weight_scale = quant_fp8_e4m3_scale_e8m0(storage_weight.detach())
+        weight_fp8 = Fp8TensorTrain(
+            weight_data.view(torch.uint8),
+            weight_scale,
+            storage_weight.dtype,
+        ).requires_grad_(True)
+
+        prequantized = MyTeGroupedLinearFp8(num_gemms=self.NUM_EXPERTS)
+        reference = MyTeGroupedLinearFp8(num_gemms=self.NUM_EXPERTS)
+        out = prequantized(x, weight_fp8, m_splits)
+        ref_out = reference(x_ref, weight_ref, m_splits)
+        torch.testing.assert_close(out, ref_out, rtol=0.0, atol=0.0)
+
+        grad = torch.randn_like(out)
+        out.backward(grad)
+        ref_out.backward(grad)
+        torch.testing.assert_close(x.grad, x_ref.grad, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(weight_fp8.grad, weight_ref.grad, rtol=0.0, atol=0.0)
+
+    def test_prequantized_weight_rejects_1d_weight_recipe(self):
+        m_splits = [16] * self.NUM_EXPERTS
+        x, weight = self._make_inputs(m_splits)
+        weight_data, weight_scale = quant_fp8_e4m3_scale_e8m0(weight.detach())
+        weight_fp8 = Fp8TensorTrain(
+            weight_data.view(torch.uint8),
+            weight_scale,
+            weight.dtype,
+        )
+        recipe = Float8BlockScaling(
+            fp8_format=Format.E4M3,
+            w_block_scaling_dim=1,
+        )
+        custom = MyTeGroupedLinearFp8(num_gemms=self.NUM_EXPERTS, recipe=recipe)
+        with self.assertRaises(AssertionError):
+            custom(
+                x,
+                weight_fp8,
+                m_splits,
+            )

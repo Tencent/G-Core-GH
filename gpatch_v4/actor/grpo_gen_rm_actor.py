@@ -158,6 +158,8 @@ class GrpoGenRmActor(BaseActor, TokenizerMixin):
             sgl_mamba_full_memory_ratio=infer_engine_config.sgl_mamba_full_memory_ratio,
             sgl_mamba_scheduler_strategy=infer_engine_config.sgl_mamba_scheduler_strategy,
             sgl_enable_spec_v2=infer_engine_config.sgl_enable_spec_v2,
+            return_original_logprob=config.ppo.use_original_logprob,
+            model_override_args=infer_engine_config.model_override_args,
             apply_deterministic_mode=getattr(config.training, "apply_deterministic_mode", False),
             placement_type=config.placement_type,
             pg_bundle_indices=pg_bundle_indices,
@@ -234,6 +236,16 @@ class GrpoGenRmActor(BaseActor, TokenizerMixin):
         if self.infer_engine is None:
             return {"ret": True}
         await self.infer_engine.sleep()
+        return {"ret": True}
+
+    async def abort_all_requests(self, req_dict):
+        """Abort every in-flight scoring request on this gen-RM."""
+        if not self._is_master_node:
+            return {"ret": True}
+        if self.infer_engine is None:
+            return {"ret": True}
+        await self.infer_engine.abort_all_requests()
+        log("gen_rm abort_all_requests done", rank=0)
         return {"ret": True}
 
     async def wake_up(self, req_dict):

@@ -22,18 +22,22 @@ git rm -rf `find tasks -mindepth 1 -maxdepth 1 -type d | grep -v -e 'tasks/math_
 git rm -rf mpatch
 git rm -rf gpatch
 git rm -rf debug
+git rm -rf gpatch_v4/training_backend/light
 git rm -rf `find gpatch_v4/models -maxdepth 1 -type d -name 'oteam*'`
 git rm -rf `find gpatch_v4/models -maxdepth 1 -type d -name 'weclip*'`
 git rm -rf `find gpatch_v4/models -maxdepth 1 -type d -name 'welm*'`
 git rm -rf `find gpatch_v4/models -maxdepth 1 -type d -name 'wegen*'`
 git rm -f gpatch_v4/extended_pipeline/pipeline_oteam4_3.py gpatch_v4/extended_pipeline/pipeline_oteam4_4.py
 git rm -f gpatch_v4/extended_model/welm_v4.py
+git rm -f gpatch_v4/extended_model/welm_omni_v4_5.py
+git rm -f gpatch_v4/training_backend/megatron_backend/welm_v45_myfa.py
 sed -i 's/WANDB_BASE_URL=.*/WANDB_BASE_URL=/g' `find -name '*.sh' | grep -v make-pub.sh`
 sed -i 's/WANDB_API_KEY=.*/WANDB_API_KEY=/g' `find -name '*.sh' | grep -v make-pub.sh`
 
 # Remove report: blocks from YAML files (wandb credentials)
 python3 -c "
 import re, os, glob
+from concurrent.futures import ThreadPoolExecutor
 
 files = []
 for p in ['**/*.yaml', '**/*.yml']:
@@ -42,12 +46,12 @@ for p in ['**/*.yaml', '**/*.yml']:
         if 'hf-hub' not in parts:
             files.append(f)
 
-for f in files:
+def process(f):
     try:
         with open(f) as fh:
             lines = fh.readlines()
     except (PermissionError, IOError):
-        continue
+        return
 
     new_lines = []
     skip_indent = None
@@ -81,6 +85,9 @@ for f in files:
 
     with open(f, 'w') as fh:
         fh.writelines(new_lines)
+
+with ThreadPoolExecutor(max_workers=min(32, max(4, (os.cpu_count() or 4) * 4))) as ex:
+    list(ex.map(process, files))
 " || true
 
 # cleanup special

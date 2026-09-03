@@ -20,12 +20,12 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from .checkpoint import _load_checkpoint_hp, _save_checkpoint_hp
-from .mtp import DeepseekV4MTPBlock
+from .fp8_tensor import _FP8_BLOCK_SIZE, Fp8TensorAg, _new_hook_stats
 
 try:
-    from .fp8 import MyGroupedLinearFp8
+    from .fp8 import MyTeGroupedLinearFp8
 except ImportError:
-    MyGroupedLinearFp8 = None
+    MyTeGroupedLinearFp8 = None
 
 # pyright: reportAttributeAccessIssue=false, reportArgumentType=false, reportCallIssue=false, reportOperatorIssue=false, reportGeneralTypeIssues=false
 
@@ -97,6 +97,7 @@ _FP32_KEEP_PER_LAYER_PATHS = (
     "attn_hc",
     "ffn_hc",
     "hc_head",
+    "confidence_head",
     "self_attn._sink_holder",
     "self_attn.compressor._position_bias_holder",
     "self_attn.compressor.indexer._position_bias_holder",
@@ -133,7 +134,9 @@ def apply_hp(
     amp_fp32: bool = True,
     fp8_qat: bool = False,
     fp4_qat: bool = False,
+    fp4_qat_indexer: bool = False,
     fp8: bool = False,
+    fsdp_fp8_gather: bool = False,
     moe_router_force_load_balancing: bool = False,
 ) -> nn.Module:
     """Shard experts for EP, apply FSDP2, and bind ``clip_grad_norm_`` / ``load_checkpoint_hp`` / ``save_checkpoint_hp``.
@@ -197,16 +200,23 @@ def apply_hp(
         Enable E2M1 1×32 fake-quantization of routed MoE expert weights.
         When both QAT flags are enabled, this takes priority over
         ``fp8_qat`` for these weights.
+    fp4_qat_indexer : bool, keyword-only, default False
+        Apply Hadamard rotation and FP4 QAT to the indexer's
+        query and compressed keys. It takes priority over ``fp8_qat`` and is
+        orthogonal to ``fp4_qat`` which only covers expert weights.
     fp8 : bool, keyword-only, default False
-        When True, MoE expert ``gate_up`` / ``down`` grouped GEMMs use
-        TE Float8BlockScaling via :class:`MyGroupedLinearFp8` (stacked
-        ``[E,N,K]`` weights; auto-pads per-expert M to 16). Orthogonal
-        to ``fp8_qat`` (fake-quant STE). Requires Transformer Engine.
+        Enable TE Float8BlockScaling grouped GEMMs for routed MoE expert
+        ``gate_up`` / ``down`` weights. FSDP still all-gathers bf16
+        unless ``fsdp_fp8_gather`` is also True. Incompatible with
+        ``fp8_qat`` and ``fp4_qat``.
+    fsdp_fp8_gather : bool, keyword-only, default False
+        Wrap routed expert weights in :class:`Fp8TensorAg` so FSDP
+        all-gathers FP8+E8M0 (TE consumes ``Fp8TensorTrain`` directly).
+        Requires ``fp8=True``. Default False keeps the bf16 FSDP path.
     moe_router_force_load_balancing : bool, keyword-only, default False
-        Sets ``model.config.moe_router_force_load_balancing`` (and MTP
-        deepcopy configs). When True, TopKRouter picks random unique top-k
-        indices for MoE load-balanced benchmarks. Mutually exclusive with
-        router replay.
+        Sets ``model.config.moe_router_force_load_balancing``. When True,
+        TopKRouter picks random unique top-k indices for MoE load-balanced
+        benchmarks. Mutually exclusive with router replay.
 
     Returns
     -------
@@ -227,6 +237,19 @@ def apply_hp(
     file in Phase 2; rank 0 globally renames and writes index + config +
     tokenizer in Phase 3. See :func:`_save_checkpoint_hp`.
     """
+    from gpatch_v4.training_backend.light.distributed.parallelizer.fsdp_patch import (
+        apply_fsdp2_post_forward_patch,
+    )
+
+    apply_fsdp2_post_forward_patch()
+
+    if fsdp_fp8_gather and not fp8:
+        raise ValueError("fsdp_fp8_gather requires fp8=True")
+    if fp8 and (fp8_qat or fp4_qat):
+        raise ValueError("fp8 is incompatible with fp8_qat and fp4_qat")
+    if fp8 and MyTeGroupedLinearFp8 is None:
+        raise RuntimeError("fp8 requires Transformer Engine")
+
     if ep_backend not in ("eager", "deepep"):
         raise ValueError(f"unknown ep_backend: {ep_backend}")
     if ep_backend == "deepep":
@@ -240,24 +263,10 @@ def apply_hp(
     model.config.amp_fp32 = amp_fp32
     model.config.fp8_qat = fp8_qat
     model.config.fp4_qat = fp4_qat
+    model.config.fp4_qat_indexer = fp4_qat_indexer
     model.config.fp8 = fp8
+    model.config.fsdp_fp8_gather = fsdp_fp8_gather
     model.config.moe_router_force_load_balancing = moe_router_force_load_balancing
-    # Sync backend knobs to every DeepseekV4Attention / DeepseekV4Experts
-    # (including MTP blocks), because MTP blocks are constructed before
-    # apply_hp runs, and their self.self_attn.config is a deepcopy that
-    # may not have these attrs.
-    for layer in _get_layers(model):
-        if isinstance(layer, DeepseekV4MTPBlock):
-            layer.config.attn_backend = attn_backend
-            layer.config.indexer_backend = indexer_backend
-            layer.config.ep_backend = ep_backend
-            layer.config.deepep_num_sms = deepep_num_sms
-            layer.config.amp_fp32 = amp_fp32
-            layer.config.fp8_qat = fp8_qat
-            layer.config.fp4_qat = fp4_qat
-            layer.config.fp8 = fp8
-            layer.config.moe_router_force_load_balancing = moe_router_force_load_balancing
-            assert layer.self_attn.config.attn_backend == attn_backend
 
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy(
@@ -284,10 +293,31 @@ def apply_hp(
         for layer in layers:
             _shard_experts_dtensor(layer.mlp.experts, ep_2d_mesh)
 
+    if fsdp_fp8_gather:
+        for layer in layers:
+            experts = layer.mlp.experts
+            for name in ("gate_up_proj", "down_proj"):
+                param = getattr(experts, name)
+                if (
+                    param.shape[-2] % _FP8_BLOCK_SIZE[0] != 0 or
+                    param.shape[-1] % _FP8_BLOCK_SIZE[1] != 0
+                ):
+                    raise ValueError(
+                        f"FP8 all-gather requires {name} shape {tuple(param.shape)} "
+                        f"divisible by {_FP8_BLOCK_SIZE} in its last two dimensions"
+                    )
+                wrapped = Fp8TensorAg(param.detach())
+                setattr(
+                    experts,
+                    name,
+                    nn.Parameter(wrapped, requires_grad=param.requires_grad),
+                )
+            experts._fp8_all_gather_stats = _new_hook_stats()
+
     if fp8:
         for layer in layers:
             experts = layer.mlp.experts
-            experts.fp8_grouped_linear = MyGroupedLinearFp8(num_gemms=experts.num_local_experts, )
+            experts.fp8_grouped_linear = MyTeGroupedLinearFp8(num_gemms=experts.num_local_experts, )
 
     # Effective number of independent samples = world_size / cp_size.
     # Inside a cp-pair, all ranks see the same input (sequence partitioned
@@ -326,6 +356,7 @@ def apply_hp(
         # (cp_full_mesh, size=world_size). Override its divide factor to
         # match the independent-sample count.
         layer.set_gradient_divide_factor(grad_divide_factor)
+        layer.set_modules_to_forward_prefetch([layer.mlp.experts])
 
     if amp_fp32:
         for path in _FP32_KEEP_ROOT_PATHS:

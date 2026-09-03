@@ -3,17 +3,19 @@
 
 import asyncio
 import copy
+import json
 import math
 import os
 import sys
 import types
 from contextlib import nullcontext
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 from packaging import version
 
 from gpatch_v4.configs.infer_engine_config import InferEngineConfig
+from gpatch_v4.core.device import preprocess_before_build_sgl_engine
 from gpatch_v4.orches.flashinfer_cudart_fix import patch_ctypes_for_cudart_stub
 from gpatch_v4.utils.common_utils import log
 from gpatch_v4.utils.logging_utils import (
@@ -71,12 +73,21 @@ def _ensure_sglang_log_config():
     config = {
         "version": 1,
         "disable_existing_loggers": False,
-        "loggers": {
-            "sglang.srt.models.deepseek_v4": {"level": "ERROR"},
-            "sglang.srt.models.deepseek_v2": {"level": "ERROR"},
-            "httpx": {"level": "WARNING"},
-            "httpcore": {"level": "WARNING"},
-        },
+        "loggers":
+            {
+                "sglang.srt.models.deepseek_v4": {
+                    "level": "ERROR"
+                },
+                "sglang.srt.models.deepseek_v2": {
+                    "level": "ERROR"
+                },
+                "httpx": {
+                    "level": "WARNING"
+                },
+                "httpcore": {
+                    "level": "WARNING"
+                },
+            },
     }
 
     fd, path = _tempfile.mkstemp(suffix=".json", prefix="sglang_log_cfg_")
@@ -95,7 +106,6 @@ class FakeSignal:
     @staticmethod
     def signal(*args):
         pass
-
 
 
 def patch_import_processors():
@@ -242,6 +252,7 @@ class InferEngine:
         infer_engine_config: InferEngineConfig,
         stop_at_token_id: int,
         logit_bias: Optional[dict[str | int, int]] = None,
+        is_eval: bool = False,
     ):
         """Build sampling parameters from an InferEngineConfig.
 
@@ -251,6 +262,8 @@ class InferEngine:
         stop_at_token_id : int
             Token ID that signals end of generation.
         logit_bias : dict, optional
+        is_eval : bool
+            Use ``eval_generate_params`` when set; otherwise ``generate_params``.
 
         Returns
         -------
@@ -258,18 +271,20 @@ class InferEngine:
             Sampling parameters.
         """
         # logit_bias: 尽可能不要使用这个东西。如果用了，这里打一个 warning，方便我们 debug 问题。
+        generate_params = infer_engine_config.resolve_generate_params(is_eval=is_eval)
+        top_k = generate_params.top_k
         return self.get_sampling_params(
             n=1,  # by passing vllm async llm issues
-            temperature=infer_engine_config.temperature,
-            top_k=infer_engine_config.top_k if infer_engine_config.top_k > 0 else -1,
-            top_p=infer_engine_config.top_p,
+            temperature=generate_params.temperature,
+            top_k=top_k if top_k > 0 else -1,
+            top_p=generate_params.top_p,
             max_tokens=infer_engine_config.generate_max_tokens,
             stop_token_ids=[stop_at_token_id],
             seed=infer_engine_config.seed,
             repetition_penalty=infer_engine_config.repetition_penalty,
             frequency_penalty=infer_engine_config.frequency_penalty,
             presence_penalty=infer_engine_config.presence_penalty,
-            min_p=infer_engine_config.min_p,
+            min_p=generate_params.min_p,
             logit_bias=logit_bias,
         )
 
@@ -319,6 +334,10 @@ class InferEngine:
 
     async def update_weights(self, *args, **kwargs):
         raise NotImplementedError(f"infer_engine does not implement update_weights")
+
+    async def abort_all_requests(self):
+        """Abort all in-flight generation requests on this engine."""
+        raise NotImplementedError(f"infer_engine does not implement abort_all_requests")
 
     async def save_engine_ckpt(self, save_ckpt_path):
         raise NotImplementedError(f"infer_engine does not implement save_engine_ckpt")
@@ -404,6 +423,7 @@ class InferEngine:
         sgl_mamba_full_memory_ratio=None,
         sgl_mamba_scheduler_strategy=None,
         sgl_enable_spec_v2=False,
+        return_original_logprob=True,
         enable_return_routed_experts=False,
         apply_deterministic_mode=False,
         placement_type=None,
@@ -411,6 +431,7 @@ class InferEngine:
         base_gpu_id: Optional[int] = None,
         enable_mtp: bool = False,
         seed: int = None,
+        model_override_args: Optional[Dict] = None,
         **extra_infer_engine_config
     ):
         """Factory method to create an InferEngine from engine arguments.
@@ -435,6 +456,10 @@ class InferEngine:
             Role (``'sampler'``, ``'gen-rm'``, etc.).
         rm_idx : int, optional
             Reward-model index for gen-rm log sharding.
+        return_original_logprob : bool, optional
+            Wired from ``ppo.use_original_logprob``. True → raw
+            (pre-temperature) logprobs; False → processed
+            (post-temperature) logprobs.
         placement_type : str, optional
             Placement mode for lifecycle behavior.
 
@@ -448,7 +473,15 @@ class InferEngine:
         assert tp_rank is not None and engine_idx is not None
         assert placement_type is not None
 
+        if model_override_args:
+            log(f"model_override_args={model_override_args}")
+
         if infer_engine_impl == "vllm":
+            if model_override_args:
+                log(
+                    f"[WARNING] model_override_args is not supported for vllm backend, "
+                    f"ignoring: {model_override_args}"
+                )
             assert not enable_mtp, "enable mtp is not supported by vllm"
             with patch_ctypes_for_cudart_stub():
                 import vllm
@@ -510,6 +543,26 @@ class InferEngine:
             user_compilation_config = extra_infer_engine_config.pop("compilation_config", None)
             if user_compilation_config is not None:
                 vllm_compilation_config.update(user_compilation_config)
+
+            if enable_return_routed_experts:
+                # EngineCore is spawned from this Ray actor, so a parent-only
+                # monkey patch is not inherited. When explicitly enabled,
+                # replace its pickle target with an importable wrapper that
+                # patches the spawned process.
+                from gpatch_v4.generation_backend.vllm_routed_experts_runtime_patch import (
+                    apply_vllm_routed_experts_engine_core_patch,
+                    is_vllm_r3_engine_core_patch_enabled,
+                )
+
+                if is_vllm_r3_engine_core_patch_enabled():
+                    apply_vllm_routed_experts_engine_core_patch()
+
+            # raw_logprobs ≡ SGLang SGLANG_RETURN_ORIGINAL_LOGPROB=1 (pre-temperature).
+            logprobs_mode = extra_infer_engine_config.pop(
+                "logprobs_mode",
+                "raw_logprobs" if return_original_logprob else "processed_logprobs",
+            )
+
             engine_args = AsyncEngineArgs(
                 model=model_path,
                 dtype=dtype,
@@ -527,6 +580,7 @@ class InferEngine:
                 enable_return_routed_experts=enable_return_routed_experts,
                 max_num_seqs=max_running_requests,
                 attention_backend=attention_backend,
+                logprobs_mode=logprobs_mode,
                 weight_transfer_config=(
                     {
                         "backend": "nccl"
@@ -557,8 +611,20 @@ class InferEngine:
             )
             return VllmEngine(infer_engine, model_path, infer_engine_role, placement_type)
         else:
+            expected_return_original_logprob = "1" if return_original_logprob else "0"
+            existing_return_original_logprob = os.environ.get(
+                "SGLANG_RETURN_ORIGINAL_LOGPROB", expected_return_original_logprob
+            )
+            assert existing_return_original_logprob == expected_return_original_logprob, (
+                f"SGLANG_RETURN_ORIGINAL_LOGPROB={existing_return_original_logprob!r} "
+                f"conflicts with return_original_logprob={return_original_logprob} "
+                f"(expected {expected_return_original_logprob!r})"
+            )
+            os.environ["SGLANG_RETURN_ORIGINAL_LOGPROB"] = expected_return_original_logprob
             if sgl_enable_spec_v2:
                 os.environ["SGLANG_ENABLE_SPEC_V2"] = "1"
+
+            preprocess_before_build_sgl_engine()
 
             import sglang as sgl
 
@@ -571,7 +637,9 @@ class InferEngine:
             import sglang.srt.entrypoints.engine
 
             from gpatch_v4.generation_backend.sglang_engine import SglangEngine
-            from gpatch_v4.generation_backend.sglang_engine import cuda_graph_max_bs_args as get_cuda_graph_max_bs_args
+            from gpatch_v4.generation_backend.sglang_engine import (
+                cuda_graph_max_bs_args as get_cuda_graph_max_bs_args,
+            )
 
             # Must be called AFTER import sglang, in case sglang's module-level
             # logging setup clears existing handlers.
@@ -653,7 +721,7 @@ class InferEngine:
                 else:
                     os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
-            server_args = sgl.ServerArgs(
+            sgl_server_args = dict(
                 model_path=model_path,
                 tp_size=tensor_parallel_size,
                 ep_size=expert_parallel_size,
@@ -678,6 +746,9 @@ class InferEngine:
                 enable_deterministic_inference=apply_deterministic_mode,
                 **extra_args,
             )
+            if model_override_args:
+                sgl_server_args["json_model_override_args"] = json.dumps(model_override_args)
+            server_args = sgl.ServerArgs(**sgl_server_args)
             if engine_idx == 0:
                 log(
                     f"init infer engine {server_args} with {extra_args=} "
@@ -688,7 +759,8 @@ class InferEngine:
             else:
                 engine_context = nullcontext()
 
-            _ensure_sglang_log_config()
+            # temp comment
+            # _ensure_sglang_log_config()
 
             with engine_context:
                 infer_engine = sgl.Engine(server_args=server_args)

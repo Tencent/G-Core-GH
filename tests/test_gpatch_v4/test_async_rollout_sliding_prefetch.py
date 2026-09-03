@@ -60,6 +60,7 @@ class _FakeRolloutController:
         self.fire_generation_requests = _RemoteMethod(self._fire_generation_requests)
         self.collect_rollout_step = _RemoteMethod(self._collect_rollout_step)
         self.wait_all_inflight = _RemoteMethod(self._wait_all_inflight)
+        self.save_data_source = _RemoteMethod(self._save_data_source)
 
     async def _fire_generation_requests(self, epoch: int, ppo_step: int, num_ppo_steps: int):
         # Validate single-epoch invariant: caller must never fire across
@@ -89,6 +90,9 @@ class _FakeRolloutController:
 
     async def _wait_all_inflight(self):
         self.events.append(("wait_all_inflight", ))
+
+    async def _save_data_source(self, step: int):
+        self.events.append(("save_data_source", step))
 
 
 class _FakeSamplerGroup:
@@ -155,6 +159,7 @@ def _make_config(
             single_controller=True,
             rollout_max_staleness=max_stale,
             save_interval=save_interval,
+            exit_step=None,
             load_aware_sampler_dispatch_stagger_s=0,
             use_gen_rm_reward=placement_type == "partial_colocated",
             use_bt_rm_reward=False,
@@ -162,6 +167,7 @@ def _make_config(
         debug=SimpleNamespace(
             trainer_return_ppo_step_metrics=False,
             skip_rollout_load_from_disk=False,
+            disable_save_checkpoint=False,
         ),
     )
     if placement_type == "partial_colocated":
@@ -446,6 +452,31 @@ class SlidingPrefetchLoopTest(unittest.IsolatedAsyncioTestCase):
                         set(save_steps)
                     ), (f"s={s} total={total} si={si}: "
                         f"duplicate saves: {save_steps}")
+
+    async def test_data_source_is_saved_after_each_model_checkpoint(self):
+        events, _ = await _run_loop(
+            max_stale=1,
+            total_ppo_step=5,
+            save_interval=2,
+        )
+
+        model_save_indices = [
+            index for index, event in enumerate(events)
+            if event[0] == "save_checkpoint"
+        ]
+        self.assertEqual(
+            [events[index] for index in model_save_indices],
+            [
+                ("save_checkpoint", 2),
+                ("save_checkpoint", 4),
+                ("save_checkpoint", 5),
+            ],
+        )
+        for index in model_save_indices:
+            self.assertEqual(
+                events[index + 1],
+                ("save_data_source", events[index][1]),
+            )
 
     async def test_cross_epoch_fires_split_per_epoch(self):
         """Reviewer blocking issue 1: the trainer must never ask a single

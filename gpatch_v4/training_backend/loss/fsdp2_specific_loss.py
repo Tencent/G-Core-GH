@@ -8,6 +8,10 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from gpatch_v4.configs import DpoConfig, FinetuneConfig
+from gpatch_v4.training_backend.fsdp2_backend.dspark_loss import (
+    DSparkLossResult,
+    calculate_dspark_loss,
+)
 from gpatch_v4.training_backend.fsdp2_backend.mtp_loss import calculate_mtp_loss
 from gpatch_v4.training_backend.loss.registry import register_loss
 from gpatch_v4.training_backend.loss_factory import compute_dpo_loss_core
@@ -27,6 +31,9 @@ class Fsdp2FinetuneLossInput:
     global_n: Optional[torch.Tensor] = None
     vocab_size: Optional[int] = None
     loss_fct: Optional[nn.Module] = None
+    online_train_dspark: bool = False
+    dspark_output: Any = None
+    global_n_for_dspark: Optional[torch.Tensor] = None
     enable_mtp: bool = False
     mtp_per_depth_h: Optional[list[torch.Tensor]] = None
     lm_head: Optional[nn.Module] = None
@@ -44,6 +51,7 @@ class Fsdp2FinetuneLossResult:
     mtp_loss: Optional[torch.Tensor] = None
     mtp_depth_losses: Optional[list[torch.Tensor]] = None
     mtp_depth_loss_metrics: Optional[list[torch.Tensor]] = None
+    dspark_result: Optional[DSparkLossResult] = None
     metrics: Dict[str, float] = field(default_factory=dict)
 
 
@@ -87,6 +95,20 @@ def fsdp2_cross_entropy_loss(
     main_loss = torch.sum(loss) / global_n
     main_loss = main_loss * dp_size
 
+    dspark_result = None
+    if loss_input.online_train_dspark:
+        assert loss_input.dspark_output is not None
+        assert loss_input.global_n_for_dspark is not None
+        dspark_result = calculate_dspark_loss(
+            outputs=loss_input.dspark_output,
+            global_denominator=loss_input.global_n_for_dspark,
+            dp_size=loss_input.dp_size,
+            ce_loss_alpha=config.training.dspark_ce_loss_alpha,
+            l1_loss_alpha=config.training.dspark_l1_loss_alpha,
+            confidence_loss_alpha=config.training.dspark_confidence_loss_alpha,
+            loss_decay_gamma=config.training.dspark_loss_decay_gamma,
+        )
+
     mtp_loss = None
     mtp_depth_losses = None
     mtp_depth_loss_metrics = None
@@ -124,6 +146,8 @@ def fsdp2_cross_entropy_loss(
         mtp_loss = torch.stack(mtp_depth_losses).sum(
         ) * (loss_input.mtp_loss_scaling_factor / max(len(mtp_depth_losses), 1))
         loss = main_loss + mtp_loss
+    elif dspark_result is not None:
+        loss = (main_loss + config.training.dspark_loss_scaling_factor * dspark_result.loss)
     else:
         loss = main_loss
 
@@ -133,6 +157,7 @@ def fsdp2_cross_entropy_loss(
         mtp_loss=mtp_loss,
         mtp_depth_losses=mtp_depth_losses,
         mtp_depth_loss_metrics=mtp_depth_loss_metrics,
+        dspark_result=dspark_result,
     )
 
 

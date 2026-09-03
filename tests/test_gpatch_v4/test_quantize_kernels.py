@@ -19,12 +19,12 @@ import torch
 
 pytest.importorskip("tilelang")
 
-from gpatch_v4.models.deepseek_v4.fp_quantize import (  # noqa: E402
+from gpatch_v4.kernel.quantize.eager_quant_kernels import (  # noqa: E402
     dequant_fp4_e2m1_fp8_scale_e8m0_packed,
     quant_fp4_e2m1_scale_e8m0_packed,
 )
-from gpatch_v4.models.deepseek_v4.kernel.quantize_kernels import (  # noqa: E402
-    fp4_qat_to_sgl_fp8,
+from gpatch_v4.kernel.quantize.fused_quant_kernels import (  # noqa: E402
+    fp4_qat_then_to_fp8,
 )
 
 
@@ -32,6 +32,12 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA is required by the TileLang quantization kernel",
 )
+
+_FP4_GROUP_SIZE = 32
+
+# Adam's first update is ``lr * m_hat / sqrt(v_hat)`` == ``lr * sign(g)``, so a
+# 1e-6 learning rate moves every element by exactly 1e-6.
+_ADAM_STEP = 1e-6
 
 _FP4_TABLE = (
     0.0,
@@ -53,7 +59,7 @@ _FP4_TABLE = (
 )
 
 
-def _torch_fp4_qat_to_sgl_fp8(
+def _torch_fp4_qat_then_to_fp8(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unfused PyTorch baseline without the optional underflow check."""
@@ -109,6 +115,21 @@ def _dequant_sgl_fp8(
     ).float()
 
 
+def _snap_to_fp4_grid(weight: torch.Tensor) -> torch.Tensor:
+    """Project onto the E2M1 1x32 grid DSV4-Flash experts are stored on."""
+    packed, scale = quant_fp4_e2m1_scale_e8m0_packed(weight)
+    return dequant_fp4_e2m1_fp8_scale_e8m0_packed(packed, scale).float()
+
+
+def _fp4_group_scales(weight: torch.Tensor) -> torch.Tensor:
+    return quant_fp4_e2m1_scale_e8m0_packed(weight)[1].float()
+
+
+def _sgl_effective_weight(weight: torch.Tensor) -> torch.Tensor:
+    """The weight sglang's GEMM sees after loading an exported expert."""
+    return _dequant_sgl_fp8(*fp4_qat_then_to_fp8(weight))
+
+
 def _assert_byte_equal(
     actual: torch.Tensor,
     expected: torch.Tensor,
@@ -140,7 +161,7 @@ def _assert_byte_equal(
         pytest.param(2048, 4096, id="rectangular-multiple-tiles2"),
     ],
 )
-def test_fp4_qat_to_sgl_fp8_matches_torch(m: int, n: int) -> None:
+def test_fp4_qat_then_to_fp8_matches_torch(m: int, n: int) -> None:
     """TileLang output must match the existing PyTorch conversion exactly."""
     torch.manual_seed(7)
     weight = torch.randn((m, n), device="cuda", dtype=torch.float32)
@@ -150,8 +171,8 @@ def test_fp4_qat_to_sgl_fp8_matches_torch(m: int, n: int) -> None:
     weight[:, 32:64] *= 2.0**-4
     weight[:, 64:96] *= 2.0**4
 
-    expected_weight, expected_scale = _torch_fp4_qat_to_sgl_fp8(weight)
-    actual_weight, actual_scale = fp4_qat_to_sgl_fp8(weight)
+    expected_weight, expected_scale = _torch_fp4_qat_then_to_fp8(weight)
+    actual_weight, actual_scale = fp4_qat_then_to_fp8(weight)
     torch.cuda.synchronize()
 
     _assert_byte_equal(actual_scale, expected_scale, "FP8 scale")
@@ -176,6 +197,54 @@ def test_fp4_qat_to_sgl_fp8_matches_torch(m: int, n: int) -> None:
     )
 
 
+def test_fp4_scale_boundary_occupancy_under_optimizer_step() -> None:
+    """Report how much of a grid-aligned expert sits on the group-scale cliff.
+
+    ``scale = 2**ceil(log2(amax / 6))`` cannot represent ``amax = 6 * scale + eps``
+    without clipping, so the scale necessarily doubles the moment a group's top
+    element grows. DSV4-Flash ships routed experts already on the E2M1 1x32
+    grid, which puts every group whose top code is 6 exactly on that cliff: an
+    Adam step of ``1e-6`` re-rounds all 32 of the group's weights onto a grid
+    twice as coarse. The cliff is inherent to power-of-two scales and is only
+    harmless while the trainer forward crosses it at the same instant, which is
+    what ``test_deepseek_v4_fp4_qat.py`` pins down.
+    """
+    torch.manual_seed(23)
+    m, n = 2048, 4096
+    weight = _snap_to_fp4_grid(
+        torch.randn((m, n), device="cuda", dtype=torch.float32)
+    )
+
+    scales = _fp4_group_scales(weight)
+    groups = weight.view(m, n // _FP4_GROUP_SIZE, _FP4_GROUP_SIZE)
+    top_code = groups.abs().amax(dim=-1) / scales
+
+    signs = torch.randint(0, 2, weight.shape, device=weight.device, dtype=torch.float32)
+    step = (signs * 2.0 - 1.0) * _ADAM_STEP
+    perturbed = weight + step
+
+    flipped = _fp4_group_scales(perturbed) != scales
+    before = _sgl_effective_weight(weight)
+    after = _sgl_effective_weight(perturbed)
+    input_shift = (step.norm() / weight.norm()).item()
+    export_shift = ((after - before).norm() / before.norm()).item()
+
+    print(
+        f"\nFP4 scale boundary shape=({m}, {n}): "
+        f"groups={scales.numel()}, "
+        f"top-code-6={(top_code == 6.0).float().mean().item():.2%}, "
+        f"scale-flipped={flipped.float().mean().item():.2%}, "
+        f"input shift={input_shift:.3e}, export shift={export_shift:.3e}, "
+        f"newly zeroed={((before != 0) & (after == 0)).sum().item()}"
+    )
+    assert torch.isfinite(after).all()
+    off_cliff = flipped & (top_code != 6.0)
+    assert not off_cliff.any(), (
+        f"{off_cliff.sum().item()} groups changed scale without sitting at top "
+        f"code 6; the group-scale rule is not the only source of instability"
+    )
+
+
 def _bench_cuda_ms(
     fn: Callable[[], object],
     *,
@@ -196,7 +265,7 @@ def _bench_cuda_ms(
     return start.elapsed_time(end) / iters
 
 
-def test_fp4_qat_to_sgl_fp8_performance_vs_torch() -> None:
+def test_fp4_qat_then_to_fp8_performance_vs_torch() -> None:
     """Report end-to-end TileLang latency and speedup over the PyTorch path."""
     m = int(os.environ.get("DSV4_QUANT_BENCH_M", "2048"))
     n = int(os.environ.get("DSV4_QUANT_BENCH_N", "4096"))
@@ -211,8 +280,8 @@ def test_fp4_qat_to_sgl_fp8_performance_vs_torch() -> None:
     weight = torch.randn((m, n), device="cuda", dtype=torch.float32)
 
     # Compile TileLang and validate the benchmark input before timing.
-    expected_weight, expected_scale = _torch_fp4_qat_to_sgl_fp8(weight)
-    actual_weight, actual_scale = fp4_qat_to_sgl_fp8(weight)
+    expected_weight, expected_scale = _torch_fp4_qat_then_to_fp8(weight)
+    actual_weight, actual_scale = fp4_qat_then_to_fp8(weight)
     torch.cuda.synchronize()
     _assert_byte_equal(actual_scale, expected_scale, "benchmark FP8 scale")
 
@@ -247,12 +316,12 @@ def test_fp4_qat_to_sgl_fp8_performance_vs_torch() -> None:
     )
 
     tilelang_ms = _bench_cuda_ms(
-        lambda: fp4_qat_to_sgl_fp8(weight),
+        lambda: fp4_qat_then_to_fp8(weight),
         warmup=warmup,
         iters=iters,
     )
     torch_ms = _bench_cuda_ms(
-        lambda: _torch_fp4_qat_to_sgl_fp8(weight),
+        lambda: _torch_fp4_qat_then_to_fp8(weight),
         warmup=warmup,
         iters=iters,
     )

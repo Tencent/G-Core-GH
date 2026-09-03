@@ -43,7 +43,7 @@ from safetensors.torch import safe_open
 # script remains runnable without any package-import gymnastics.
 _FP_QUANT_PATH = (
     Path(__file__).resolve().parent.parent.parent
-    / "gpatch_v4/models/deepseek_v4/fp_quantize.py"
+    / "gpatch_v4/kernel/quantize/eager_quant_kernels.py"
 )
 _spec = importlib.util.spec_from_file_location("fp_quantize", _FP_QUANT_PATH)
 assert _spec is not None and _spec.loader is not None

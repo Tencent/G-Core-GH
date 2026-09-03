@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import inspect
 import os
 import random
@@ -6,7 +7,11 @@ import time
 import traceback
 from collections import defaultdict
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
+
+from gpatch_v4.compat import ensure_typing_self
+
+ensure_typing_self()
 
 import torch
 
@@ -38,6 +43,7 @@ from gpatch_v4.core.parallel_state import (
     is_tp_and_cp_head,
     preserve_rng_state,
 )
+from gpatch_v4.core.smart_pad_helper import DPBalanceHelper
 from gpatch_v4.orches.train_actor import BaseActor
 from gpatch_v4.rollout_generator import RolloutGeneratorFactory
 from gpatch_v4.training_backend import (
@@ -200,11 +206,28 @@ class FinetuneActor(
         if self.config.training.loss_func not in BUILDIN_LOSS_FUNC:
             assert self.config.training.loss_func == "custom", "Custom loss function must be provided"
             #TODO: loss refact ing
-            register_custom_loss_fn(
-                self.config.training.loss_func,
-                self.config.training.loss_func_py_path,
-                self.config.training.loss_func_py_name,
-            )
+            for _backend in ("mcore", "fsdp2"):
+                register_backend_custom_loss_fn(
+                    backend=_backend,
+                    loss_name=self.config.training.loss_func,
+                    py_path=self.config.training.loss_func_py_path,
+                    fn_name=self.config.training.loss_func_py_name,
+                )
+
+    def _finetune_data_parallel_meta(self) -> Tuple[int, int]:
+        """Return (dp_rank, dp_size) used for SFT dataloader / GAS.
+
+        mlite dynamic CP uses logical DP=1 so every pool rank sees the same
+        global batch; the runtime plugin then schedules across DP×CP.
+        """
+        #TODO: 这里可能要抽成一个单一的函数，供其他地方调用
+        dist_config = self.config.policy.dist_config
+        if (
+            self.config.training.training_backend == "mlite" and
+            dist_config.dynamic_context_parallel
+        ):
+            return 0, 1
+        return mpu.get_data_parallel_rank(), mpu.get_data_parallel_world_size()
 
     async def setup_model_and_optimizer(self):
         """Build model, optimizer, and optionally rebuild dataloader for resume."""
@@ -240,11 +263,12 @@ class FinetuneActor(
             extra_args = {}
             if resume_step is not None and "meta_info" in fn_kwargs:
                 extra_args['meta_info'] = {'resume_step': resume_step}
+            dp_rank, dp_size = self._finetune_data_parallel_meta()
             fn_ret = fn(
                 config=self.config,
                 tokenizer=self.tokenizer,
-                dp_rank=mpu.get_data_parallel_rank(),
-                dp_size=mpu.get_data_parallel_world_size(),
+                dp_rank=dp_rank,
+                dp_size=dp_size,
                 **extra_args,
             )
 
@@ -266,7 +290,7 @@ class FinetuneActor(
     def align_and_resume_sampler(self, resume_step):
         if not isinstance(self.train_sampler, ResumableDistributedSampler):
             return
-        dp_size = mpu.get_data_parallel_world_size()
+        _dp_rank, dp_size = self._finetune_data_parallel_meta()
         mbs = self.config.training.train_mbs
         gas = self.config.training.train_gbs // (dp_size * mbs)
         step_per_epoch = self.train_sampler.num_samples // (gas * mbs)
@@ -276,8 +300,7 @@ class FinetuneActor(
 
     def auto_calc_train_step(self):
         training_config = self.config.training
-        dp_rank = mpu.get_data_parallel_rank()
-        dp_size = mpu.get_data_parallel_world_size()
+        dp_rank, dp_size = self._finetune_data_parallel_meta()
 
         gas = training_config.train_gbs // (dp_size * training_config.train_mbs)
         assert gas > 0, f"gradient_accumulation_steps must be positive, got {gas}"
@@ -291,7 +314,7 @@ class FinetuneActor(
         self.config.training.gradient_accumulation_steps = gas
         log(
             f"train_dataset length: {len(self.train_dataloader)=} {len(self.train_dataset)=} "
-            f"{dp_size=} {self.config.training.total_training_step=}"
+            f"{dp_rank=} {dp_size=} {self.config.training.total_training_step=}"
         )
 
         if self.config.training.eval_interval > 0:
@@ -319,6 +342,19 @@ class FinetuneActor(
         # 将 batched_data 转为 List[Dict[str, List[Any, 这里是 mbs 的大小]]]
         expanded_rbs = expand_rollout_batches(batched_data)
         return expanded_rbs
+
+    def _setup_manual_gc(self) -> None:
+        if not self.config.training.manual_gc:
+            return
+        gc.disable()
+        gc.collect()
+
+    def _maybe_manual_gc(self, train_step: int) -> None:
+        training_config = self.config.training
+        if (
+            training_config.manual_gc and (train_step + 1) % training_config.manual_gc_interval == 0
+        ):
+            gc.collect()
 
     def _eval_loop(self, train_step):
         self._training_plt_report(TrainingPltMixin.TrainState.EVAL_START, {})
@@ -367,6 +403,7 @@ class FinetuneActor(
         collected_metrics = []
 
         cpu_barrier()
+        self._setup_manual_gc()
         for epoch in range(init_epoch, training_config.num_train_epoches):
             if epoch == init_epoch and init_step > 0:
                 reset_start_index = False
@@ -397,6 +434,14 @@ class FinetuneActor(
                     batched_data.append(new_data)
                 expanded_rbs = self.process_batched_data(batched_data)
                 timers("get_batched_data").stop()
+
+                # ---- dp_balance for train: rebalance samples across DP ranks ----
+                if self.config.policy.balance_dp_seqlen:
+                    expanded_rbs = DPBalanceHelper.rebalance_row_batches_for_train(
+                        expanded_rbs,
+                        add_custom_keys=self.config.policy.dp_balance_extra_keys,
+                    )
+
                 if self.config.debug.save_every_rollout_data or (
                     self.config.debug.save_first_rollout_data and train_step == 0
                 ):
@@ -428,6 +473,7 @@ class FinetuneActor(
                 if clear_gathered_routing_info is not None:
                     clear_gathered_routing_info()
 
+                self._maybe_manual_gc(train_step)
                 timers("train_step_total").stop()
                 time_log_keys = ["get_batched_data", "train_step", "train_step_total"]
                 metric = record_time_to_metrics(timers, time_log_keys, metric, reset=True)

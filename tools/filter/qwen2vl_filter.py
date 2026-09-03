@@ -136,7 +136,7 @@ def get_filter_args():
         default="qwen2.5vl",
         choices=[
             "qwen2vl", "qwen2.5vl", "qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe",
-            "wemm3_embedding"
+            "wemm3_embedding", "wemm3_5_embedding", "wemm3_5_moe_embedding"
         ],
         help='model arch type'
     )

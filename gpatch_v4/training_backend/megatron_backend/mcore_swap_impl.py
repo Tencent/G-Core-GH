@@ -3,12 +3,22 @@ import torch
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.optimizer.optimizer import ChainedOptimizer
 
+from gpatch_v4.core.device import sync_param_offload
 from gpatch_v4.utils.common_utils import (
     clear_memory,
     log,
     logging_memory_usage,
     logging_memory_usage_details,
 )
+
+
+def _prepare_models_for_te_offload(models) -> int:
+    # TE may pin/release extra state before host offload; skip when API is absent.
+    try:
+        from transformer_engine.pytorch import prepare_model_for_offload
+    except ImportError:
+        return 0
+    return prepare_model_for_offload(models)
 
 
 class McoreSwapImpl:
@@ -27,26 +37,57 @@ class McoreSwapImpl:
         if models is None:
             return
 
+        sync_offload = sync_param_offload()
+        offload_fn = (
+            rebind_offload_tensor_to_cpu
+            if sync_offload else offload_tensor_to_cpu
+        )
+
+        state_bytes_before = torch.cuda.memory_allocated()
+        prepared_parameter_count = _prepare_models_for_te_offload(models)
+        if prepared_parameter_count > 0:
+            released_state_bytes = max(
+                0, state_bytes_before - torch.cuda.memory_allocated()
+            )
+            log(
+                "memory tracking Transformer Engine prepared "
+                f"{prepared_parameter_count} parameters for offload, released "
+                f"{released_state_bytes / (1024**3):.3f} GB allocated",
+                rank=0,
+            )
+
+        staged = []
         for model_chunk in models:
             if isinstance(model_chunk, DDP):
                 model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
                 for buffers in model_chunk_all_buffers:
                     for buffer in buffers:
-                        offload_tensor_to_cpu(buffer.param_data)
+                        offload_tensor_to_cpu(buffer.param_data, non_blocking=not sync_offload)
+                        staged.append(buffer.param_data)
                         if self.early_swap_model:
                             _attach_param_cpu_views(buffer)
                         release_tensor_mem(buffer.grad_data)
                 for _, param in model_chunk.module.named_parameters():
                     if not param.requires_grad:
                         assert not param._is_view()
-                        offload_tensor_to_cpu(param)
+                        offload_tensor_to_cpu(param, non_blocking=not sync_offload)
+                        staged.append(param)
             else:
                 for _, param in model_chunk.named_parameters():
-                    offload_tensor_to_cpu(param)
+                    offload_fn(param)
+                    if not sync_offload:
+                        staged.append(param)
                     if param.grad is not None:
-                        offload_tensor_to_cpu(param.grad)
+                        offload_fn(param.grad)
+                        if not sync_offload:
+                            staged.append(param.grad)
                 for _, buf in model_chunk.named_buffers():
-                    offload_tensor_to_cpu(buf)
+                    offload_fn(buf)
+                    if not sync_offload:
+                        staged.append(buf)
+
+        # D2H is async; one sync then free all GPU storages (avoid per-tensor sync).
+        sync_and_resize_offloaded_tensors(staged)
 
         cleared_bytes = clear_cached_gpu_tensors(models)
         log(
@@ -83,6 +124,11 @@ class McoreSwapImpl:
         logging_memory_usage_details(f"memory tracking before {tag}model onload", rank=0)
         if models is None:
             return
+        sync_offload = sync_param_offload()
+        onload_fn = (
+            rebind_onload_tensor_to_gpu
+            if sync_offload else onload_tensor_to_gpu
+        )
         for model_chunk in models:
             if isinstance(model_chunk, DDP):
                 model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
@@ -99,11 +145,11 @@ class McoreSwapImpl:
             else:
                 # we need this for ref module
                 for _, param in model_chunk.named_parameters():
-                    onload_tensor_to_gpu(param)
+                    onload_fn(param)
                     if param.grad is not None:
-                        onload_tensor_to_gpu(param.grad)
+                        onload_fn(param.grad)
                 for _, buf in model_chunk.named_buffers():
-                    onload_tensor_to_gpu(buf)
+                    onload_fn(buf)
         clear_memory()
         logging_memory_usage_details(f"memory tracking after {tag}model onload", rank=0)
 
@@ -120,13 +166,18 @@ class McoreSwapImpl:
         else:
             optimizer_lst.append(optimizers)
 
+        sync_offload = sync_param_offload()
+        staged = []
         for optimizer in optimizer_lst:
-            offload_megatron_copy_params(optimizer)
+            staged.extend(offload_megatron_copy_params(optimizer, non_blocking=not sync_offload))
             opt_state_dict_values = optimizer.optimizer.state.values()
 
             for v in opt_state_dict_values:
-                offload_tensor_to_cpu(v.get("exp_avg"))
-                offload_tensor_to_cpu(v.get("exp_avg_sq"))
+                offload_tensor_to_cpu(v.get("exp_avg"), non_blocking=not sync_offload)
+                staged.append(v.get("exp_avg"))
+                offload_tensor_to_cpu(v.get("exp_avg_sq"), non_blocking=not sync_offload)
+                staged.append(v.get("exp_avg_sq"))
+        sync_and_resize_offloaded_tensors(staged)
 
         clear_memory()
         logging_memory_usage_details("memory tracking after optimizer offload", rank=0)
@@ -192,21 +243,64 @@ class _CheckTensorAttr:
             _CheckTensorAttr.run_once_flag = True
 
 
-def offload_tensor_to_cpu(tensor):
+def offload_tensor_to_cpu(tensor, non_blocking=True):
     _CheckTensorAttr.check_attr()
     if tensor is None:
         return
     assert isinstance(tensor, torch.Tensor), f"{tensor=} type must be torch.Tensor"
     if not hasattr(tensor, "gcore_cpu_data"):
-        #  non_blocking=True 都是异步的，在 cpu 访问这个 tensor 需要先同步再访问
-        setattr(tensor, "gcore_cpu_data", tensor.data.to("cpu", non_blocking=True))
+        setattr(tensor, "gcore_cpu_data", tensor.data.to("cpu", non_blocking=non_blocking))
     else:
         assert tensor.gcore_cpu_data.shape == tensor.data.shape
         assert tensor.gcore_cpu_data.dtype == tensor.data.dtype
         tensor.gcore_cpu_data.copy_(tensor.data, non_blocking=True)
     tensor.gcore_untyped_storage_data_size = tensor.untyped_storage().size()
     assert tensor.gcore_untyped_storage_data_size == tensor.gcore_cpu_data.untyped_storage().size()
-    tensor.untyped_storage().resize_(0)
+
+
+def resize_offloaded_tensor_gpu(tensor):
+    """Free GPU storage after D2H for ``tensor`` has completed."""
+    if tensor is None:
+        return
+    if tensor.untyped_storage().size() > 0:
+        tensor.untyped_storage().resize_(0)
+
+
+def sync_and_resize_offloaded_tensors(tensors):
+    """One stream sync, then ``resize_(0)`` for every staged offload tensor."""
+    if any(tensor is not None and tensor.untyped_storage().size() > 0 for tensor in tensors):
+        torch.cuda.current_stream().synchronize()
+    for tensor in tensors:
+        resize_offloaded_tensor_gpu(tensor)
+
+
+def _can_safely_resize_storage(tensor: torch.Tensor) -> bool:
+    return (
+        tensor.untyped_storage().size() == tensor.numel() * tensor.element_size()
+        and tensor.storage_offset() == 0
+        and tensor.is_contiguous()
+    )
+
+
+def rebind_offload_tensor_to_cpu(tensor: torch.Tensor | None) -> None:
+    if tensor is None:
+        return
+    assert isinstance(tensor, torch.Tensor), f"{tensor=} type must be torch.Tensor"
+    if tensor.device.type == "cpu":
+        return
+    old_data = tensor.data
+    tensor.data = old_data.to("cpu", non_blocking=False)
+    if _can_safely_resize_storage(old_data):
+        old_data.untyped_storage().resize_(0)
+
+
+def rebind_onload_tensor_to_gpu(tensor: torch.Tensor | None) -> None:
+    if tensor is None:
+        return
+    assert isinstance(tensor, torch.Tensor), f"{tensor=} type must be torch.Tensor"
+    if tensor.device.type != "cpu":
+        return
+    tensor.data = tensor.data.to(torch.cuda.current_device(), non_blocking=False)
 
 
 def onload_tensor_to_gpu(tensor):
@@ -257,9 +351,33 @@ _DISPATCHER_CACHED_ATTRS = (
     "reversed_local_input_permutation_mapping",
 )
 
+_FLEX_DISPATCH_MANAGER_CACHED_ATTRS = (
+    "routing_map",
+    "token_probs",
+    "token_indices",
+    "dispatched_probs",
+    "dispatched_indices",
+    "tokens_per_expert",
+    "dispatched_routing_map",
+    "reversed_mapping_for_combine",
+    "pad_offsets",
+    "num_permuted_tokens",
+)
+
+
+def _clear_cuda_tensor_attrs(owner, attr_names):
+    """Clear direct CUDA tensor attributes and return their logical size."""
+    cleared_bytes = 0
+    for attr_name in attr_names:
+        val = getattr(owner, attr_name, None)
+        if isinstance(val, torch.Tensor) and val.is_cuda:
+            cleared_bytes += val.nelement() * val.element_size()
+            setattr(owner, attr_name, None)
+    return cleared_bytes
+
 
 def clear_cached_gpu_tensors(models):
-    """Clear GPU tensors cached by MoEAlltoAllTokenDispatcher.
+    """Clear GPU tensors cached by MoE token dispatchers.
 
     During forward, each ``MoEAlltoAllTokenDispatcher`` stores ``probs``,
     ``routing_map`` and ``reversed_local_input_permutation_mapping`` as
@@ -267,8 +385,12 @@ def clear_cached_gpu_tensors(models):
     GB across MoE layers; we set them to ``None`` so ``empty_cache()`` can
     reclaim the GPU memory.
 
-    ``MoEAlltoAllTokenDispatcher`` is NOT an ``nn.Module``; we locate it
-    via ``MoELayer.token_dispatcher`` since ``MoELayer`` is.
+    ``MoEFlexTokenDispatcher`` stores equivalent routing and permutation
+    metadata on its nested DeepEP/HybridEP communication manager. Clear
+    those tensors as well after training has completed.
+
+    Token dispatchers are NOT ``nn.Module`` instances; locate them via
+    ``MoELayer.token_dispatcher`` since ``MoELayer`` is.
 
     Returns
     -------
@@ -289,21 +411,31 @@ def clear_cached_gpu_tensors(models):
             dispatcher = getattr(module, "token_dispatcher", None)
             if dispatcher is None:
                 continue
-            for attr_name in _DISPATCHER_CACHED_ATTRS:
-                val = getattr(dispatcher, attr_name, None)
-                if isinstance(val, torch.Tensor) and val.is_cuda:
-                    total_bytes += val.nelement() * val.element_size()
-                    setattr(dispatcher, attr_name, None)
+            total_bytes += _clear_cuda_tensor_attrs(dispatcher, _DISPATCHER_CACHED_ATTRS)
+
+            comm_manager = getattr(dispatcher, "_comm_manager", None)
+            if comm_manager is not None:
+                total_bytes += _clear_cuda_tensor_attrs(
+                    comm_manager, _FLEX_DISPATCH_MANAGER_CACHED_ATTRS
+                )
     return total_bytes
 
 
 @torch.no_grad()
-def offload_megatron_copy_params(optimizers):
-    """Offload optimizer parameters to CPU.
+def offload_megatron_copy_params(optimizers, non_blocking=True):
+    """Offload optimizer parameters to CPU (D2H only; caller frees GPU storage).
 
     Args:
         optimizers:
+        non_blocking: forwarded to ``offload_tensor_to_cpu``.
+
+    Returns
+    -------
+    list
+        Tensors that were staged and still need ``sync_and_resize_offloaded_tensors``.
     """
+    staged = []
+
     def offload_group_to_cpu(group):
         if group is None:
             return
@@ -312,16 +444,20 @@ def offload_megatron_copy_params(optimizers):
             for param_group in group:
                 if isinstance(param_group, list):
                     for param in param_group:
-                        offload_tensor_to_cpu(param)
+                        offload_tensor_to_cpu(param, non_blocking=non_blocking)
+                        staged.append(param)
                 else:
-                    offload_tensor_to_cpu(param_group)
+                    offload_tensor_to_cpu(param_group, non_blocking=non_blocking)
+                    staged.append(param_group)
         else:
-            offload_tensor_to_cpu(group)
+            offload_tensor_to_cpu(group, non_blocking=non_blocking)
+            staged.append(group)
 
     # Offload all parameter groups to CPU
 
     if hasattr(optimizers, 'shard_fp32_from_float16_groups'):
         offload_group_to_cpu(getattr(optimizers, 'shard_fp32_from_float16_groups'))
+    return staged
 
 
 @torch.no_grad()

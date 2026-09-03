@@ -58,6 +58,7 @@ def _config_attr(config, *names):
 
 
 def _server_args(sgl, model_path, *, return_routed_experts):
+    from gpatch_v4.generation_backend.sglang_engine import filter_server_args_kwargs
     kwargs = dict(
         model_path=model_path,
         tp_size=8,
@@ -79,7 +80,7 @@ def _server_args(sgl, model_path, *, return_routed_experts):
             enable_over_encoding=True,
             enable_return_routed_experts=True,
         )
-    return sgl.ServerArgs(**kwargs)
+    return sgl.ServerArgs(**filter_server_args_kwargs(kwargs))
 
 
 async def _generate(llm, *, return_routed_experts):
@@ -172,6 +173,9 @@ def test_sglang_generation_e2e():
         pytest.skip(f"requires 8 GPUs, found {torch.cuda.device_count()}")
 
     sgl = pytest.importorskip("sglang")
+
+    # To AI: 不要 skip，如果没有 welm in sglang 就让他 fail 就好。
+
     try:
         patch_torch = importlib.import_module("sglang.srt.patch_torch")
     except ImportError:

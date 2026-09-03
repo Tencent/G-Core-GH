@@ -1,0 +1,76 @@
+_target_: gpatch_v4.configs.config.DpoConfig
+
+training:
+  training_backend: mcore
+  use_fast_tokenizer: True
+  train_gbs: 16
+  train_mbs: 1
+  seq_length: 8192
+  data_parallel_random_init: False
+  save_interval: 400
+  num_train_epoches: 10
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: True
+  recompute: True
+  enable_mtp: False
+  moe_pad_with_random_tokens: True
+  loss_func: dpo
+  dpo_beta: 0.1
+  dpo_label_smoothing: 0.0
+  dpo_loss_type: sigmoid
+  dpo_ftx_gamma: 0.0
+
+checkpoint:
+  load_ckpt_path: save_dsv4_dpo_mcore_small
+  save_ckpt_path: save_dsv4_dpo_mcore_small
+  convert_mcore_to_hf_online: True
+  mbridge_distributed_filesystem: True
+  override_tokenizer_special_token:
+    eos_token: "<｜end▁of▁sentence｜>"
+
+optimizer:
+  lr: 1.0e-6
+  lr_warmup_steps: 0
+  lr_decay_style: "constant"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "/mnt/ceph-hz1-csp/mm-base-plt2/user_xiaotaoliu/data/dpo_data2/"
+  py_path: "tasks/math_dsv4/dpo_dataset_v2.py"
+  fn_name: "get_dataset_and_dataloader"
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+policy:
+  dist_config:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8
+    context_parallel_size: 8
+  model_arch: "deepseek_v4"
+  # DSv4 mcore CP uses contiguous THD packing for DPO ref and policy forwards.
+  ppo_pack_seq: True
+  attn_implementation: "fused"
+  indexer_backend: "fused"
+  without_ref: False
+  hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
+  hf_tokenizer_path: ${policy.hf_model_path}
+  ref_hf_model_path: ${policy.hf_model_path}
+  override_transformer_config:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    sequence_packing_scheduler: dp_balanced
+    # only test
+    num_layers: 4
+    csa_compress_ratios: [0, 0, 4, 128]
+    moe_layer_freq: [1, 1, 1, 1]
+    dsa_indexer_loss_coeff: 0.0
+
+debug:
+  save_first_rollout_data: true

@@ -1,3 +1,4 @@
+# 此文件后续将逐渐废弃，替换到 training_backend/loss 目录下
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
@@ -15,9 +16,11 @@ except:
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 
 from gpatch_v4.configs.config import OnPolicyDistillConfig
+from gpatch_v4.core.adaptive_entropy import get_entropy_bonus_coef
 from gpatch_v4.core.correction_helper import compute_off_policy_correction_weights
 from gpatch_v4.core.mappings import (
     all_gather_from_context_parallel_region,
+    all_gather_from_context_parallel_region_no_zigzag,
     reduce_from_context_parallel_region,
 )
 from gpatch_v4.training_backend.vocab_parallel_entropy import vocab_parallel_entropy
@@ -126,12 +129,20 @@ class PolicyLossInput:
     cu_seqlens_padded: Optional[torch.Tensor] = None
     local_cp_size: int = 1
     calculate_per_token_loss: bool = False
+    cp_partition_mode: str = "zigzag"
 
 
 def _normalize_local_cp_size(local_cp_size: Any) -> int:
     if isinstance(local_cp_size, torch.Tensor):
         return int(local_cp_size.item())
     return int(local_cp_size)
+
+
+def _get_local_cp_group(local_cp_size: Any):
+    local_cp_size = _normalize_local_cp_size(local_cp_size)
+    if local_cp_size <= 1:
+        return None
+    return mpu.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
 
 
 def _thd_cu_seqlens_for_values(
@@ -239,8 +250,8 @@ def masked_mean_per_sample_or_token(
     if local_cp_size > 1:
         cp_group = mpu.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
         combined = torch.stack([sums, counts])
-        dist.all_reduce(combined, group=cp_group, op=dist.ReduceOp.SUM)
-        sums, counts = combined[0], combined[1]
+        combined = reduce_from_context_parallel_region(combined, group=cp_group)
+        sums, counts = combined[0], combined[1].detach()
 
     return (sums / counts.clamp(min=1)).mean()
 
@@ -266,8 +277,8 @@ def _masked_sample_sum_and_count(
         if local_cp_size > 1:
             cp_group = mpu.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
             combined = torch.stack([sums, counts])
-            dist.all_reduce(combined, group=cp_group, op=dist.ReduceOp.SUM)
-            sums, counts = combined[0], combined[1]
+            combined = reduce_from_context_parallel_region(combined, group=cp_group)
+            sums, counts = combined[0], combined[1].detach()
 
         # Matches `masked_mean_per_sample_or_token`'s `.mean()`: every
         # cu_seqlens_padded segment counts once toward the denominator (an
@@ -338,14 +349,76 @@ def masked_sum_and_count_per_sample_or_token(
     """
     # Always compute both aggregates (reporting needs both). Only the selected
     # backward target keeps the autograd graph; the other runs under no_grad.
+    token_sum_ctx = nullcontext() if calculate_per_token_loss else torch.no_grad()
+    sample_sum_ctx = torch.no_grad() if calculate_per_token_loss else nullcontext()
+    with token_sum_ctx:
+        token_sum = masked_sum(values, mask)
+        token_count = mask.sum()
+
+    with sample_sum_ctx:
+        sample_sum, sample_count = _masked_sample_sum_and_count(
+            values, mask, cu_seqlens_padded, local_cp_size, sample_mask
+        )
+
+    if calculate_per_token_loss:
+        bwd_sum, bwd_count = token_sum, token_count
+    else:
+        bwd_sum, bwd_count = sample_sum, sample_count
+
+    return (
+        token_sum.detach().clone(),
+        token_count.detach().clone(),
+        sample_sum.detach().clone(),
+        sample_count.detach().clone(),
+        bwd_sum,
+        bwd_count,
+    )
+
+
+def _masked_sum_and_count_contiguous_cp(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    cu_seqlens_padded: Optional[torch.Tensor] = None,
+    calculate_per_token_loss: bool = False,
+    local_cp_size: int = 1,
+    sample_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Aggregate a contiguous THD shard while preserving global sample boundaries."""
+    local_cp_size = _normalize_local_cp_size(local_cp_size)
+    if cu_seqlens_padded is None or local_cp_size <= 1:
+        return masked_sum_and_count_per_sample_or_token(
+            values,
+            mask,
+            cu_seqlens_padded,
+            calculate_per_token_loss,
+            local_cp_size,
+            sample_mask,
+        )
+
+    cp_group = mpu.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
+    local_rows = values.numel()
+    global_rows = int(cu_seqlens_padded[-1].item())
+    assert global_rows == local_rows * local_cp_size, (
+        f"contiguous THD rows mismatch: global={global_rows}, "
+        f"local={local_rows}, cp={local_cp_size}"
+    )
+
+    global_start = cp_group.rank() * local_rows
+    local_cu = (cu_seqlens_padded - global_start).clamp_(0, local_rows)
+    values_flat = torch.where(mask > 0, values, 0.0).reshape(-1)
+    mask_flat = mask.reshape(-1)
+
     with nullcontext() if calculate_per_token_loss else torch.no_grad():
         token_sum = masked_sum(values, mask)
         token_count = mask.sum()
 
     with torch.no_grad() if calculate_per_token_loss else nullcontext():
-        sample_sum, sample_count = _masked_sample_sum_and_count(
-            values, mask, cu_seqlens_padded, local_cp_size, sample_mask
-        )
+        sums, counts = _thd_per_sample_sum_and_count_local(values_flat, mask_flat, local_cu)
+        combined = torch.stack([sums, counts])
+        dist.all_reduce(combined, group=cp_group, op=dist.ReduceOp.SUM)
+        sums, counts = combined[0], combined[1]
+        sample_sum = (sums / counts.clamp(min=1)).sum()
+        sample_count = sums.new_tensor(float(local_cu.numel() - 1))
 
     if calculate_per_token_loss:
         bwd_sum, bwd_count = token_sum, token_count
@@ -376,6 +449,10 @@ class FinetuneLossInput:
     When not None, this group is used instead of ``mpu.get_context_parallel_group()``.
     Set by the dynamic-CP path to the per-microbatch dynamic CP subgroup."""
     cp_group: Optional[Any] = None
+    cur_mbs_step: Optional[int] = None
+    num_mbs: Optional[int] = None
+    """Frozen Student-TP shard of the Teacher output-layer weight."""
+    teacher_output_weight: Optional[torch.Tensor] = None
 
 
 def register_loss(name: str):
@@ -680,6 +757,8 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
         effective_prev,
         rollout_log_probs,
         response_mask.float(),
+        loss_input.cu_seqlens_padded,
+        _get_local_cp_group(loss_input.local_cp_size),
     )
 
     # support dapo Clip-Higher https://arxiv.org/pdf/2503.14476
@@ -734,6 +813,10 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
 
     cu_seqlens_padded = loss_input.cu_seqlens_padded
     local_cp_size = loss_input.local_cp_size
+    aggregate = (
+        _masked_sum_and_count_contiguous_cp if loss_input.cp_partition_mode == "contiguous" else
+        masked_sum_and_count_per_sample_or_token
+    )
 
     (
         actor_token_sum,
@@ -742,7 +825,7 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
         actor_sample_count,
         actor_bwd_sum,
         actor_bwd_count,
-    ) = masked_sum_and_count_per_sample_or_token(
+    ) = aggregate(
         actor_loss, response_mask, cu_seqlens_padded, calculate_per_token_loss, local_cp_size,
         sample_mask
     )
@@ -753,11 +836,11 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
         entropy_sample_count,
         entropy_bwd_sum,
         entropy_bwd_count,
-    ) = masked_sum_and_count_per_sample_or_token(
+    ) = aggregate(
         per_token_entropy, response_mask, cu_seqlens_padded, calculate_per_token_loss,
         local_cp_size, sample_mask
     )
-    loss = actor_bwd_sum - entropy_bwd_sum * ppo_config.ppo_entropy_bonus
+    loss = actor_bwd_sum - entropy_bwd_sum * get_entropy_bonus_coef(ppo_config)
 
     with torch.no_grad():
         ppo_ratio = masked_mean(ratios.detach(), response_mask)
@@ -801,7 +884,7 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
             kl_sample_count,
             kl_bwd_sum,
             kl_bwd_count,
-        ) = masked_sum_and_count_per_sample_or_token(
+        ) = aggregate(
             per_token_kl, response_mask, cu_seqlens_padded, calculate_per_token_loss, local_cp_size,
             sample_mask
         )
@@ -869,13 +952,13 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
     if loss_input.should_dump_metrics:
         metrics.update(
             {
-                "curr_logprobs": dumped_curr_logprobs,
-                "per_token_entropy": dumped_per_token_entropy,
-                "topk_logprobs": dumped_topk_logprobs,
-                "topk_token_ids": dumped_topk_token_ids,
-                "ppo_ratio_unclamped": dumped_ppo_ratio_unclamped,
-                "is_ppo_ratio_clamped": dumped_is_ppo_ratio_clamped,
-                "mask": dumped_mask,
+                "dump/curr_logprobs": dumped_curr_logprobs,
+                "dump/per_token_entropy": dumped_per_token_entropy,
+                "dump/topk_logprobs": dumped_topk_logprobs,
+                "dump/topk_token_ids": dumped_topk_token_ids,
+                "dump/ppo_ratio_unclamped": dumped_ppo_ratio_unclamped,
+                "dump/is_ppo_ratio_clamped": dumped_is_ppo_ratio_clamped,
+                "dump/mask": dumped_mask,
             }
         )
 
@@ -884,21 +967,14 @@ def grpo_loss_func(config, loss_input: PolicyLossInput):
 
 @register_loss("opd")
 def opd_loss_func(config, loss_input: PolicyLossInput):
-    """On-Policy Distill loss: GRPO actor loss + policy-ref KL + teacher-student KL.
+    """On-Policy Distill loss: GRPO actor + policy-ref KL + teacher-student KL.
 
-    Computes three components:
-      1. Clipped surrogate actor loss (same as GRPO).
-      2. policy_ref_kl_loss: KL(current_policy || ref_model) — prevents the
-         student from drifting too far from its reference checkpoint.
-      3. teacher_student_kl_loss: KL(teacher || student) — distills teacher
-         knowledge into the student on-policy.
+    Backward contract matches GRPO: returns the SUM of per-sample token-means
+    (seq-mean-token-mean numerator). Listed in ``SEQ_MEAN_RL_LOSS_FNS``.
 
-    Config knobs:
-      - ``ppo.grpo_kl_loss_beta``  controls weight of policy_ref_kl_loss.
-      - ``ppo.opd_teacher_kl_loss_beta`` controls weight of teacher_student_kl_loss.
-
-    When ``ppo.log_prob_top_k > 0``, PPO ratio / clip is computed in 3D on the
-    student top-K log-probs, summed over K, then combined with 2D KL / entropy.
+    When ``advantages.dim() == 3`` (``log_prob_top_k > 0``), PPO ratio / clip is
+    computed in 3D on student top-K log-probs, summed over K before aggregate;
+    ratio metrics use softmax-weighted collapse to 2D.
     """
     ppo_config = config.ppo
     advantages = loss_input.advantages
@@ -909,8 +985,14 @@ def opd_loss_func(config, loss_input: PolicyLossInput):
     response_mask = loss_input.response_mask
     scaled_entropy = loss_input.scaled_entropy
     rollout_log_probs = loss_input.rollout_log_probs
+    per_token_entropy = loss_input.per_token_entropy
+    sample_mask = loss_input.sample_mask
+    calculate_per_token_loss = loss_input.calculate_per_token_loss
 
     assert teacher_log_probs is not None, ("opd_loss requires teacher_log_probs in PolicyLossInput")
+
+    if per_token_entropy is None:
+        per_token_entropy = torch.zeros_like(curr_log_probs)
 
     # ---- ratio computation (2D label-based or 3D top-K) ----
     if advantages.dim() == 3:
@@ -934,6 +1016,8 @@ def opd_loss_func(config, loss_input: PolicyLossInput):
         prev_log_probs,
         rollout_log_probs,
         response_mask.float(),
+        loss_input.cu_seqlens_padded,
+        _get_local_cp_group(loss_input.local_cp_size),
     )
 
     clip_ratio_low = (
@@ -980,9 +1064,9 @@ def opd_loss_func(config, loss_input: PolicyLossInput):
             actor_loss = actor_loss * correction_ratio
 
     if advantages.dim() == 3:
-        # sum over K 压回 2D。
+        # sum over K 压回 2D before aggregate.
         actor_loss = actor_loss.sum(dim=-1)
-        # ratio metric 用 softmax 加权平均到 2D，保持与非 top-K 同量级。
+        # ratio metrics: softmax-weighted collapse to 2D (same scale as non-top-K).
         ratio_weights = torch.softmax(loss_input.prev_topk_logprobs.detach(), dim=-1)
         ratios_for_metric = (ratios.detach() * ratio_weights).sum(dim=-1)
         ratios_clamped_for_metric = (ratios_clamped.detach() * ratio_weights).sum(dim=-1)
@@ -990,49 +1074,91 @@ def opd_loss_func(config, loss_input: PolicyLossInput):
         ratios_for_metric = ratios.detach()
         ratios_clamped_for_metric = ratios_clamped.detach()
 
-    actor_loss = masked_mean_per_sample_or_token(
-        actor_loss,
-        response_mask,
-        loss_input.cu_seqlens_padded,
-        config.policy.override_transformer_config.get("calculate_per_token_loss", False),
-        loss_input.local_cp_size,
+    cu_seqlens_padded = loss_input.cu_seqlens_padded
+    local_cp_size = loss_input.local_cp_size
+    aggregate = (
+        _masked_sum_and_count_contiguous_cp if loss_input.cp_partition_mode == "contiguous" else
+        masked_sum_and_count_per_sample_or_token
     )
-    loss = actor_loss - scaled_entropy * ppo_config.ppo_entropy_bonus
+
+    (
+        actor_token_sum,
+        actor_token_count,
+        actor_sample_sum,
+        actor_sample_count,
+        actor_bwd_sum,
+        actor_bwd_count,
+    ) = aggregate(
+        actor_loss, response_mask, cu_seqlens_padded, calculate_per_token_loss, local_cp_size,
+        sample_mask
+    )
+    (
+        entropy_token_sum,
+        entropy_token_count,
+        entropy_sample_sum,
+        entropy_sample_count,
+        entropy_bwd_sum,
+        entropy_bwd_count,
+    ) = aggregate(
+        per_token_entropy, response_mask, cu_seqlens_padded, calculate_per_token_loss,
+        local_cp_size, sample_mask
+    )
+    loss = actor_bwd_sum - entropy_bwd_sum * get_entropy_bonus_coef(ppo_config)
 
     with torch.no_grad():
         ppo_ratio = masked_mean(ratios_for_metric, response_mask)
         ppo_ratio_clamped = masked_mean(ratios_clamped_for_metric, response_mask)
         scaled_entropy = scaled_entropy.detach()
 
-    # ---- policy-ref KL loss: prevents student from drifting from ref ----
-    policy_ref_kl = masked_mean(
-        calculate_kl_loss(
+    if ref_log_probs is not None:
+        per_token_policy_ref_kl = calculate_kl_loss(
             cur_log_probs=curr_log_probs,
             ref_log_probs=ref_log_probs,
             use_absolute_kl=False,
             use_low_var_kl=True,
             clamp_kl_loss=ppo_config.ppo_dual_clip_ratio_c is not None,
             clamp_kl_val=ppo_config.ppo_clamp_kl_val,
-        ),
-        response_mask,
+        )
+        (
+            policy_ref_kl_token_sum,
+            policy_ref_kl_token_count,
+            policy_ref_kl_sample_sum,
+            policy_ref_kl_sample_count,
+            policy_ref_kl_bwd_sum,
+            policy_ref_kl_bwd_count,
+        ) = aggregate(
+            per_token_policy_ref_kl, response_mask, cu_seqlens_padded, calculate_per_token_loss,
+            local_cp_size, sample_mask
+        )
+        loss = loss + policy_ref_kl_bwd_sum * ppo_config.grpo_kl_loss_beta
+    else:
+        zero = torch.zeros_like(actor_token_sum)
+        policy_ref_kl_token_sum = policy_ref_kl_sample_sum = policy_ref_kl_bwd_sum = zero
+        policy_ref_kl_token_count = actor_token_count
+        policy_ref_kl_sample_count = actor_sample_count
+        policy_ref_kl_bwd_count = actor_bwd_count
+
+    # teacher-student KL: always low-var (not absolute).
+    per_token_teacher_kl = calculate_kl_loss(
+        cur_log_probs=curr_log_probs,
+        ref_log_probs=teacher_log_probs,
+        use_absolute_kl=False,
+        use_low_var_kl=True,
+        clamp_kl_loss=ppo_config.ppo_dual_clip_ratio_c is not None,
+        clamp_kl_val=ppo_config.ppo_clamp_kl_val,
     )
-    loss = loss + policy_ref_kl * ppo_config.grpo_kl_loss_beta
-    #TODO(oriontian): 下面之前设置
-    # use_absolute_kl=True, use_low_var_kl=False, 是为了 打印绝对值好看 kl_loss 变化
-    # 先临时改回去了 use_absolute_kl=False, use_low_var_kl=True 方便算入 loss
-    teacher_kl = masked_mean(
-        calculate_kl_loss(
-            cur_log_probs=curr_log_probs,
-            ref_log_probs=teacher_log_probs,
-            use_absolute_kl=False,
-            use_low_var_kl=True,
-            clamp_kl_loss=ppo_config.ppo_dual_clip_ratio_c is not None,
-            clamp_kl_val=ppo_config.ppo_clamp_kl_val,
-        ),
-        response_mask,
+    (
+        teacher_kl_token_sum,
+        teacher_kl_token_count,
+        teacher_kl_sample_sum,
+        teacher_kl_sample_count,
+        teacher_kl_bwd_sum,
+        teacher_kl_bwd_count,
+    ) = aggregate(
+        per_token_teacher_kl, response_mask, cu_seqlens_padded, calculate_per_token_loss,
+        local_cp_size, sample_mask
     )
-    opd_teacher_kl_beta = getattr(ppo_config, "opd_teacher_kl_loss_beta", 0.0)
-    loss = loss + teacher_kl * opd_teacher_kl_beta
+    loss = loss + teacher_kl_bwd_sum * ppo_config.opd_teacher_kl_loss_beta
 
     bwd_loss = loss.clone()
 
@@ -1053,13 +1179,40 @@ def opd_loss_func(config, loss_input: PolicyLossInput):
         )
 
         metrics = {
-            "loss": torch.stack([loss.detach() * numel, numel]),
-            "policy_loss": torch.stack([actor_loss.detach() * numel, numel]),
-            "ppo_ratio": torch.stack([ppo_ratio * numel, numel]),
-            "ppo_ratio_clamped": torch.stack([ppo_ratio_clamped * numel, numel]),
-            "scaled_entropy": torch.stack([scaled_entropy * numel, numel]),
-            "policy_ref_kl_loss": torch.stack([policy_ref_kl.detach() * numel, numel]),
-            "teacher_student_kl_loss": torch.stack([teacher_kl.detach() * numel, numel]),
+            "loss":
+                torch.stack([loss.detach(), actor_bwd_count.detach()]),
+            "policy_loss":
+                torch.stack([actor_bwd_sum.detach(),
+                             actor_bwd_count.detach()]),
+            "scaled_entropy":
+                torch.stack([entropy_bwd_sum.detach(),
+                             entropy_bwd_count.detach()]),
+            "policy_ref_kl_loss":
+                torch.stack([policy_ref_kl_bwd_sum.detach(),
+                             policy_ref_kl_bwd_count.detach()]),
+            "teacher_student_kl_loss":
+                torch.stack([teacher_kl_bwd_sum.detach(),
+                             teacher_kl_bwd_count.detach()]),
+            "ppo_ratio":
+                torch.stack([ppo_ratio * numel, numel]),
+            "ppo_ratio_clamped":
+                torch.stack([ppo_ratio_clamped * numel, numel]),
+            "policy_loss_token":
+                torch.stack([actor_token_sum, actor_token_count]),
+            "policy_loss_sample":
+                torch.stack([actor_sample_sum, actor_sample_count]),
+            "entropy_token":
+                torch.stack([entropy_token_sum, entropy_token_count]),
+            "entropy_sample":
+                torch.stack([entropy_sample_sum, entropy_sample_count]),
+            "policy_ref_kl_token":
+                torch.stack([policy_ref_kl_token_sum, policy_ref_kl_token_count]),
+            "policy_ref_kl_sample":
+                torch.stack([policy_ref_kl_sample_sum, policy_ref_kl_sample_count]),
+            "teacher_student_kl_token":
+                torch.stack([teacher_kl_token_sum, teacher_kl_token_count]),
+            "teacher_student_kl_sample":
+                torch.stack([teacher_kl_sample_sum, teacher_kl_sample_count]),
             **clip_metrics,
         }
 
@@ -1067,6 +1220,7 @@ def opd_loss_func(config, loss_input: PolicyLossInput):
         metrics.update(extra_metrics)
     if entropy_reg_metrics:
         metrics.update(entropy_reg_metrics)
+
     reduce_metrics_across_data_parallel_group(metrics)
 
     return (bwd_loss, metrics)
@@ -1083,8 +1237,9 @@ def gspo_loss_func(config, loss_input: PolicyLossInput):
       3. Metrics use plain mean/min/max over the full ratio tensor.
     """
     assert loss_input.cu_seqlens_padded is None, (
-        "gspo_loss_func does not yet support THD packed format (dynamic CP). "
-        "Please disable dynamic_context_parallel or use grpo loss."
+        "gspo_loss_func expects response-padded [B, S] "
+        "(cu_seqlens_padded=None). Convert dyn-CP THD packs before loss "
+        "(mixin._rl_response_pad_dyn_cp_tensors)."
     )
     ppo_config = config.ppo
     advantages = loss_input.advantages
@@ -1125,6 +1280,8 @@ def gspo_loss_func(config, loss_input: PolicyLossInput):
         effective_prev,
         rollout_log_probs,
         response_mask.float(),
+        loss_input.cu_seqlens_padded,
+        _get_local_cp_group(loss_input.local_cp_size),
     )
 
     # ------------------------------------------------------------------
@@ -1183,7 +1340,7 @@ def gspo_loss_func(config, loss_input: PolicyLossInput):
     else:
         actor_loss = torch.mean(seq_losses)
 
-    loss = actor_loss - scaled_entropy * ppo_config.ppo_entropy_bonus
+    loss = actor_loss - scaled_entropy * get_entropy_bonus_coef(ppo_config)
 
     # ------------------------------------------------------------------
     # 5. KL regularization (token-level, same as GRPO)
@@ -1292,13 +1449,13 @@ def gspo_loss_func(config, loss_input: PolicyLossInput):
     if loss_input.should_dump_metrics:
         metrics.update(
             {
-                "curr_logprobs": dumped_curr_logprobs,
-                "per_token_entropy": dumped_per_token_entropy,
-                "topk_logprobs": dumped_topk_logprobs,
-                "topk_token_ids": dumped_topk_token_ids,
-                "ppo_ratio_unclamped": dumped_ppo_ratio_unclamped,
-                "is_ppo_ratio_clamped": dumped_is_ppo_ratio_clamped,
-                "mask": dumped_mask,
+                "dump/curr_logprobs": dumped_curr_logprobs,
+                "dump/per_token_entropy": dumped_per_token_entropy,
+                "dump/topk_logprobs": dumped_topk_logprobs,
+                "dump/topk_token_ids": dumped_topk_token_ids,
+                "dump/ppo_ratio_unclamped": dumped_ppo_ratio_unclamped,
+                "dump/is_ppo_ratio_clamped": dumped_is_ppo_ratio_clamped,
+                "dump/mask": dumped_mask,
             }
         )
 
@@ -1356,6 +1513,8 @@ def cispo_loss_func(config, loss_input: PolicyLossInput):
         effective_prev,
         rollout_log_probs,
         response_mask.float(),
+        loss_input.cu_seqlens_padded,
+        _get_local_cp_group(loss_input.local_cp_size),
     )
 
     # ------------------------------------------------------------------
@@ -1405,7 +1564,7 @@ def cispo_loss_func(config, loss_input: PolicyLossInput):
         local_cp_size,
         sample_mask,
     )
-    loss = actor_bwd_sum - entropy_bwd_sum * ppo_config.ppo_entropy_bonus
+    loss = actor_bwd_sum - entropy_bwd_sum * get_entropy_bonus_coef(ppo_config)
 
     # ------------------------------------------------------------------
     # 4. KL regularization (same as GRPO)
@@ -1449,16 +1608,18 @@ def cispo_loss_func(config, loss_input: PolicyLossInput):
         kl_bwd_count = actor_bwd_count
 
     # ------------------------------------------------------------------
-    # 5. Backward loss (global retention ratio compensation)
+    # 5. Backward loss
     # ------------------------------------------------------------------
+    # Dead-sample retention is applied by the training backend's global
+    # normalizer (per-sample: N = retention * gbs; per-token: mask.sum()
+    # already ignores dead rows). Do NOT divide bwd_loss by retention here
+    # or the compensation is applied twice. Keep the ratio only for
+    # logging-only ``*_dead_aware`` metrics below.
     bwd_loss = loss.clone()
 
     global_retention_ratio = loss_input.global_retention_ratio
     if hasattr(config, "debug") and getattr(config.debug, "ignore_global_retention_ratio", False):
         global_retention_ratio = None
-    if global_retention_ratio is not None:
-        global_retention_ratio_scalar = global_retention_ratio.flatten()[0].clamp(min=1e-6)
-        bwd_loss = bwd_loss / global_retention_ratio_scalar
 
     # ------------------------------------------------------------------
     # 6. Metrics
@@ -1535,13 +1696,13 @@ def cispo_loss_func(config, loss_input: PolicyLossInput):
     if loss_input.should_dump_metrics:
         metrics.update(
             {
-                "curr_logprobs": dumped_curr_logprobs,
-                "per_token_entropy": dumped_per_token_entropy,
-                "topk_logprobs": dumped_topk_logprobs,
-                "topk_token_ids": dumped_topk_token_ids,
-                "ppo_ratio_unclamped": dumped_ppo_ratio_unclamped,
-                "is_ppo_ratio_clamped": dumped_is_ppo_ratio_clamped,
-                "mask": dumped_mask,
+                "dump/curr_logprobs": dumped_curr_logprobs,
+                "dump/per_token_entropy": dumped_per_token_entropy,
+                "dump/topk_logprobs": dumped_topk_logprobs,
+                "dump/topk_token_ids": dumped_topk_token_ids,
+                "dump/ppo_ratio_unclamped": dumped_ppo_ratio_unclamped,
+                "dump/is_ppo_ratio_clamped": dumped_is_ppo_ratio_clamped,
+                "dump/mask": dumped_mask,
             }
         )
 
@@ -1563,14 +1724,14 @@ def sapo_loss_func(config, loss_input: PolicyLossInput):
     of truncating like a hard clip. Asymmetric temperatures (``τ_neg > τ_pos``)
     make negative-token gradients decay faster, improving stability.
 
-    Aggregation follows the paper Eq.(5): seq-mean-token-mean (each sequence is
-    weighted equally), identical to ``gspo_loss_func``. There is no hard / dual
+    Aggregation defaults to the paper Eq.(5) seq-mean-token-mean when
+    ``calculate_per_token_loss=False`` (each sequence weighted equally). Set
+    ``calculate_per_token_loss=True`` for GRPO-style global token-mean / token
+    sum. Both aggregation modes support Dynamic CP: sequence means reduce each
+    sample's token sum/count across its CP subgroup before normalization, while
+    token mean aggregates local token sums globally. There is no hard / dual
     clipping; ``ppo_clip_ratio_*`` and ``ppo_dual_clip_ratio_c`` are inert here.
     """
-    assert loss_input.cu_seqlens_padded is None, (
-        "sapo_loss_func does not yet support THD packed format (dynamic CP). "
-        "Please disable dynamic_context_parallel or use grpo loss."
-    )
     ppo_config = config.ppo
     advantages = loss_input.advantages
     prev_log_probs = loss_input.prev_log_probs
@@ -1583,6 +1744,9 @@ def sapo_loss_func(config, loss_input: PolicyLossInput):
     dumped_topk_logprobs = loss_input.dumped_topk_logprobs
     dumped_topk_token_ids = loss_input.dumped_topk_token_ids
     sample_mask = loss_input.sample_mask
+    cu_seqlens_padded = loss_input.cu_seqlens_padded
+    local_cp_size = loss_input.local_cp_size
+    calculate_per_token_loss = loss_input.calculate_per_token_loss
 
     # ------------------------------------------------------------------
     # 1. Token-level importance ratio (supports skip_prev_logps)
@@ -1609,6 +1773,8 @@ def sapo_loss_func(config, loss_input: PolicyLossInput):
         effective_prev,
         rollout_log_probs,
         response_mask.float(),
+        loss_input.cu_seqlens_padded,
+        _get_local_cp_group(loss_input.local_cp_size),
     )
 
     # ------------------------------------------------------------------
@@ -1629,22 +1795,49 @@ def sapo_loss_func(config, loss_input: PolicyLossInput):
         actor_loss = actor_loss * correction_ratio
 
     # ------------------------------------------------------------------
-    # 4. Sequence-level loss aggregation (paper Eq.(5))
-    #    L = (1/G) Σ_i (1/|y_i|) Σ_t l_{i,t}
+    # 4. Aggregate the token-level SAPO surrogate.
+    #
+    # Shared helper selects token-sum (``calculate_per_token_loss=True``) or
+    # seq-mean-token-mean (paper Eq.(5)).  For the latter under Dynamic CP it
+    # remaps THD boundaries onto the compact local CP shard and all-reduces
+    # each sample's sum/count before forming per-sample means.  Returns a
+    # numerator/count pair so Megatron can normalize once over the PPO step.
     # ------------------------------------------------------------------
-    seq_losses = (
-        torch.sum(actor_loss * response_mask, dim=-1) /
-        torch.sum(response_mask, dim=-1).clamp(min=1)
+    (
+        actor_token_sum,
+        actor_token_count,
+        actor_sample_sum,
+        actor_sample_count,
+        actor_bwd_sum,
+        actor_bwd_count,
+    ) = masked_sum_and_count_per_sample_or_token(
+        actor_loss,
+        response_mask,
+        cu_seqlens_padded,
+        calculate_per_token_loss,
+        local_cp_size,
+        sample_mask,
     )
-    if sample_mask is not None:
-        actor_loss = (seq_losses * sample_mask).sum() / sample_mask.sum().clamp(min=1)
-    else:
-        actor_loss = torch.mean(seq_losses)
-
-    loss = actor_loss - scaled_entropy * ppo_config.ppo_entropy_bonus
+    (
+        entropy_token_sum,
+        entropy_token_count,
+        entropy_sample_sum,
+        entropy_sample_count,
+        entropy_bwd_sum,
+        entropy_bwd_count,
+    ) = masked_sum_and_count_per_sample_or_token(
+        per_token_entropy,
+        response_mask,
+        cu_seqlens_padded,
+        calculate_per_token_loss,
+        local_cp_size,
+        sample_mask,
+    )
+    loss = actor_bwd_sum - entropy_bwd_sum * get_entropy_bonus_coef(ppo_config)
 
     # ------------------------------------------------------------------
-    # 5. KL regularization (token-level, same as GRPO/GSPO)
+    # 5. KL regularization.  Use the same aggregation as the actor term so a
+    # single global denominator remains valid for dynamic CP.
     # ------------------------------------------------------------------
     use_absolute_kl = False
     use_low_var_kl = True
@@ -1652,43 +1845,45 @@ def sapo_loss_func(config, loss_input: PolicyLossInput):
         use_absolute_kl = True
         use_low_var_kl = False
     if ref_log_probs is not None:
-        kl_loss = masked_mean(
-            calculate_kl_loss(
-                cur_log_probs=curr_log_probs,
-                ref_log_probs=ref_log_probs,
-                use_absolute_kl=use_absolute_kl,
-                use_low_var_kl=use_low_var_kl,
-                clamp_kl_loss=ppo_config.ppo_dual_clip_ratio_c is not None,
-                clamp_kl_val=ppo_config.ppo_clamp_kl_val,
-            ),
-            response_mask,
+        per_token_kl = calculate_kl_loss(
+            cur_log_probs=curr_log_probs,
+            ref_log_probs=ref_log_probs,
+            use_absolute_kl=use_absolute_kl,
+            use_low_var_kl=use_low_var_kl,
+            clamp_kl_loss=ppo_config.ppo_dual_clip_ratio_c is not None,
+            clamp_kl_val=ppo_config.ppo_clamp_kl_val,
         )
-        loss = loss + kl_loss * ppo_config.grpo_kl_loss_beta
+        (
+            kl_token_sum,
+            kl_token_count,
+            kl_sample_sum,
+            kl_sample_count,
+            kl_bwd_sum,
+            kl_bwd_count,
+        ) = masked_sum_and_count_per_sample_or_token(
+            per_token_kl,
+            response_mask,
+            cu_seqlens_padded,
+            calculate_per_token_loss,
+            local_cp_size,
+            sample_mask,
+        )
+        loss = loss + kl_bwd_sum * ppo_config.grpo_kl_loss_beta
     else:
-        kl_loss = torch.zeros_like(loss)
+        per_token_kl = None
+        zero = torch.zeros_like(actor_token_sum)
+        kl_token_sum = kl_sample_sum = kl_bwd_sum = zero
+        kl_token_count = actor_token_count
+        kl_sample_count = actor_sample_count
+        kl_bwd_count = actor_bwd_count
 
     # ------------------------------------------------------------------
     # 6. Metrics (gspo-style seq-level loss + SAPO gate diagnostics)
     # ------------------------------------------------------------------
     bwd_loss = loss.clone()  # TODO: 为什么需要clone
 
-    global_retention_ratio = loss_input.global_retention_ratio
-    if hasattr(config, "debug") and getattr(config.debug, "ignore_global_retention_ratio", False):
-        # DEBUG: skip the 1/global_retention_ratio compensation for grad-scaling experiments.
-        global_retention_ratio = None
-    if global_retention_ratio is not None:
-        # TODO (@yeazhao): 该 1/retention 补偿只在「有效 micro-batch = 单样本」时严格等于全局
-        # mean-over-alive：此时死样本各自占满 1/M 计数、贡献 0，自然归一化是 ÷N_total，
-        # ÷retention 正好升级为 ÷N_valid。但 train_mbs>1 或 dynamic_mbs/smart_pad 把多个
-        # 样本打包进同一 micro-batch 时，local 除数是该 mb 的存活数，单个全局标量无法修复
-        # 各 mb 存活数不均带来的偏差（异质性），结果有偏。代码里没有任何 train_mbs==1 的约束。
-        # 严格做法应改走全局计数归一（calculate_per_token_loss）或 local 除以含死样本的样本总数。
-        global_retention_ratio_scalar = global_retention_ratio.flatten()[0].clamp(min=1e-6)
-        bwd_loss = bwd_loss / global_retention_ratio_scalar
-
     with torch.no_grad():
         numel = response_mask.sum()
-        ones = torch.tensor(1.0, device=loss.device)
         mask_bool = response_mask.bool()
 
         ppo_ratio_sum = (ratios.detach() * response_mask).sum()
@@ -1720,11 +1915,20 @@ def sapo_loss_func(config, loss_input: PolicyLossInput):
             dumped_mask = response_mask.detach().bool().to(device="cpu")
 
     metrics = {
-        "loss": torch.stack([loss.detach(), ones]),
-        "policy_loss": torch.stack([actor_loss.detach(), ones]),
+        "loss": torch.stack([loss.detach(), actor_bwd_count.detach()]),
+        "policy_loss": torch.stack([actor_bwd_sum.detach(),
+                                    actor_bwd_count.detach()]),
         "ppo_ratio": torch.stack([ppo_ratio_sum, numel]),
-        "scaled_entropy": torch.stack([scaled_entropy.detach() * numel, numel]),
-        "grpo_kl_loss": torch.stack([kl_loss.detach() * numel, numel]),
+        "scaled_entropy": torch.stack([entropy_bwd_sum.detach(),
+                                       entropy_bwd_count.detach()]),
+        "grpo_kl_loss": torch.stack([kl_bwd_sum.detach(),
+                                     kl_bwd_count.detach()]),
+        "policy_loss_token": torch.stack([actor_token_sum, actor_token_count]),
+        "policy_loss_sample": torch.stack([actor_sample_sum, actor_sample_count]),
+        "entropy_token": torch.stack([entropy_token_sum, entropy_token_count]),
+        "entropy_sample": torch.stack([entropy_sample_sum, entropy_sample_count]),
+        "grpo_kl_token": torch.stack([kl_token_sum, kl_token_count]),
+        "grpo_kl_sample": torch.stack([kl_sample_sum, kl_sample_count]),
         # on-policy 理论 =2/sapo_tau_pos (adv>=0) =2/sapo_tau_neg (adv<0)，越小 ratio 差别越大
         "sapo/gate_mean": gate_mean,
         # >= 0 | 越偏离 2/sapo_tau_pos(neg) ratio 差别越大
@@ -1742,22 +1946,17 @@ def sapo_loss_func(config, loss_input: PolicyLossInput):
         metrics["valid_sample_ratio"] = masked_mean(
             sample_mask.float().detach(), torch.ones_like(sample_mask, dtype=torch.float)
         )
-
-    if global_retention_ratio is not None:
-        grr_scalar = global_retention_ratio.flatten()[0].clamp(min=1e-6)
-        metrics["loss_dead_aware"] = torch.stack([loss.detach() / grr_scalar, ones])
-        metrics["policy_loss_dead_aware"] = torch.stack([actor_loss.detach() / grr_scalar, ones])
     reduce_metrics_across_data_parallel_group(metrics)
 
     if loss_input.should_dump_metrics:
         metrics.update(
             {
-                "curr_logprobs": dumped_curr_logprobs,
-                "per_token_entropy": dumped_per_token_entropy,
-                "topk_logprobs": dumped_topk_logprobs,
-                "topk_token_ids": dumped_topk_token_ids,
-                "ppo_ratio_unclamped": dumped_ratios,
-                "mask": dumped_mask,
+                "dump/curr_logprobs": dumped_curr_logprobs,
+                "dump/per_token_entropy": dumped_per_token_entropy,
+                "dump/topk_logprobs": dumped_topk_logprobs,
+                "dump/topk_token_ids": dumped_topk_token_ids,
+                "dump/ppo_ratio_unclamped": dumped_ratios,
+                "dump/mask": dumped_mask,
             }
         )
 
@@ -1813,6 +2012,8 @@ def fipo_loss_func(config, loss_input: PolicyLossInput):
         prev_log_probs,
         rollout_log_probs,
         response_mask.float(),
+        loss_input.cu_seqlens_padded,
+        _get_local_cp_group(loss_input.local_cp_size),
     )
 
     # ------------------------------------------------------------------
@@ -1947,7 +2148,7 @@ def fipo_loss_func(config, loss_input: PolicyLossInput):
         config.policy.override_transformer_config.get("calculate_per_token_loss", False),
         loss_input.local_cp_size,
     )
-    loss = actor_loss - scaled_entropy * ppo_config.ppo_entropy_bonus
+    loss = actor_loss - scaled_entropy * get_entropy_bonus_coef(ppo_config)
 
     # ------------------------------------------------------------------
     # 8. KL regularisation
@@ -2127,8 +2328,11 @@ def cross_entroy_loss_func(
     loss_weights = batch.get("loss_weights", None)
 
     if loss_input.linear_ce_input is not None:
-        assert config.training.use_linear_ce
-        loss = linear_ce_loss(
+        assert config.training.return_hidden_states_for_ce
+        hidden_ce_loss = (
+            linear_ce_loss if config.training.use_linear_ce else compact_ce_loss
+        )
+        loss = hidden_ce_loss(
             config,
             loss_input.linear_ce_input,
             labels,
@@ -2156,27 +2360,158 @@ def cross_entroy_loss_func(
 
     # dump metrics
     if batch.get("should_dump_metrics", False):
-        assert not config.training.use_linear_ce, "暂不支持，因为没有 logits"
-        metrics.update({"mask": batch["full_loss_mask"].detach().bool().to(device="cpu")})
+        assert not config.training.return_hidden_states_for_ce, "暂不支持，因为没有 logits"
+        metrics.update(
+            {"dump/mask": batch["full_loss_mask"].detach().bool().to(device="cpu")}
+        )
 
         if config.training.dump_metrics_logprobs_topk > 0:
             topk_logprobs, topk_token_ids = from_parallel_logits_to_topk_logprobs(
-                vocab_parallel_logits=logits, topk=config.training.dump_metrics_logprobs_topk
+                vocab_parallel_logits=logits,
+                topk=config.training.dump_metrics_logprobs_topk,
+                temperature=1.0,
             )
             topk_logprobs = topk_logprobs.to(dtype=torch.bfloat16, device="cpu")
             topk_token_ids = topk_token_ids.to(dtype=torch.int32, device="cpu")
-            metrics.update({"topk_logprobs": topk_logprobs, "topk_token_ids": topk_token_ids})
+            metrics.update(
+                {
+                    "dump/topk_logprobs": topk_logprobs,
+                    "dump/topk_token_ids": topk_token_ids,
+                }
+            )
 
         if config.training.ppo_dump_per_token_entropy:
             _, per_token_entropy_unmasked = vocab_parallel_entropy(logits.detach().clone())
             metrics.update(
                 {
-                    "per_token_entropy":
+                    "dump/per_token_entropy":
                         per_token_entropy_unmasked.to(dtype=torch.bfloat16, device="cpu")
                 }
             )
 
     return (loss[0].clone(), local_num_tokens, metrics)
+
+
+def compact_ce_loss(
+    config,
+    linear_ce_input: Dict[str, torch.Tensor],
+    labels: torch.Tensor,
+    loss_mask: torch.Tensor,
+    kl_alpha_mask: torch.Tensor = None,
+    return_src_loss: bool = False,
+    skip_cp_reduce: bool = False,
+    cp_group=None,
+    loss_weights: Optional[torch.Tensor] = None,
+):
+    """Ordinary vocab-parallel CE on compacted hidden states.
+
+    Returns:
+        If ``return_src_loss``: per-token loss ``[b, s]``.
+        Otherwise: ``torch.Tensor`` ``[loss_sum, total_tokens]``.
+    """
+    assert config.training.ce_compaction
+    assert not config.training.use_linear_ce
+    labels = labels.transpose(0, 1).contiguous()
+
+    hidden_states = linear_ce_input["hidden_states"]
+    output_layer = linear_ce_input["output_layer"]
+    tp_group = output_layer.tp_group
+    if output_layer.sequence_parallel:
+        hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+            hidden_states,
+            tensor_parallel_output_grad=False,
+        )
+    weight = linear_ce_input["weight"]
+    if weight is None:
+        weight = output_layer.weight
+    assert output_layer.bias is None, (
+        "CE compaction requires an output projection without bias"
+    )
+    assert not output_layer.gather_output
+    assert not linear_ce_input["runtime_gather_output"]
+
+    loss_mask_sb = loss_mask.transpose(0, 1).contiguous()
+    assert hidden_states.shape[:-1] == labels.shape == loss_mask_sb.shape, (
+        "compact CE shape mismatch: "
+        f"{hidden_states.shape=}, {labels.shape=}, {loss_mask_sb.shape=}"
+    )
+    flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+    flat_labels = labels.reshape(-1)
+    keep_indices = (loss_mask_sb.reshape(-1) != 0).nonzero(as_tuple=False).flatten()
+    num_valid_tokens = keep_indices.numel()
+    if num_valid_tokens == 0:
+        zero_loss = (flat_hidden[:0].sum() + weight[:0].sum()).float()
+        loss = zero_loss.expand(labels.numel()).view_as(labels)
+    else:
+        compact_hidden = flat_hidden.index_select(0, keep_indices).unsqueeze(1)
+        compact_labels = flat_labels.index_select(0, keep_indices)
+        assert compact_hidden.shape[-1] == weight.shape[-1]
+        if tp_group is not None and dist.get_world_size(tp_group) > 1:
+            # Enter TP region so vocab-parallel CE all-reduces d_hidden.
+            compact_hidden = tensor_parallel.copy_to_tensor_model_parallel_region(
+                compact_hidden,
+                group=tp_group,
+            )
+        compact_logits = F.linear(compact_hidden, weight).float()
+        compact_labels = compact_labels.unsqueeze(1)
+        if config.training.cross_entropy_loss_fusion:
+            if config.training.cross_entropy_fusion_impl == 'te':
+                if te_parallel_cross_entropy is not None:
+                    compact_labels = torch.as_strided(
+                        compact_labels,
+                        compact_labels.size(),
+                        (compact_labels.size()[1], 1),
+                    )
+                    compact_loss = te_parallel_cross_entropy(
+                        compact_logits,
+                        compact_labels,
+                        parallel_state.get_tensor_model_parallel_group(),
+                    )
+                else:
+                    raise RuntimeError("Trying to use a TE block when it's not present.")
+            elif config.training.cross_entropy_fusion_impl == 'native':
+                compact_loss = fused_vocab_parallel_cross_entropy(
+                    compact_logits,
+                    compact_labels,
+                    parallel_state.get_tensor_model_parallel_group(),
+                )
+        else:
+            compact_loss = tensor_parallel.vocab_parallel_cross_entropy(
+                compact_logits,
+                compact_labels,
+            )
+        loss = compact_loss.new_zeros(labels.numel())
+        loss = loss.scatter(0, keep_indices, compact_loss.reshape(-1))
+        loss = loss.view_as(labels)
+
+    loss = loss.transpose(0, 1).contiguous()
+    if return_src_loss:
+        return loss
+
+    if kl_alpha_mask is not None:
+        ce_weight = (1 - kl_alpha_mask).view(-1, 1).float()
+        loss = loss * ce_weight
+        loss_mask = loss_mask * (ce_weight != 0)
+
+    losses = loss.view(-1).float()
+    loss_mask = loss_mask.view(-1).float()
+
+    if loss_weights is not None:
+        weighted_mask = loss_mask * loss_weights.view(-1).float()
+    else:
+        weighted_mask = loss_mask
+
+    loss = torch.sum(losses * weighted_mask)
+    total_tokens = loss_mask.sum()
+    loss = torch.cat([loss.view(1), total_tokens.view(1)])
+
+    # When calculate_per_token_loss=True the pipeline schedule + finalize_model_grads
+    # handle CP gradient aggregation.  Skipping the AVG here keeps each CP rank's
+    # local loss_sum/tokens so finalize_model_grads produces correctly scaled gradients.
+    _cp_group = cp_group if cp_group is not None else mpu.get_context_parallel_group()
+    if not skip_cp_reduce and dist.get_world_size(_cp_group) > 1:
+        torch.distributed.all_reduce(loss, group=_cp_group, op=torch.distributed.ReduceOp.AVG)
+    return loss
 
 
 def linear_ce_loss(
@@ -2217,14 +2552,49 @@ def linear_ce_loss(
     weight = linear_ce_input["weight"]
     if weight is None:
         weight = output_layer.weight
-    loss = linear_cross_entropy(
-        hidden_states,
-        weight,
-        labels,
-        1.0,
-        "none",
-        tp_group,
-    )
+
+    if not config.training.ce_compaction:
+        loss = linear_cross_entropy(
+            hidden_states,
+            weight,
+            labels,
+            1.0,
+            "none",
+            tp_group,
+        )
+    else:
+        loss_mask_sb = loss_mask.transpose(0, 1).contiguous()
+        assert hidden_states.shape[:-1] == labels.shape == loss_mask_sb.shape, (
+            "linear CE shape mismatch: "
+            f"{hidden_states.shape=}, {labels.shape=}, {loss_mask_sb.shape=}"
+        )
+
+        flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+        flat_labels = labels.reshape(-1)
+        keep_indices = (loss_mask_sb.reshape(-1) != 0).nonzero(as_tuple=False).flatten()
+        num_valid_tokens = keep_indices.numel()
+        if num_valid_tokens == 0:
+            # Preserve zero gradients for hidden states and output weights.
+            zero_loss = flat_hidden[:0].sum() + weight[:0].sum()
+            loss = zero_loss.expand(labels.numel()).view_as(labels)
+        else:
+            linear_ce_hidden = flat_hidden.index_select(0, keep_indices)
+            linear_ce_labels = flat_labels.index_select(0, keep_indices)
+            # Triton specializes one token to a scalar, so pad it to two rows.
+            if num_valid_tokens == 1:
+                linear_ce_hidden = torch.cat((linear_ce_hidden, linear_ce_hidden), dim=0)
+                linear_ce_labels = torch.cat((linear_ce_labels, linear_ce_labels))
+            loss = linear_cross_entropy(
+                linear_ce_hidden,
+                weight,
+                linear_ce_labels,
+                1.0,
+                "none",
+                tp_group,
+            )
+            dense_loss = loss.new_zeros(labels.numel())
+            loss = dense_loss.scatter(0, keep_indices, loss[:num_valid_tokens])
+            loss = loss.view_as(labels)
 
     # [s b] => [b, s]
     loss = loss.transpose(0, 1).contiguous()
@@ -2334,9 +2704,34 @@ def logits_kl_loss(
         kl_loss = torch.sum(kl_loss * local_mask / (temperature**2))
 
     reduce_kl_tensor = torch.cat([kl_loss.view(1), local_mask.sum().view(1)])
+    # Match ``ce_loss`` / ``linear_ce_loss``: AVG so d(mean)/d(local_sum)
+    # is ``cp / global_tokens``. A SUM here would make KL grads ``1/cp``
+    # of CE after DP×CP DDP averaging.
     if dist.get_world_size(mpu.get_context_parallel_group()) > 1:
-        torch.distributed.all_reduce(reduce_kl_tensor, group=mpu.get_context_parallel_group())
+        torch.distributed.all_reduce(
+            reduce_kl_tensor,
+            group=mpu.get_context_parallel_group(),
+            op=torch.distributed.ReduceOp.AVG,
+        )
     return reduce_kl_tensor
+
+
+def _offpd_megatron_loss_outputs(
+    loss: torch.Tensor,
+    num_tokens: torch.Tensor,
+    metrics: Dict[str, Any],
+):
+    """Pack a Megatron 3-tuple so CP does not apply the legacy ``*cp_size``.
+
+    A 2-tuple return is treated as an already-averaged loss and then
+    multiplied by ``cp_group_size`` in ``forward_step_calc_loss``. That is
+    wrong for ``ce_with_kl``, whose CE/KL means are already CP-reduced.
+    Returning ``(loss_sum, num_tokens, metrics)`` matches ``cross_entropy``
+    so TP/PP/CP configs share the same backward scale.
+    """
+    num_tokens = num_tokens.detach().to(dtype=torch.int)
+    token_scale = num_tokens.clamp(min=1).to(dtype=loss.dtype)
+    return (loss * token_scale, num_tokens, metrics)
 
 
 @register_loss("ce_with_kl")
@@ -2359,16 +2754,48 @@ def off_policy_loss_func(
         assert kl_alpha_mask.shape[0] == labels.shape[
             0], f"shape mismatch {kl_alpha_mask.shape} {labels.shape}"
 
-    loss = ce_loss(
-        config,
-        parallel_logits,
-        labels,
-        loss_mask,
-        kl_alpha_mask=kl_alpha_mask if
-        (config.training.enable_teacher_kl_loss and
-         config.distill.enable_data_with_alpha) else None,
-        loss_weights=loss_weights,
+    ce_kl_alpha_mask = (
+        kl_alpha_mask if
+        (config.training.enable_teacher_kl_loss and config.distill.enable_data_with_alpha) else None
     )
+    if config.training.use_linear_ce:
+        loss = linear_ce_loss(
+            config,
+            loss_input.linear_ce_input,
+            labels,
+            loss_mask,
+            kl_alpha_mask=ce_kl_alpha_mask,
+            skip_cp_reduce=loss_input.skip_cp_loss_reduce,
+            cp_group=loss_input.cp_group,
+            loss_weights=loss_weights,
+        )
+
+        linear_ce_input = loss_input.linear_ce_input
+        student_hidden_states = linear_ce_input["hidden_states"]
+        student_output_layer = linear_ce_input["output_layer"]
+        assert not getattr(student_output_layer.config, "use_mup", False), (
+            "Teacher hidden-state transfer does not yet support MuP logit scaling"
+        )
+        student_weight = linear_ce_input["weight"]
+        if student_weight is None:
+            student_weight = student_output_layer.weight
+        student_output = student_output_layer(
+            student_hidden_states,
+            weight=student_weight,
+            runtime_gather_output=linear_ce_input["runtime_gather_output"],
+        )
+        if isinstance(student_output, tuple):
+            student_output = student_output[0]
+        parallel_logits = student_output.transpose(0, 1).contiguous()
+    else:
+        loss = ce_loss(
+            config,
+            parallel_logits,
+            labels,
+            loss_mask,
+            kl_alpha_mask=ce_kl_alpha_mask,
+            loss_weights=loss_weights,
+        )
     ce_numel = loss[1].detach()  # token count for metrics
     if loss[1] != 0:
         lm_loss = loss[0] / loss[1]
@@ -2376,7 +2803,22 @@ def off_policy_loss_func(
         lm_loss = loss[0]
 
     if config.training.enable_teacher_kl_loss:
-        teacher_logits = batch["teacher_logits"]
+        teacher_hidden_states = batch["teacher_hidden_states"]
+        teacher_output_weight = loss_input.teacher_output_weight
+        assert teacher_output_weight is not None
+        assert teacher_hidden_states.shape[-1] == teacher_output_weight.shape[-1], (
+            f"Teacher hidden/head mismatch: {teacher_hidden_states.shape} vs "
+            f"{teacher_output_weight.shape}"
+        )
+        with torch.no_grad():
+            teacher_logits = F.linear(
+                teacher_hidden_states.to(dtype=teacher_output_weight.dtype),
+                teacher_output_weight,
+            )
+        assert teacher_logits.shape == parallel_logits.shape, (
+            f"Teacher/Student logits mismatch: {teacher_logits.shape} vs "
+            f"{parallel_logits.shape}"
+        )
         # logits_kl_loss 函数中，TP > 1 时需要手动实现 all-reduce 来跨 TP ranks
         # 计算全局 softmax 和 KL 散度（因为每个 rank 只持有 vocab 的一部分 logits）。
         reduce_kl_loss = logits_kl_loss(
@@ -2412,7 +2854,7 @@ def off_policy_loss_func(
                 "lm_loss": torch.stack([lm_loss.detach() * ce_numel, ce_numel]),
                 "kl_loss": torch.stack([kl_loss.detach() * kl_numel, kl_numel]),
             }
-        return (loss.clone(), metrics)
+        return _offpd_megatron_loss_outputs(loss, total_numel, metrics)
     else:
         loss = lm_loss
         with torch.no_grad():
@@ -2420,7 +2862,7 @@ def off_policy_loss_func(
                 "loss": torch.stack([loss.detach() * ce_numel, ce_numel]),
                 "lm_loss": torch.stack([lm_loss.detach() * ce_numel, ce_numel]),
             }
-        return (loss.clone(), metrics)
+        return _offpd_megatron_loss_outputs(loss, ce_numel, metrics)
 
 
 def compute_dpo_loss_core(
@@ -2462,33 +2904,25 @@ def compute_dpo_loss_core(
     return losses, chosen_rewards.detach(), rejected_rewards.detach()
 
 
-@register_loss("dpo")
-def dpo_loss_func(
+def _dpo_loss_from_sequence_logprobs(
     config,
-    loss_input: FinetuneLossInput,
-):
-    """Megatron-backend DPO loss (uses ``from_parallel_logits_to_logprobs``)."""
-    logits = loss_input.logits.float()
-    batch = loss_input.batch
-    labels = batch["labels"]
-    loss_mask = batch["full_loss_mask"][:, :-1]
-    target = batch["full_tokens"]
-
-    assert logits.shape[0] % 2 == 0, "mbs must be 2*n"
-    rbs = logits.shape[0] // 2
-    policy_chosen_logits, policy_rejected_logits = logits.split(rbs, dim=0)
-    policy_chosen_logits_mean = policy_chosen_logits.detach().mean().float()
-    policy_rejected_logits_mean = policy_rejected_logits.detach().mean().float()
-
-    # shape = [bs, seq_len - 1]
-    logps = from_parallel_logits_to_logprobs(
-        vocab_parallel_logits=logits, target=target, inference_only=False
-    )
-    logps = (logps * loss_mask).sum(-1)
-    ref_logps = (batch['ref_logprobs'] * loss_mask).sum(-1)
-    policy_chosen_logps, policy_rejected_logps = logps.split(rbs, dim=0)
-    ref_chosen_logps, ref_rejected_logps = ref_logps.split(rbs, dim=0)
-
+    policy_seq_logps: torch.Tensor,
+    ref_seq_logps: torch.Tensor,
+    chosen_token_counts: Optional[torch.Tensor] = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Apply pairwise DPO and optional FTX to aligned sequence log-probs."""
+    assert policy_seq_logps.numel() % 2 == 0, "DPO requires chosen/rejected pairs"
+    rbs = policy_seq_logps.numel() // 2
+    policy_chosen_logps, policy_rejected_logps = policy_seq_logps.split(rbs)
+    ref_chosen_logps, ref_rejected_logps = ref_seq_logps.split(rbs)
     losses, chosen_rewards, rejected_rewards = compute_dpo_loss_core(
         policy_chosen_logps,
         policy_rejected_logps,
@@ -2498,16 +2932,250 @@ def dpo_loss_func(
         label_smoothing=config.training.dpo_label_smoothing,
         loss_type=config.training.dpo_loss_type,
     )
-    reward_accuracies = (chosen_rewards > rejected_rewards).float()
+    if config.training.dpo_ftx_gamma > 1e-6:
+        assert chosen_token_counts is not None
+        losses -= (
+            config.training.dpo_ftx_gamma * policy_chosen_logps /
+            chosen_token_counts.clamp_min(1.0)
+        )
+    return (
+        losses,
+        chosen_rewards,
+        rejected_rewards,
+        policy_chosen_logps,
+        policy_rejected_logps,
+        ref_chosen_logps,
+        ref_rejected_logps,
+    )
 
+
+def _contiguous_thd_pair_logits_mean(
+    logits: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute BSHD-equivalent chosen/rejected logit means for contiguous THD."""
+    assert cu_seqlens_padded.numel() % 2 == 1, "DPO requires chosen/rejected pairs"
+    cp_group = mpu.get_context_parallel_group()
+    local_rows = logits.shape[1]
+    global_start = cp_group.rank() * local_rows
+    global_rows = torch.arange(
+        global_start,
+        global_start + local_rows,
+        device=logits.device,
+        dtype=cu_seqlens_padded.dtype,
+    )
+    sequence_ids = torch.bucketize(global_rows, cu_seqlens_padded[1:], right=True)
+    chosen_rows = sequence_ids < (cu_seqlens_padded.numel() - 1) // 2
+
+    # Match BSHD's ``logits.mean()`` semantics while avoiding a per-sequence
+    # slice/reduction and host synchronization for every packed boundary.
+    row_sums = logits.detach().sum(dim=(0, 2))
+    elements_per_row = logits.shape[0] * logits.shape[2]
+    stats = torch.stack(
+        (
+            row_sums[chosen_rows].sum(),
+            chosen_rows.sum().to(logits.dtype) * elements_per_row,
+            row_sums[~chosen_rows].sum(),
+            (~chosen_rows).sum().to(logits.dtype) * elements_per_row,
+        )
+    )
+
+    dist.all_reduce(stats, group=cp_group, op=dist.ReduceOp.SUM)
+    return stats[0] / stats[1].clamp_min(1), stats[2] / stats[3].clamp_min(1)
+
+
+def contiguous_thd_dpo_loss(
+    config,
+    loss_input: FinetuneLossInput,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Compute DPO over DSv4 contiguous-CP THD shards and return pair-level values.
+
+    Log-probs are gathered back into physical packed-buffer order before
+    sequence aggregation. ``cu_seqlens_q_padded`` is required because its
+    boundaries include the inter-sequence CP alignment padding.
+    """
+    logits = loss_input.logits.float()
+    batch = loss_input.batch
+    assert "ref_logprobs" in batch, "THD DPO requires packed reference log-probs"
+    packed_seq_params = batch["full_packed_seq_params"]
+    assert packed_seq_params.cp_partition_mode == "contiguous", (
+        "THD DPO currently supports only DSv4 contiguous CP partitioning"
+    )
+    local_logps = from_parallel_logits_to_logprobs(
+        vocab_parallel_logits=logits,
+        target=batch["labels"],
+        inference_only=False,
+        ignore_cp=True,
+        pre_shifted=True,
+    )
+    local_mask = batch["loss_mask"].to(dtype=local_logps.dtype)
+    local_ref_logps = batch["ref_logprobs"].to(dtype=local_logps.dtype)
+    assert local_logps.shape == local_mask.shape == local_ref_logps.shape
+
+    policy_logps = all_gather_from_context_parallel_region_no_zigzag(local_logps)
+    loss_mask = all_gather_from_context_parallel_region_no_zigzag(local_mask)
+    ref_logps = all_gather_from_context_parallel_region_no_zigzag(local_ref_logps)
+    cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+    policy_chosen_logits_mean, policy_rejected_logits_mean = _contiguous_thd_pair_logits_mean(
+        logits, cu_seqlens
+    )
+    policy_seq_logps = []
+    ref_seq_logps = []
+    sequence_token_counts = []
+    for seq_start, seq_end in zip(cu_seqlens[:-1], cu_seqlens[1:], strict=True):
+        seq_slice = slice(int(seq_start.item()), int(seq_end.item()))
+        mask = loss_mask[0, seq_slice]
+        policy_seq_logps.append((policy_logps[0, seq_slice] * mask).sum())
+        ref_seq_logps.append((ref_logps[0, seq_slice] * mask).sum())
+        sequence_token_counts.append(mask.sum())
+
+    policy_seq_logps = torch.stack(policy_seq_logps)
+    ref_seq_logps = torch.stack(ref_seq_logps)
+    sequence_token_counts = torch.stack(sequence_token_counts)
+    chosen_token_counts = sequence_token_counts[:sequence_token_counts.numel() // 2]
+    (
+        losses,
+        chosen_rewards,
+        rejected_rewards,
+        policy_chosen_logps,
+        policy_rejected_logps,
+        ref_chosen_logps,
+        ref_rejected_logps,
+    ) = _dpo_loss_from_sequence_logprobs(
+        config,
+        policy_seq_logps,
+        ref_seq_logps,
+        chosen_token_counts,
+    )
+
+    return (
+        losses,
+        chosen_rewards,
+        rejected_rewards,
+        policy_chosen_logps,
+        policy_rejected_logps,
+        ref_chosen_logps,
+        ref_rejected_logps,
+        policy_chosen_logits_mean,
+        policy_rejected_logits_mean,
+    )
+
+
+def bshd_dpo_loss(
+    config,
+    loss_input: FinetuneLossInput,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Compute DPO for standard BSHD, including Megatron zigzag CP."""
+    logits = loss_input.logits.float()
+    batch = loss_input.batch
+    labels = batch["labels"]
+    loss_mask = batch["full_loss_mask"][:, :-1]
+    target = batch["full_tokens"]
+
+    assert logits.shape[0] % 2 == 0, "mbs must be 2*n"
+    rbs = logits.shape[0] // 2
+    policy_chosen_logits, policy_rejected_logits = logits.split(rbs, dim=0)
+    logps = from_parallel_logits_to_logprobs(
+        vocab_parallel_logits=logits, target=target, inference_only=False
+    )
+    logps = (logps * loss_mask).sum(-1)
+    ref_logps = (batch["ref_logprobs"] * loss_mask).sum(-1)
+    chosen_token_counts = None
     if config.training.dpo_ftx_gamma > 1e-6:
         chosen_labels = labels.split(rbs, dim=0)[0]
-        loss_mask_sum = (chosen_labels != -100).sum(-1)
+        chosen_token_counts = (chosen_labels != -100).sum(-1)
         if config.policy.dist_config.context_parallel_size > 1:
-            loss_mask_sum = reduce_from_context_parallel_region(loss_mask_sum)
-        losses -= config.training.dpo_ftx_gamma * policy_chosen_logps / loss_mask_sum
+            chosen_token_counts = reduce_from_context_parallel_region(chosen_token_counts)
+    (
+        losses,
+        chosen_rewards,
+        rejected_rewards,
+        policy_chosen_logps,
+        policy_rejected_logps,
+        ref_chosen_logps,
+        ref_rejected_logps,
+    ) = _dpo_loss_from_sequence_logprobs(
+        config,
+        logps,
+        ref_logps,
+        chosen_token_counts,
+    )
 
-    losses = losses.mean()
+    return (
+        losses,
+        chosen_rewards,
+        rejected_rewards,
+        policy_chosen_logps,
+        policy_rejected_logps,
+        ref_chosen_logps,
+        ref_rejected_logps,
+        policy_chosen_logits.detach().mean().float(),
+        policy_rejected_logits.detach().mean().float(),
+    )
+
+
+@register_loss("dpo")
+def dpo_loss_func(
+    config,
+    loss_input: FinetuneLossInput,
+):
+    """Megatron-backend DPO loss (uses ``from_parallel_logits_to_logprobs``)."""
+    # TODO: support ``logprobs_from_linear_ce`` so DPO can avoid materializing
+    # vocab logits when ``training.use_linear_ce`` is enabled.
+    batch = loss_input.batch
+    is_thd = batch.get("full_packed_seq_params") is not None
+
+    # Standard BSHD, including Megatron zigzag CP, uses the non-THD helper.
+    # Only DSv4 contiguous THD CP is supported here. Generic THD + CP uses
+    # different partition/reorder semantics and needs its own aggregation path.
+    if is_thd:
+        (
+            losses,
+            chosen_rewards,
+            rejected_rewards,
+            policy_chosen_logps,
+            policy_rejected_logps,
+            ref_chosen_logps,
+            ref_rejected_logps,
+            policy_chosen_logits_mean,
+            policy_rejected_logits_mean,
+        ) = contiguous_thd_dpo_loss(config, loss_input)
+    else:
+        (
+            losses,
+            chosen_rewards,
+            rejected_rewards,
+            policy_chosen_logps,
+            policy_rejected_logps,
+            ref_chosen_logps,
+            ref_rejected_logps,
+            policy_chosen_logits_mean,
+            policy_rejected_logits_mean,
+        ) = bshd_dpo_loss(config, loss_input)
+
+    reward_accuracies = (chosen_rewards > rejected_rewards).float()
+    reported_loss = losses.mean()
+    losses = reported_loss
     metrics = {
         "dpo-metrics/rewards-accuracies": reward_accuracies.mean().float(),
         "dpo-metrics/rewards-chosen": chosen_rewards.mean().float(),
@@ -2519,7 +3187,7 @@ def dpo_loss_func(
         "dpo-metrics/ref-logps-chosen": ref_chosen_logps.detach().mean().float(),
         "dpo-metrics/logits-rejected": policy_rejected_logits_mean.detach().mean().float(),
         "dpo-metrics/logits-chosen": policy_chosen_logits_mean.detach().mean().float(),
-        "dpo-metrics/loss": losses.clone().detach().float(),
+        "dpo-metrics/loss": reported_loss.clone().detach().float(),
     }
     keys = sorted(list(metrics.keys()))
     avg_metrics = average_losses_across_data_parallel_group([metrics[k] for k in keys])
@@ -2576,7 +3244,10 @@ def square_averaging_cross_entroy_loss_func(
     assert square_averaging_weights.requires_grad is False
 
     if loss_input.linear_ce_input is not None:
-        losses = linear_ce_loss(
+        hidden_ce_loss = (
+            linear_ce_loss if config.training.use_linear_ce else compact_ce_loss
+        )
+        losses = hidden_ce_loss(
             config,
             loss_input.linear_ce_input,
             labels,
@@ -2862,9 +3533,74 @@ def load_balancing_loss_func(
 # (seq-mean-token-mean numerator) rather than a micro-batch token-mean. The
 # training backend divides this by the global active-sequence count. Loss funcs
 # not listed here keep the legacy micro-batch-mean backward semantics.
-SEQ_MEAN_RL_LOSS_FNS = {grpo_loss_func, cispo_loss_func}
+SEQ_MEAN_RL_LOSS_FNS = {grpo_loss_func, cispo_loss_func, sapo_loss_func, opd_loss_func}
 
 
 def is_seq_mean_rl_loss_fn(fn: Callable) -> bool:
     """Whether ``fn`` returns the seq-mean-token-mean sum as its backward loss."""
     return fn in SEQ_MEAN_RL_LOSS_FNS
+
+
+@register_loss("grad_cache_loss")
+def grad_cache_loss_replay_func(
+    config,
+    loss_input: FinetuneLossInput,
+):
+
+    batch = loss_input.batch
+    linear_ce_input = loss_input.linear_ce_input
+    hidden_states = linear_ce_input['hidden_states']
+    output_layer = linear_ce_input['output_layer']
+    if output_layer is not None and getattr(output_layer, "sequence_parallel", False):
+        hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+            hidden_states, tensor_parallel_output_grad=False
+        )
+    elif output_layer is not None:
+        tp_group = getattr(output_layer, "tp_group", None)
+        if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
+            assert not hidden_states.requires_grad, (
+                "tensor_model_parallel_size > 1 且 sequence_parallel=False 时, "
+                "hidden_states 在各 tp rank 间是复制而不是切分的, 但反向不会自动 "
+                "all-reduce d_hidden, 直接用会导致梯度错误。请开启 sequence_parallel "
+                "(通常和 tp>1 一起自动启用), 或改用其它方式处理。"
+            )
+
+    # [seqlen, batch, hidden] -> [batch, seqlen, hidden]
+    last_hidden_state = hidden_states.transpose(0, 1).contiguous()
+    if "eos_positions" in batch and batch["eos_positions"] is not None:
+        eos_positions = batch["eos_positions"].to(device=last_hidden_state.device)
+        assert last_hidden_state.size(0) == 1, (
+            f"packed THD expects batch dim 1, got {last_hidden_state.shape}"
+        )
+        eos_embeddings = last_hidden_state[0, eos_positions]
+    else:
+        attention_mask = batch["attention_mask"]  # (batch_size, seq_len)
+        eos_positions = attention_mask.sum(dim=1) - 1
+        batch_indices = torch.arange(last_hidden_state.size(0), device=last_hidden_state.device)
+        eos_embeddings = last_hidden_state[batch_indices, eos_positions]
+
+    logit_scale = loss_input.unwrapped_model.logit_scale
+
+    embeddings_grad = batch.get('embeddings_grad')
+    assert embeddings_grad is not None, (
+        "batch 里没有 embeddings_grad: GradCache 回放需要 "
+        "EmbeddingActor 在 gather_embs 之后调用 "
+        "engine.embedding_cache_backward (阶段2), 且 "
+        "wemm3_embedding._sft_train_packed 需要透传 embeddings_grad。"
+    )
+    assert embeddings_grad.size(0) == eos_embeddings.size(0), (
+        f"grad_buf {embeddings_grad.shape} 与 eos_embeddings {eos_embeddings.shape} 不一致"
+    )
+
+    grad_logit_scale = batch.get('logit_scale_grad')
+
+    surrogate = (eos_embeddings * embeddings_grad).sum()
+    if grad_logit_scale is not None:
+        surrogate = surrogate + logit_scale * grad_logit_scale
+
+    # metrics 是阶段2 算好的真值: 每个 mbs 返回同一份, Megatron 跨 mbs 平均后
+    # 数值不变; 浅拷贝避免被 schedule 原地修改。
+    metrics = batch['cache_metrics']
+    if metrics is not None:
+        metrics = dict(metrics)
+    return surrogate, metrics

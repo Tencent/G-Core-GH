@@ -11,6 +11,8 @@ pkill -9 -f python
 export RAY_DEDUP_LOGS=0
 export PYTHONUNBUFFERED=1
 export VLLM_LOG_STATS_INTERVAL=3
+# PyTorch 2.11 ConfigTokenizer expects key:value (colon), not key=value.
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export GPATCH_EXTRA_PROPAGATE_ENV=VLLM_LOG_STATS_INTERVAL,$GPATCH_EXTRA_PROPAGATE_ENV
 
 mpirun -v --allow-run-as-root \

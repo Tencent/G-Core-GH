@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Tuple
 from contextlib import nullcontext
+from typing import Any, Dict, List, Tuple
 
 import torch
 
@@ -51,6 +51,15 @@ class ApplySamplingRolloutAttrBase(ABC):
         """
         ...
 
+    def cached_rollout_attrs(self) -> Dict[str, Dict[str, Any]]:
+        """``{unique_id: {key: value}}`` that ``add_back_*`` will put back.
+
+        Only meaningful on the mp+cp head, which is where the cache is filled;
+        used to show a mid-generation consumer the same fields the batched path
+        sees. Empty means nothing was stripped.
+        """
+        return {}
+
     @abstractmethod
     def add_back_rollout_attr(
         self, rollout_batches: List[Dict[str, List[Any]]]
@@ -86,8 +95,16 @@ class ApplySamplingRolloutAttrBase(ABC):
 class SamplerGenerateFunc(ABC):
     """Abstract callable for sampler generation."""
     @abstractmethod
-    async def __call__(self, config, infer_engine, idx, tokenizer, batched_data,
-                       sampling_repeat_n) -> Dict[str, List[Any]]:
+    async def __call__(
+        self,
+        config,
+        infer_engine,
+        idx,
+        tokenizer,
+        batched_data,
+        sampling_repeat_n,
+        is_eval: bool = False
+    ) -> Dict[str, List[Any]]:
         """Generate samples using the inference engine.
 
         Parameters
@@ -100,6 +117,8 @@ class SamplerGenerateFunc(ABC):
         batched_data : dict
         sampling_repeat_n : int
             Repeated samples per prompt.
+        is_eval : bool
+            When True, use ``eval_*`` sampling overrides if configured.
 
         Returns
         -------
@@ -162,6 +181,24 @@ class PrepareDataForward(ABC):
     ) -> torch.Tensor:
         ...
 
+    def sft_to_mlite_packed(
+        self,
+        batch: List[Dict[str, Any]],
+        *,
+        num_microbatches: int,
+        seq_length: int,
+        device: torch.device,
+        dp_size: int,
+        dp_group,
+    ):
+        """Pack a finetune step batch into mlite ``PackedBatch`` + ``LossContext`` pairs.
+
+        Used by ``training_backend=mlite``. 
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement sft_to_mlite_packed"
+        )
+
     def sft_train_with_dynamic_cp(
         self,
         batches: List[Dict[str, Any]],
@@ -172,6 +209,33 @@ class PrepareDataForward(ABC):
         **kwargs,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         raise NotImplementedError("sft_train_with_dynamic_cp is not implemented")
+
+    def pretrain_packed(
+        self,
+        batch: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """H2D + static-CP shard + ``PackedSeqParams`` for one packed THD mb.
+
+        Parameters
+        ----------
+        batch : Dict[str, Any]
+            CPU packed sample: ``tokens`` / ``labels`` / ``loss_mask`` /
+            ``position_ids`` / ``cu_seqlens_padded`` / ``max_seqlen`` /
+            ``padded_seq_len``; optional audio feature keys.
+
+        Returns
+        -------
+        Tuple[Dict[str, Any], Dict[str, Any]]
+            ``(batch, fwd_kwargs)``. ``batch`` is on device with
+            ``cp_group`` set; ``fwd_kwargs`` feeds the model forward.
+            No dyn-CP / no live ``PackedSeqParams.cp_group``.
+
+        Raises
+        ------
+        NotImplementedError
+            Base class; subclasses MUST override.
+        """
+        raise NotImplementedError("pretrain_packed is not implemented")
 
     def grpo_train_with_dynamic_cp(
         self,

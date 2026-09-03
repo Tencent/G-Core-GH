@@ -9,7 +9,11 @@ import torch
 from gpatch_v4.configs.config import OnPolicyDistillConfig
 from gpatch_v4.core.advantage_impl import calculate_topk_advantages
 from gpatch_v4.trainer import OnPolicyDistillTrainer
-from gpatch_v4.training_backend.loss_factory import PolicyLossInput, opd_loss_func
+from gpatch_v4.training_backend.loss_factory import (
+    PolicyLossInput,
+    is_seq_mean_rl_loss_fn,
+    opd_loss_func,
+)
 from gpatch_v4_test_helper import kill_all_actors_and_shutdown_ray, load_config, requires_sglang
 
 
@@ -51,12 +55,14 @@ def test_topk_pure_kl_adv_3d_ratio_3d_loss_scalar(mock_reduce):
     # step 2: feed 3D advantage into opd_loss → ratio is 3D, final loss is 0-d scalar
     prev_topk = torch.randn(B, S, K) - 2.0
     curr_topk = prev_topk + torch.randn(B, S, K) * 0.01  # small perturbation → ratio ≈ 1
+    resp_mask = torch.stack(masks)
     li = PolicyLossInput(
         advantages=torch.stack(advs),
         prev_log_probs=torch.randn(B, S), ref_log_probs=torch.randn(B, S),
-        curr_log_probs=torch.randn(B, S), response_mask=torch.stack(masks),
+        curr_log_probs=torch.randn(B, S), response_mask=resp_mask,
         scaled_entropy=torch.tensor(0.1), teacher_log_probs=torch.randn(B, S),
         prev_topk_logprobs=prev_topk, curr_topk_logprobs=curr_topk.requires_grad_(True),
+        per_token_entropy=torch.zeros_like(resp_mask),
     )
     loss, m = opd_loss_func(_cfg(), li)
 
@@ -66,6 +72,36 @@ def test_topk_pure_kl_adv_3d_ratio_3d_loss_scalar(mock_reduce):
 
     ratio = m["ppo_ratio"][0] / m["ppo_ratio"][1]
     assert 0.9 < ratio < 1.1, f"ppo_ratio should be ~1.0 with small perturbation, got {ratio:.4f}"
+
+
+@patch("gpatch_v4.training_backend.loss_factory.reduce_metrics_across_data_parallel_group")
+def test_opd_plain_bs_uses_equal_weight_per_sample(mock_reduce):
+    """cu_seqlens=None must not length-bias actor loss (dyn-CP response-pad path)."""
+    # Two samples: short (2 toks) vs long (6 toks). Constant per-token surrogate
+    # of 1.0 on short and 0.0 on long → token-mean=0.25, seq-means sum to 1.0.
+    assert is_seq_mean_rl_loss_fn(opd_loss_func)
+    mask = torch.tensor([[1.0, 1.0, 0, 0, 0, 0], [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]])
+    advantages = torch.tensor([[-1.0, -1.0, 0, 0, 0, 0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    # ratios=1 → loss1=loss2=-advantages; clip_max = -advantages
+    # short tokens contribute 1.0 each; long contribute 0.0
+    prev = torch.zeros(2, 6)
+    curr = torch.zeros(2, 6)
+    li = PolicyLossInput(
+        advantages=advantages,
+        prev_log_probs=prev,
+        ref_log_probs=torch.zeros(2, 6),
+        curr_log_probs=curr,
+        response_mask=mask,
+        scaled_entropy=torch.tensor(0.0),
+        teacher_log_probs=torch.zeros(2, 6),
+        per_token_entropy=torch.zeros(2, 6),
+        cu_seqlens_padded=None,
+        local_cp_size=1,
+        calculate_per_token_loss=False,
+    )
+    loss, _ = opd_loss_func(_cfg(grpo_kl_loss_beta=0.0, opd_teacher_kl_loss_beta=0.0), li)
+    # Seq-mean SUM contract: short mean 1.0 + long mean 0.0 = 1.0 (not mean 0.5)
+    assert torch.allclose(loss, torch.tensor(1.0), atol=1e-5), loss
 
 
 # -- E2E test: full pipeline with log_prob_top_k=16, no reward --

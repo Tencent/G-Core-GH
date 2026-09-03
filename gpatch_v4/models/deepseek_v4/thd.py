@@ -40,6 +40,7 @@ __all__ = [
     "make_packed_seq_layout",
     "pack_sequences",
     "cp_slice_layout",
+    "count_cross_cp_segments",
 ]
 
 # ---------------------------------------------------------------------------
@@ -311,6 +312,11 @@ class _PackedSeqLayout:
             pad_token_mask = [F]*10 + [T]*6 + [F]*20 + [T]*4
             #                └seg 0─┘└pad─┘ └─seg 1──┘└pad┘
 
+    pad_token_mask_full : Tensor
+        Shape ``[T]`` bool, always global after :func:`cp_slice_layout`.
+        DSpark uses it with global anchor coordinates while the backbone uses
+        the rank-local :attr:`pad_token_mask`.
+
     per_m : dict[int, _PerMLayout]
         One bundle per ``m`` in ``sorted(set(config.compress_rates.values()))``;
         see :class:`_PerMLayout`. Default V4 ``compress_rates = {4, 128}``
@@ -331,6 +337,7 @@ class _PackedSeqLayout:
     seg_id_per_token_full: torch.Tensor  # used: build_cp_causal_mask 等仍读全局 [T] 的路径
     seg_id_per_token_with_prefix: torch.Tensor  # used: fused SWA kv-side cross-seg gate
     pad_token_mask: torch.Tensor  # used: _per_m_layout 内部作 pad_token_mask_with_prefix 来源
+    pad_token_mask_full: torch.Tensor  # used: DSpark global anchor context pad gate
     per_m: dict[int, _PerMLayout]
     sliding_window: int
     seg_id_per_token_zz: torch.Tensor | None = None  # used: Indexer fused zigzag mask/topk
@@ -468,9 +475,44 @@ def make_packed_seq_layout(
         seg_id_per_token_full=seg_id_per_token,
         seg_id_per_token_with_prefix=seg_id_per_token,
         pad_token_mask=pad_token_mask,
+        pad_token_mask_full=pad_token_mask,
         per_m=per_m,
         sliding_window=config.sliding_window,
     )
+
+
+def count_cross_cp_segments(cu_seqlens_padded: torch.Tensor, cp_size: int) -> int:
+    """Count packed segments whose padded span covers more than one CP chunk.
+
+    A segment ``[s, e)`` crosses CP if ``s // s_local != (e - 1) // s_local``.
+    Segments that end exactly on a CP cut do not count.
+
+    Parameters
+    ----------
+    cu_seqlens_padded : Tensor
+        Shape ``[N+1]``; ``cu[-1]`` MUST be divisible by ``cp_size``.
+    cp_size : int
+
+    Returns
+    -------
+    int
+        0 when ``cp_size == 1`` or every segment lies inside one chunk.
+    """
+    assert cp_size >= 1, f"cp_size must be >= 1, got {cp_size}"
+    if cp_size == 1:
+        return 0
+    total = int(cu_seqlens_padded[-1].item())
+    assert total % cp_size == 0, (
+        f"cu_seqlens_padded[-1] ({total}) must be divisible by cp_size ({cp_size})"
+    )
+    s_local = total // cp_size
+    start = cu_seqlens_padded[:-1]
+    end = cu_seqlens_padded[1:]
+    # 防止空段，物理占位长度为0。当前代码基本不会出现了。之前已经处理过了
+    valid = end > start
+    owner_start = torch.div(start, s_local, rounding_mode="floor")
+    owner_end = torch.div(end - 1, s_local, rounding_mode="floor")
+    return int(((owner_start != owner_end) & valid).sum().item())
 
 
 def cp_slice_layout(
@@ -505,6 +547,8 @@ def cp_slice_layout(
         │                                               │    prefix            │                             │
         ├───────────────────────────────────────────────┼──────────────────────┼─────────────────────────────┤
         │ pad_token_mask                                │ ✅ slice             │ [s_local]                   │
+        ├───────────────────────────────────────────────┼──────────────────────┼─────────────────────────────┤
+        │ pad_token_mask_full                           │ ❌ stay global       │ [T]                         │
         ├───────────────────────────────────────────────┼──────────────────────┼─────────────────────────────┤
         │ per_m.causal_threshold_per_token              │ ✅ slice             │ [s_local]                   │
         ├───────────────────────────────────────────────┼──────────────────────┼─────────────────────────────┤
@@ -594,6 +638,7 @@ def cp_slice_layout(
         seg_id_per_token_full=layout.seg_id_per_token_full,
         seg_id_per_token_with_prefix=layout.seg_id_per_token_with_prefix[sl_swa_with_prefix],
         pad_token_mask=layout.pad_token_mask[sl],
+        pad_token_mask_full=layout.pad_token_mask_full,
         per_m=new_per_m,
         sliding_window=layout.sliding_window,
     )

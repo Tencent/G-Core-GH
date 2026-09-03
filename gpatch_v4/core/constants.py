@@ -45,6 +45,7 @@ class MODEL_ARCH:
     QWEN2_VL = 'qwen2_vl'
     DEEPSEEK_V3 = 'deepseek_v3'
     DEEPSEEK_V4 = 'deepseek_v4'
+    QWEN4_EXP = 'qwen4_exp'  # Qwen3.8-Flash-Next
     MISTRAL = 'mistral'
     GEMMA3_TEXT = 'gemma3_text'
     GEMMA4 = 'gemma4'
@@ -58,6 +59,8 @@ class MODEL_ARCH:
     QWEN3_5_MOE_WEMM = 'qwen3_5_moe_wemm'
     QWEN3_VL_WEMM = 'qwen3_vl_wemm'
     WEMM3_EMBEDDING = 'wemm3_embedding'
+    WEMM3_5_EMBEDDING = 'wemm3_5_embedding'
+    WEMM3_5_MOE_EMBEDDING = 'wemm3_5_moe_embedding'
 
     # diffusion
     STABLE_DIFFUSION_V1_5 = 'stable_diffusion_v1_5'  # https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5

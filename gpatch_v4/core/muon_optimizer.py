@@ -1,8 +1,10 @@
 """Moonlight Muon optimizer
 adapted from https://github.com/MoonshotAI/Moonlight/blob/master/examples/toy_train.py.
-Param groups are split into two (use_muon=True / False) 
+Param groups are split into two (use_muon=True / False)
 
 Moonlight 论文: https://arxiv.org/abs/2502.16982
+
+TODO(@rionawang): grad 做 svd 分解疑似错误，没有在 full tensor 上进行。
 """
 
 import math
@@ -33,9 +35,7 @@ def zeropower_via_newtonschulz5(G, steps):
     # Perform the NS iterations
     for _ in range(steps):
         A = X @ X.T
-        B = (
-            b * A + c * A @ A
-        )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        B = (b * A + c * A @ A)  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
 
     if G.size(0) > G.size(1):
@@ -58,7 +58,6 @@ class Muon(torch.optim.Optimizer):
 
     Equivalent to NVIDIA Emerging-Optimizers ``scale_mode="spectral" × extra_scale_factor=0.2``.
     """
-
     def __init__(
         self,
         muon_params,
@@ -183,9 +182,9 @@ class Muon(torch.optim.Optimizer):
 
                     g = buf1 / (eps + buf2.sqrt())
 
-                    bias_correction1 = 1 - beta1 ** step
-                    bias_correction2 = 1 - beta2 ** step
-                    scale = bias_correction1 / bias_correction2 ** 0.5
+                    bias_correction1 = 1 - beta1**step
+                    bias_correction2 = 1 - beta2**step
+                    scale = bias_correction1 / bias_correction2**0.5
                     p.data.mul_(1 - lr * wd)
                     p.data.add_(g, alpha=-lr / scale)
 

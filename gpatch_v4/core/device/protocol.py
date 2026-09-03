@@ -36,6 +36,16 @@ class DeviceProtocol(ABC):
         ...
 
     @property
+    def kernel_device_name(self) -> str:
+        """Name used to load ``gpatch_v4.kernel.<kernel_device_name>``.
+
+        Distinct from :attr:`name`, which is the torch backend. Override
+        when the same backend needs different kernels (for example NVIDIA
+        and XPU both exposing ``torch.cuda``).
+        """
+        return self.name
+
+    @property
     @abstractmethod
     def dist_backend(self) -> str:
         ...
@@ -86,6 +96,13 @@ class CudaDeviceBackend(DeviceProtocol):
     @property
     def visible_devices_env_var(self) -> str:
         return "CUDA_VISIBLE_DEVICES"
+
+    @property
+    def sync_param_offload(self) -> bool:
+        return False
+
+    def preprocess_before_build_sgl_engine(self) -> None:
+        return
 
     def get_flash_attn_varlen_func(self, **kwargs):
         from flash_attn import flash_attn_varlen_func

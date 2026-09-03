@@ -1,5 +1,6 @@
 import abc
 import asyncio
+import inspect
 import time
 import traceback
 from contextlib import nullcontext
@@ -9,6 +10,7 @@ from transformers import AutoTokenizer
 
 from gpatch_v4.client import GenRmClient, SamplerClient
 from gpatch_v4.configs.config import RlConfig
+from gpatch_v4.reward.base_external_reward import stream_external_reward_declined_reason
 from gpatch_v4.rollout_generator.async_rollout.mixin import ColocateAgentMixin
 from gpatch_v4.utils import import_fn_from_path, log, log_debug
 from gpatch_v4.utils.data_manipulate_utils import ensure_sample_hierarchical_id
@@ -37,6 +39,21 @@ class BaseAgentLoopActor(ColocateAgentMixin, abc.ABC):
         self.training_config = config.training
         self.worker_id = worker_id
         self._init_colocate_state()
+        self._pause_event: asyncio.Event = asyncio.Event()
+
+    def begin_step(self) -> None:
+        """Clear the cooperative pause flag for a fresh fire window."""
+        self._pause_event.clear()
+
+    async def pause_generation(self) -> None:
+        """Raise the cooperative pause flag.
+
+        Subclasses that issue several generations per microbatch should
+        check ``self._pause_event`` between rounds and return what they
+        already have; single-round actors are stopped by the controller's
+        hard abort on the sampler instead.
+        """
+        self._pause_event.set()
 
     @abc.abstractmethod
     async def setup(self):
@@ -83,6 +100,8 @@ class AgentLoopActor(BaseAgentLoopActor):
         self.gen_rm_client = None
         self.tokenizer = None
         self.external_reward = None
+        # resolved in setup(), once the reward instance exists
+        self._stream_external_reward = False
 
     async def setup(self):
         """Create RPC clients.  Must be called once after actor creation."""
@@ -100,10 +119,58 @@ class AgentLoopActor(BaseAgentLoopActor):
             )
             self._setup_external_reward()
 
+        self._stream_external_reward = self._resolve_stream_external_reward()
+
+        reward_name = type(self.external_reward).__name__ if self.external_reward else None
         log(
             f"[AgentLoopActor-{self.worker_id}] setup done, "
-            f"external_reward={type(self.external_reward).__name__ if self.external_reward else None}"
+            f"external_reward={reward_name}, "
+            f"stream_external_reward={self._stream_external_reward}"
         )
+
+    def _resolve_stream_external_reward(self) -> bool:
+        """Whether to fire each micro-batch's external reward as it finishes generating.
+
+        Decided once here so a declined switch is logged once, not per PPO step.
+        """
+        if not self.training_config.stream_external_reward:
+            return False
+        if self.external_reward is None:
+            return False
+        if self.training_config.use_gen_rm_reward:
+            log(
+                f"[AgentLoopActor-{self.worker_id}] stream_external_reward ignored: "
+                "use_gen_rm_reward=True requires gen-RM scored before the external reward"
+            )
+            return False
+        if not self._generate_batches_takes_on_ready():
+            log(
+                f"[AgentLoopActor-{self.worker_id}] stream_external_reward ignored: "
+                f"{type(self).__name__}.generate_batches has no on_ready parameter, so "
+                "there is no point at which a finished micro-batch can be handed over"
+            )
+            return False
+        declined = stream_external_reward_declined_reason(self.external_reward)
+        if declined is not None:
+            log(
+                f"[AgentLoopActor-{self.worker_id}] stream_external_reward ignored: "
+                f"{declined}"
+            )
+            return False
+        return True
+
+    def _generate_batches_takes_on_ready(self) -> bool:
+        """Whether this actor's ``generate_batches`` can hand over a finished micro-batch.
+
+        ``agent_loop_actor_cls`` is a config hook, so a task can override
+        ``generate_batches`` with the signature that predates ``on_ready``.
+        Checked at setup: passing the callback to such an override raises
+        TypeError mid-step, which is a worse way to find out.
+        """
+        params = inspect.signature(self.generate_batches).parameters
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return True
+        return "on_ready" in params
 
     def _setup_external_reward(self):
         """Instantiate the external reward class from config."""
@@ -131,8 +198,15 @@ class AgentLoopActor(BaseAgentLoopActor):
         ppo_step: int,
         sample_indices: List[int],
         use_colocate: bool,
+        on_ready=None,
     ) -> List[Dict[str, List[Any]]]:
-        """Generate rollouts by firing all requests, then awaiting all results."""
+        """Generate rollouts by firing all requests, then awaiting all results.
+
+        ``on_ready(rbi, rb)``, when given, is called for each micro-batch the
+        moment its generation lands, so a consumer can start work that would
+        otherwise wait for the whole list.  Results are still returned in
+        micro-batch index order either way.
+        """
         sampler_idx = 0
         repeat_n = self.training_config.sampling_repeat_n
         if not cleaned_batches and not use_colocate:
@@ -152,10 +226,36 @@ class AgentLoopActor(BaseAgentLoopActor):
                     ) for cleaned_data, sidx in zip(cleaned_batches, sample_indices)
                 ]
             )
-            rbs = list(
-                await asyncio.gather(*[self.sampler_client.await_generate(ref) for ref in refs])
-            )
+            if on_ready is None:
+                awaits = [self.sampler_client.await_generate(ref) for ref in refs]
+                rbs = list(await asyncio.gather(*awaits))
+            else:
+                rbs = await self._await_generate_streaming(refs, on_ready)
         return rbs
+
+    async def _await_generate_streaming(self, refs, on_ready) -> List[Dict[str, List[Any]]]:
+        results = [None] * len(refs)
+
+        async def _indexed(_rbi, _ref):
+            return _rbi, await self.sampler_client.await_generate(_ref)
+
+        # owned explicitly: as_completed schedules them all, so leaving the loop early
+        # would let the rest outlive the step with their exceptions never retrieved
+        tasks = [asyncio.ensure_future(_indexed(i, r)) for i, r in enumerate(refs)]
+        try:
+            for _fut in asyncio.as_completed(tasks):
+                _rbi, _rb = await _fut
+                results[_rbi] = _rb
+                on_ready(_rbi, _rb)
+                # yield, else on_ready's coroutine may not be submitted before generation ends
+                await asyncio.sleep(0)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        return results
 
     async def _score_one_gen_rm(
         self,
@@ -243,6 +343,51 @@ class AgentLoopActor(BaseAgentLoopActor):
         )
         return await self.score_external_reward_batches(rbs, ppo_step)
 
+    async def _collect_streamed_external_rewards(
+        self,
+        rbs: List[Dict[str, List[Any]]],
+        futs: Dict[int, Any],
+        ppo_step: int,
+    ) -> List[Dict[str, List[Any]]]:
+        missing = [rbi for rbi in range(len(rbs)) if rbi not in futs]
+        if missing:
+            raise RuntimeError(
+                f"streamed external reward: generation produced {len(rbs)} rollout batches "
+                f"but no reward task was fired for micro-batch(es) {missing}"
+            )
+        t0 = time.time()
+        all_updates = await asyncio.gather(*[futs[rbi] for rbi in range(len(rbs))])
+        for rbi, (rb, updates) in enumerate(zip(rbs, all_updates)):
+            if len(updates) != 1:
+                raise RuntimeError(
+                    f"streamed reward for micro-batch {rbi} returned {len(updates)} "
+                    "updates, expected 1"
+                )
+            rb.update(updates[0])
+        log_debug(
+            f"[external_reward] STREAMED worker_id={self.worker_id} "
+            f"ppo_step={ppo_step} num_microbatches={len(rbs)} "
+            f"collect_elapsed_s={time.time() - t0:.3f}"
+        )
+        return rbs
+
+    @staticmethod
+    async def _cancel_stream_reward_futs(futs: Dict[int, Any]):
+        """Cancel and drain reward tasks still in flight (streaming path).
+
+        They are fired with ``ensure_future`` during generation, so anything
+        that raises before the collect would otherwise leave them running
+        unowned — and a retried step would issue the requests a second time.
+        Draining is what makes that true: ``cancel()`` only requests it, and a
+        task dropped between the request and its next scheduling still reports
+        "Task exception was never retrieved" over the real error.
+        """
+        pending = list(futs.values())
+        futs.clear()
+        for fut in pending:
+            fut.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
     async def _batch_loop(
         self,
         cleaned_batches: List[Dict[str, Any]],
@@ -255,31 +400,60 @@ class AgentLoopActor(BaseAgentLoopActor):
         ``use_colocate`` selects only the sampler dispatch style and
         whether gen-RM scoring is wrapped by colocate lifecycle phases.
         The rest of the generation/reward pipeline is shared.
-        """
-        rbs = await self.generate_batches(
-            cleaned_batches,
-            ppo_step,
-            sample_indices,
-            use_colocate=use_colocate,
-        )
-        for rb in rbs:
-            ensure_sample_hierarchical_id(rb)
 
-        if self.worker_id == 0:
-            log(
-                f"[AgentLoopActor-{self.worker_id}] "
-                f"_batch_loop done: {ppo_step=}, "
-                f"mode={'colocate' if use_colocate else 'disaggregated'}, "
-                f"num_microbatches={len(cleaned_batches)}, "
-                f"num_rollout_batches={len(rbs)}"
+        Under ``training.stream_external_reward`` each micro-batch's external
+        reward is submitted as that micro-batch lands, rather than all of them
+        after the last one.
+        """
+        stream = self._stream_external_reward
+        reward_futs: Dict[int, Any] = {}
+        on_ready = None
+        if stream:
+
+            def on_ready(rbi, rb, _futs=reward_futs):
+                # the batched path fills these before scoring; match it
+                ensure_sample_hierarchical_id(rb)
+                log_debug(
+                    f"[external_reward] FIRE worker_id={self.worker_id} "
+                    f"ppo_step={ppo_step} microbatch={rbi} t={time.time():.3f}"
+                )
+                _futs[rbi] = asyncio.ensure_future(
+                    self.external_reward.calc_external_reward([rb], ppo_step)
+                )
+
+        gen_kwargs = {"on_ready": on_ready} if stream else {}
+        try:
+            rbs = await self.generate_batches(
+                cleaned_batches,
+                ppo_step,
+                sample_indices,
+                use_colocate=use_colocate,
+                **gen_kwargs,
             )
-        rbs = await self.score_rollout_batches(
-            rbs,
-            ppo_step,
-            sample_indices,
-            use_colocate=use_colocate,
-        )
-        return rbs
+            for rb in rbs:
+                ensure_sample_hierarchical_id(rb)
+
+            if self.worker_id == 0:
+                log(
+                    f"[AgentLoopActor-{self.worker_id}] "
+                    f"_batch_loop done: {ppo_step=}, "
+                    f"mode={'colocate' if use_colocate else 'disaggregated'}, "
+                    f"num_microbatches={len(cleaned_batches)}, "
+                    f"num_rollout_batches={len(rbs)}, "
+                    f"stream_external_reward={stream}"
+                )
+            if stream:
+                # gen-RM is off on this path (see _resolve_stream_external_reward)
+                return await self._collect_streamed_external_rewards(rbs, reward_futs, ppo_step)
+            return await self.score_rollout_batches(
+                rbs,
+                ppo_step,
+                sample_indices,
+                use_colocate=use_colocate,
+            )
+        except BaseException:
+            await self._cancel_stream_reward_futs(reward_futs)
+            raise
 
     async def agent_loop(
         self,

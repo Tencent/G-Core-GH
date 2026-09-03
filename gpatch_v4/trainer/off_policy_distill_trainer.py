@@ -8,6 +8,7 @@ from gpatch_v4.orches.placement_group import (
 )
 from gpatch_v4.trainer.helper import convert_mcore_to_hf, set_nnodes_default
 from gpatch_v4.trainer.trainer_mixin import TrainerRetryMixin
+from gpatch_v4.transfer import init_tq_connector
 
 
 class OffPolicyDistillTrainer(TrainerRetryMixin):
@@ -39,6 +40,8 @@ class OffPolicyDistillTrainer(TrainerRetryMixin):
         orches.init(config)
         set_nnodes_default(config)
         pgs = create_placement_groups(config)
+        if config.tq.enable:
+            init_tq_connector(config.tq)
 
         if config.training.enable_teacher_rollout:
             self.sampler_group = create_sampler_group(config, pgs)
@@ -64,6 +67,8 @@ class OffPolicyDistillTrainer(TrainerRetryMixin):
         orches.init(config)
         set_nnodes_default(config)
         pgs = create_placement_groups(config)
+        if config.tq.enable:
+            init_tq_connector(config.tq)
         if config.training.enable_teacher_kl_loss and config.training.setup_teacher_in_independent_topo:
             self.teacher_group = create_teacher_group(config, pgs)
             await self.teacher_group.init()

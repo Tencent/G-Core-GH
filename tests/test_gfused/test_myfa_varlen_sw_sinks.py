@@ -142,14 +142,9 @@ CASES = [
     # edge case: window_size >= seq_len
     dict(seqlens=[64], HQ=4, HK=4, d=128, is_causal=True, window_size=128, sinks=True),
 
-    # kv longer than q (cross-attention style, right-aligned)
-    # dict(seqlens=[200], seqlens_k=[1234], HQ=4, HK=4, d=128, is_causal=True, window_size=None, sinks=False),
-    # dict(seqlens=[200], seqlens_k=[1234], HQ=4, HK=4, d=128, is_causal=True, window_size=None, sinks=True),
-    # dict(seqlens=[200], seqlens_k=[1234], HQ=8, HK=2, d=128, is_causal=True, window_size=512, sinks=True),
-    # dict(seqlens=[100, 300], seqlens_k=[500, 1500], HQ=4, HK=4, d=128, is_causal=True, window_size=None, sinks=True),
-    # dict(seqlens=[100, 300], seqlens_k=[500, 1500], HQ=4, HK=4, d=128, is_causal=True, window_size=256, sinks=True),
-    # dict(seqlens=[64], seqlens_k=[4096], HQ=4, HK=4, d=128, is_causal=True, window_size=512, sinks=True),
-    # dict(seqlens=[1], seqlens_k=[1024], HQ=4, HK=4, d=128, is_causal=True, window_size=None, sinks=True),
+    # kv longer than q (packed-CP zigzag Q chunk vs causal K prefix)
+    dict(seqlens=[256], seqlens_k=[1024], HQ=8, HK=2, d=128, is_causal=True, window_size=None, sinks=True),
+    dict(seqlens=[256], seqlens_k=[1024], HQ=8, HK=2, d=128, is_causal=True, window_size=128, sinks=True),
 ]
 
 
@@ -218,6 +213,7 @@ def test_fwd_bwd(case):
 
     q, k, v, sinks_val, cu_seqlens_q, cu_seqlens_k, max_seqlen = _make_inputs(
         seqlens, HQ, HK, d, seqlens_k=seqlens_k, dtype=torch.float16)
+    max_seqlen_k = max(seqlens_k if seqlens_k is not None else seqlens)
 
     sinks_arg = sinks_val if has_sinks else None
 
@@ -242,8 +238,9 @@ def test_fwd_bwd(case):
         k_my = k.detach().clone().requires_grad_(True)
         v_my = v.detach().clone().requires_grad_(True)
         sinks_my = sinks_val.detach().clone().requires_grad_(True) if has_sinks else None
-        my_o = myfa_varlen_sw_sinks(q_my, k_my, v_my, cu_seqlens_q, cu_seqlens_k, max_seqlen,
-                                    sinks=sinks_my, is_causal=is_causal, window_size=window_size)
+        my_o = myfa_varlen_sw_sinks(
+            q_my, k_my, v_my, cu_seqlens_q, cu_seqlens_k, max_seqlen, max_seqlen_k,
+            sinks=sinks_my, is_causal=is_causal, window_size=window_size)
         my_o.backward(dO)
     my_dQ = q_my.grad
     my_dK = k_my.grad

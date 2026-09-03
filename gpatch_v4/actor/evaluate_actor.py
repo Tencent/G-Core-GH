@@ -93,7 +93,7 @@ class EvaluateActor(BaseActor, TokenizerMixin):
         for rbi, rollout_batch in enumerate(rbs):
             _sidx = sidx + rbi
             co = self.sampler_client.generate(
-                sampler_idx, curr_train_step, _sidx, rollout_batch, repeat_n=repeat_n
+                sampler_idx, curr_train_step, _sidx, rollout_batch, repeat_n=repeat_n, is_eval=True
             )
             cos.append(co)
         return await asyncio.gather(*cos)

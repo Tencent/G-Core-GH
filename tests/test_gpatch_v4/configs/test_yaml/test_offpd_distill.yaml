@@ -18,6 +18,7 @@ training:
   enable_teacher_kl_loss: True
   setup_teacher_in_independent_topo: False
   loss_func: ce_with_kl
+  use_linear_ce: True
   exit_step: 2
 
 checkpoint:

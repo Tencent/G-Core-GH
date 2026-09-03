@@ -27,16 +27,28 @@ class BasePolicyConfig(MappingProtocol):
     indexer_backend : str
         DeepSeek-V4 indexer backend: ``"eager"`` / ``"fused"``.
     ep_backend : str
-        DeepSeek-V4 expert dispatch backend: ``"eager"`` / ``"deepep"``.
+        Training-side MoE expert dispatch backend: ``"eager"`` / ``"deepep"``.
     deepep_num_sms : int
         Number of SMs assigned to DeepEP kernels.
     fp8_qat : bool
         Enable FP8 activation/weight fake-quant (QAT) via ``apply_hp``.
     fp4_qat : bool
         Enable FP4 fake-quant for routed DeepSeek-V4 MoE expert weights.
+    fp4_qat_indexer : bool
+        Apply Hadamard rotation and FP4 QAT to the indexer's
+        query and compressed keys. It takes priority over ``fp8_qat`` and is
+        orthogonal to ``fp4_qat`` which only covers expert weights.
+    sglang_export_fp4_qdq : bool
+        Apply FP4 Q/DQ then re-encode routed DeepSeek-V4 MoE expert weights
+        into SGLang's FP8 update format. This export-only diagnostic switch
+        does not enable FP4 QAT in the training forward pass.
     fp8 : bool
-        Enable TE FP8 block-scaling grouped GEMM for DeepSeek-V4 MoE
-        experts (``apply_hp(..., fp8=True)``). Orthogonal to QAT.
+        Enable TE block-scaling grouped GEMM for DeepSeek-V4 routed MoE
+        experts. FSDP still all-gathers bf16 unless ``fsdp_fp8_gather``
+        is also True. Incompatible with QAT.
+    fsdp_fp8_gather : bool
+        Wrap routed expert weights in ``Fp8TensorAg`` so FSDP all-gathers
+        FP8+E8M0. Requires ``fp8=True``. Default False (bf16 FSDP path).
     moe_router_force_load_balancing : bool
         Force MoE TopKRouter load balancing with random expert indices;
         benchmark switch via ``apply_hp``.
@@ -52,12 +64,21 @@ class BasePolicyConfig(MappingProtocol):
         Skip the reference model entirely.
     without_optim : bool
         Disable optimizer (debug only).
+    balance_dp_seqlen : bool
+        Whether to rebalance samples across DP ranks by sequence length.
+    dp_balance_extra_keys : list of str or None
+        Extra batch keys to keep during DP rebalance after the default
+        reward/rm-aux filter. ``None`` means none.
     smart_pad_infer : bool
     smart_pad_train : bool
     wrap_with_ddp : bool
         Whether to wrap the model with DistributedDataParallel.
     post_wrap_with_ddp : bool
         Whether to delay DDP wrapping until after mbridge weight loading.
+    use_megatron_fsdp : bool
+        Whether to enable Megatron-FSDP through the Megatron-Bridge DDP wrapper.
+    override_ddp_config : dict
+        Overrides for DistributedDataParallelConfig (mbridge and Megatron-Bridge).
     override_transformer_config : dict
         Overrides applied to the transformer model config.
     freeze_patterns : list of str
@@ -87,7 +108,9 @@ class BasePolicyConfig(MappingProtocol):
     indexer_backend: str = field(
         default="eager", metadata={"help": "DSV4 indexer backend: eager, fused"}
     )
-    ep_backend: str = field(default="eager", metadata={"help": "DSV4 EP backend: eager, deepep"})
+    ep_backend: str = field(
+        default="eager", metadata={"help": "Training MoE EP backend: eager, deepep"}
+    )
     deepep_num_sms: int = field(
         default=24, metadata={"help": "Number of SMs used by DeepEP kernels"}
     )
@@ -97,9 +120,46 @@ class BasePolicyConfig(MappingProtocol):
     fp4_qat: bool = field(
         default=False, metadata={"help": "Enable FP4 fake-quant for routed DSV4 MoE experts"}
     )
+    fp4_qat_indexer: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "Apply Hadamard rotation and FP4 QAT to the indexer's "
+                    "query and compressed keys. It takes priority over ``fp8_qat`` and is "
+                    "orthogonal to ``fp4_qat`` which only covers expert weights."
+                )
+        },
+    )
+    sglang_export_fp4_qdq: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "Export DSV4 routed experts through FP4 Q/DQ into SGLang FP8 "
+                    "without enabling FP4 QAT in the training forward pass"
+                )
+        },
+    )
     fp8: bool = field(
         default=False,
-        metadata={"help": "Enable TE FP8 block-scaling grouped GEMM for DSV4 MoE experts"},
+        metadata={
+            "help":
+                (
+                    "Enable TE FP8 grouped GEMM for DSV4 routed experts "
+                    "(bf16 FSDP all-gather unless fsdp_fp8_gather=True)"
+                )
+        },
+    )
+    fsdp_fp8_gather: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "FSDP FP8 all-gather for DSV4 routed experts via Fp8TensorAg; "
+                    "requires fp8=True"
+                )
+        },
     )
     moe_router_force_load_balancing: bool = field(
         default=False,
@@ -147,6 +207,14 @@ class BasePolicyConfig(MappingProtocol):
     balance_dp_seqlen: bool = field(
         default=False, metadata={"help": "Whether to balance dp seqlen."}
     )
+    dp_balance_extra_keys: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help":
+                "Extra batch keys to include in DP rebalance after filtering "
+                "reward/rm-aux keys. None means none."
+        },
+    )
     smart_pad_infer: bool = field(
         default=False, metadata={"help": "Whether to do smart pad in infer."}
     )
@@ -158,6 +226,11 @@ class BasePolicyConfig(MappingProtocol):
         default=False,
         metadata={"help": "Delay DDP wrapping until after mbridge load_weights."},
     )
+    use_megatron_fsdp: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable Megatron-FSDP in the Megatron backend."},
+    )
+    override_ddp_config: dict[str, Any] = field(default_factory=dict)
     override_transformer_config: dict[str, Any] = field(default_factory=dict)
     freeze_patterns: List[str] = field(
         default_factory=list,

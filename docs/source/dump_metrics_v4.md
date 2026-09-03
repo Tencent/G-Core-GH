@@ -1,5 +1,7 @@
 # Dump Metrics V4
 
+> WandB / TensorBoard 上的分布图（`*_histogram`）见 [Metrics](metrics.md)。本文只讲 per-token 指标落盘。
+
 ## 功能概述
 
 V4 训练框架支持在 **RL 训练（GRPO/GSPO）** 和 **SFT 训练** 期间，按配置间隔采集每个 ppo_step（或 train_step）的训练指标并落盘保存。采集内容包括每条样本的 token ids、reward、各阶段 logprobs（rollout / ref / curr）、ratio、是否被 clip、per-token entropy、advantage、top-k logprobs 及对应 token ids，以及 MoE 路由 top-k 信息。
@@ -16,6 +18,7 @@ V4 训练框架支持在 **RL 训练（GRPO/GSPO）** 和 **SFT 训练** 期间�
 | `ppo_dump_per_token_entropy` | bool | False | 是否落盘 per-token entropy（注意⚠️此开关仅用于控制sft, 是由于sft在拿到per_token_entropy时会有重复计算，影响训练效率，所以加了个开关，默认关闭，需要才打开；⚠️grpo不会产生重复计算，默认会对per_token_entropy落盘，不用加这个开关） |
 | `dump_metrics_logprobs_topk` | int | 0 | 算loss前得到的输出层 logprobs 取 top-k，[b,s,vocab_size]->[b,s,topk] |
 | `ppo_dump_moe_topk` | int | 0 | MoE routing 取 ppo_dump_moe_topk个experts（可以>训练的topk），`0` 表示关闭 |
+| `ppo_dump_gradient` | bool | False | 是否额外落盘 `actor_loss_grad` / `curr_logprob_grad`（仅 `ppo.use_legacy_loss=False`；需同时开启 `ppo_dump_metrics_interval > 0`） |
 
 ### 配置示例
 
@@ -26,6 +29,7 @@ training:
   ppo_dump_per_token_entropy: True
   ppo_dump_moe_topk: 32
   dump_metrics_logprobs_topk: 10
+  ppo_dump_gradient: True
 ```
 
 
@@ -44,6 +48,8 @@ training:
 > 一般关系：`T ≤ P ≤ S`。不使用 smart_pad 且 batch 组成相同时 `P = S`；使用 smart_pad 时三者通常不同。
 >
 > shifted 类字段（logprobs、mask、entropy 等）长度为 `S-1` 或 `P-1`，因为自回归模型 N 个 token 只产生 N-1 个 next-token 预测。
+>
+> **Dynamic CP（GRPO）**：loss 侧 1D 字段会先 scatter 回未 pad 的 `[T-1]`（与 `pre_logprobs` / `advantages` 同下标），再 reverse-reroute 回原始 DP 后与 `expanded_rbs` zip（`dynamic_batch_train` 则为按 train-step flatten 后的 samples）。`dump_metrics_logprobs_topk`、`ppo_dump_moe_topk`、SFT dump 与 dyn-CP 暂不支持。
 
 #### 1.Rollout 相关metrics
 
@@ -56,6 +62,7 @@ training:
 | `rewards_details` | - | - | reward 明细（如有） |
 | `rollout_logprobs` | `[T]` | bfloat16 | rollout 阶段推理引擎生成的 shifted logprobs，`rollout[i]` = log P(token[i+1] \| tokens[0:i+1])，prompt 位置为哨兵值 1.0 |
 | `pre_logprobs` | `[P-1]` | bfloat16 | 当前 policy model（训练前）的 shifted logprobs，即 PPO ratio 的分母 π_old |
+| `response_mask` | `[P-1]` | float32 | rollout 样本的 response mask，来自 `expanded_rbs["mask"]` |
 | `advantages` | `[P-1]` | bfloat16 | 每个 token 的 advantage 值 |
 
 
@@ -72,9 +79,11 @@ training:
 | `topk_token_ids` | `[S, topk]` | int32 | topk_logprobs 对应的 token-ids |
 | `ppo_ratio_unclamped` | `[S-1]` | bfloat16 | clip 前的 ratio |
 | `is_ppo_ratio_clamped` | `[S-1]` | bool | 该 token 的 ratio 是否被 clip |
-| `mask` | `[S-1]` | bool | response mask |
+| `mask` | `[S-1]` | bool | 训练 loss 使用的 response mask（`dump/mask`） |
+| `actor_loss_grad` | `[S-1]` | bfloat16 | `∂bwd_loss/∂actor_loss`（聚合前 per-token；需 `ppo_dump_gradient=True` 且 `use_legacy_loss=False`） |
+| `curr_logprob_grad` | `[S-1]` | bfloat16 | `∂bwd_loss/∂curr_log_probs`（含 KL 路径；需 `ppo_dump_gradient=True` 且 `use_legacy_loss=False`） |
 
-（实现：在训练的每个 forward 中采集，由 pipeline last stage 广播到所有 PP ranks。）
+（实现：在训练的每个 forward 中采集，由 pipeline last stage 广播到所有 PP ranks。metrics 内 key 带 `dump/` 前缀，落盘时剥掉前缀。`actor_loss_grad` / `curr_logprob_grad` 对 loss_fn 返回的 `bwd_loss` 求导，与 mixin 里 GBS `scaled_loss` 只差全局常数，不影响 token 间相对关系/符号/是否为 0。）
 
 
 #### 3.MoE Routing相关Metrics
@@ -153,6 +162,7 @@ ppo_dump_metrics_dir/
         "rewards_details": ...,
         "rollout_logprobs": Tensor[T],           # bfloat16
         "pre_logprobs": Tensor[P-1],             # bfloat16
+        "response_mask": Tensor[P-1],            # float32, rollout 侧 mask
         "advantages": Tensor[P-1],               # bfloat16
         "curr_logprobs": Tensor[S-1],            # bfloat16
         "per_token_entropy": Tensor[S-1],        # bfloat16
@@ -160,7 +170,9 @@ ppo_dump_metrics_dir/
         "topk_token_ids": Tensor[S, topk],       # int32
         "ppo_ratio_unclamped": Tensor[S-1],      # bfloat16
         "is_ppo_ratio_clamped": Tensor[S-1],     # bool
-        "mask": Tensor[S-1],                     # bool
+        "mask": Tensor[S-1],                     # bool, loss 侧 response mask
+        "actor_loss_grad": Tensor[S-1],          # bfloat16, ∂bwd_loss/∂actor_loss
+        "curr_logprob_grad": Tensor[S-1],        # bfloat16, ∂bwd_loss/∂curr_log_probs
         "moe_topk_info": {
             "layer1": {"topk_scores": Tensor[S, moe_topk], "topk_indices": Tensor[S, moe_topk]},
             "layer2": { ... },

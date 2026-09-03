@@ -19,12 +19,14 @@ from gpatch_v4.extended_model.base import PrepareDataForward
 from gpatch_v4.extended_model.mtp_mixin import OnlineMtpSftMixin
 from gpatch_v4.utils import (
     get_tensor_on_this_cp_rank,
+    metadata_scalar,
     pad_3d_seq_dim,
     pad_or_truncate_last_dim,
     qwen2vl_pad_and_split,
 )
 from gpatch_v4.utils.dynamic_cp_utils import (
     _round_up,
+    compute_dyn_cp_response_span,
     dyn_cp_schedule_default,
     dyn_cp_schedule_smart_padding,
 )
@@ -627,8 +629,11 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         dtype_map = {
             "vision_grid_thw": torch.int64,
             "vision_data": self._get_default_vision_type(self.config),
+            "audio_feature": torch.float32,
         }
         vision_data_last_dim = None
+        mel_bins = None
+        audio_data_len = None
         for i, batch in enumerate(gbs_batches):
             if batch.get("vision_data") is not None:
                 assert batch.get("vision_grid_thw") is not None
@@ -644,6 +649,21 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                             f"inconsistent vision_data last dim across samples: "
                             f"{vision_data_last_dim=} != {batch['vision_data'].shape[-1]=}"
                         )
+            if batch.get("audio_feature") is not None:
+                assert dtype_map["audio_feature"] == batch["audio_feature"].dtype, (
+                    f"inconsistent audio_feature dtype: {batch['audio_feature'].dtype} vs {dtype_map['audio_feature']}"
+                )
+                if batch["audio_feature"].numel() > 0:
+                    if audio_data_len is None:
+                        mel_bins = batch["audio_feature"].shape[1]
+                        audio_data_len = batch["audio_feature"].shape[2]
+                    else:
+                        assert mel_bins == batch["audio_feature"].shape[
+                            1] and audio_data_len == batch["audio_feature"].shape[2], (
+                                f"inconsistent audio_feature last two dims across samples: "
+                                f"{mel_bins=} != {batch['audio_feature'].shape[1]=}, "
+                                f"{audio_data_len=} != {batch['audio_feature'].shape[2]=}"
+                            )
 
             tokens = batch["tokens"]
             labels = batch["labels"]
@@ -668,15 +688,26 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                                                       0).permute(1, 2, 0).reshape(-1).contiguous(),
                 image_input_mask=pad_or_truncate_last_dim(batch["image_input_mask"], pad_len,
                                                           0).reshape(-1),
-                vision_data=batch["vision_data"].reshape(-1) if "vision_data" in batch else None,
+                vision_data=batch["vision_data"].reshape(-1)
+                if batch.get("vision_data") is not None else None,
                 vision_grid_thw=batch["vision_grid_thw"].reshape(-1)
-                if "vision_grid_thw" in batch else None,
+                if batch.get("vision_grid_thw") is not None else None,
+                audio_feature=batch["audio_feature"].reshape(-1)
+                if batch.get("audio_feature") is not None else None,
             )
 
         # 2. 根据调度器类型执行不同的调度和 packing 策略
         dev = torch.cuda.current_device()
+        # 获取audio_feature的最后两个dim的shape
+        audio_shape = torch.tensor(
+            [mel_bins, audio_data_len], dtype=torch.int32, device=dev
+        ) if mel_bins is not None else torch.tensor([0, 0], dtype=torch.int32, device=dev)
+        torch.distributed.all_reduce(
+            audio_shape, op=torch.distributed.ReduceOp.MAX, group=dp_cp_group
+        )
+
         packed_keys = ["tokens", "labels", "loss_mask", "image_input_mask", "position_ids"]
-        cat_keys = ["vision_data", "vision_grid_thw"]
+        cat_keys = ["vision_data", "vision_grid_thw", "audio_feature"]
 
         if scheduler_type == "smart_padding":
             assert len(gbs_batches) % cp_size == 0, (
@@ -707,6 +738,7 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 "vision_data",
                 "vision_grid_thw",
                 "position_ids",
+                "audio_feature",
             ]
             new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, _ = (
                 dyn_cp_schedule_default(
@@ -748,6 +780,11 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                     sample[k] = sample[k].reshape(-1, vision_data_last_dim)
                 elif k in ["vision_grid_thw"]:
                     sample[k] = sample[k].reshape(-1, 3)
+                elif k in ["audio_feature"]:
+                    # restore flattened [N*mel_bins*L] -> [N, mel_bins, L]
+                    if sample[k].numel() == 0:
+                        continue
+                    sample[k] = sample[k].reshape(-1, *audio_shape)
 
         return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum
 
@@ -849,6 +886,11 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             cp_img_num=None,
             packed_seq_params=packed_seq_params,
         )
+        # Audio features are carried through the dyn-cp reroute (see
+        # sft_reroute_data_for_dynamic_cp). Pass them so audio samples get their
+        # audio embeddings; the model splits audio for CP internally.
+        if batch.get("audio_feature") is not None:
+            fwd_kwargs["audio_feature"] = batch["audio_feature"]
 
         # Store cp_group in batch so the loss function can use it for CP reduction.
         batch["cp_group"] = cp_group
@@ -883,6 +925,7 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         first = gbs_batches[0]
         global_retention_ratio = first.get("global_retention_ratio")
+        entropy_aux_figures = first.get("entropy_aux_figures")
 
         _optional_rl_keys = [
             ("mask", "loss_mask"),
@@ -890,6 +933,7 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             ("logprobs", "prev_log_probs"),
             ("ref_logprobs", "ref_log_probs"),
             ("rollout_log_probs", "rollout_log_probs"),
+            ("prev_per_token_entropy", "prev_per_token_entropy"),
         ]
         # OPD teacher logprobs: detect teacher_logprobs_* keys and unify to
         # teacher_log_probs. For multi-teacher, select per-sample based on routing.
@@ -907,8 +951,11 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         dtype_map = {
             "vision_grid_thw": torch.int64,
             "vision_data": self._get_default_vision_type(self.config),
+            "audio_feature": torch.float32,
         }
         vision_data_last_dim = None
+        mel_bins = None
+        audio_data_len = None
         for i, batch in enumerate(gbs_batches):
             if batch.get("vision_data") is not None:
                 assert batch.get("vision_grid_thw") is not None
@@ -924,12 +971,36 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                             f"inconsistent vision_data last dim across samples: "
                             f"{vision_data_last_dim=} != {batch['vision_data'].shape[-1]=}"
                         )
+            if batch.get("audio_feature") is not None:
+                assert dtype_map["audio_feature"] == batch["audio_feature"].dtype, (
+                    f"inconsistent audio_feature dtype: {batch['audio_feature'].dtype} vs {dtype_map['audio_feature']}"
+                )
+                if batch["audio_feature"].numel() > 0:
+                    if audio_data_len is None:
+                        mel_bins = batch["audio_feature"].shape[1]
+                        audio_data_len = batch["audio_feature"].shape[2]
+                    else:
+                        assert mel_bins == batch["audio_feature"].shape[
+                            1] and audio_data_len == batch["audio_feature"].shape[2], (
+                                f"inconsistent audio_feature last two dims across samples: "
+                                f"{mel_bins=} != {batch['audio_feature'].shape[1]=}, "
+                                f"{audio_data_len=} != {batch['audio_feature'].shape[2]=}"
+                            )
 
             tokens = batch["tokens"]
             shifted_tokens = tokens[:-1]
             shifted_labels = tokens[1:]
             actual_len = shifted_tokens.shape[-1]
             pad_len = _round_up(actual_len, pad_div)
+            prompt_len = metadata_scalar(batch, "prompt_lengths")
+            sequence_len = metadata_scalar(batch, "sequence_lengths")
+            response_start, response_len = compute_dyn_cp_response_span(
+                prompt_len=prompt_len,
+                sequence_len=sequence_len,
+                actual_len=actual_len,
+                # Optional: logprob-only reroute runs before create_response_mask.
+                response_mask=batch.get("mask"),
+            )
 
             # tokens / image_input_mask / position_ids index absolute positions, so the
             # pre-shift (dropping the last token) needs no extra slicing here.
@@ -942,10 +1013,14 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                                                           0).reshape(-1),
                 original_seq_len=torch.tensor([actual_len], dtype=torch.int32),
                 padded_seq_len=torch.tensor([pad_len], dtype=torch.int32),
+                dyn_cp_response_start=torch.tensor([response_start], dtype=torch.int32),
+                dyn_cp_response_length=torch.tensor([response_len], dtype=torch.int32),
                 vision_data=batch["vision_data"].reshape(-1)
                 if batch.get("vision_data") is not None else None,
                 vision_grid_thw=batch["vision_grid_thw"].reshape(-1)
                 if batch.get("vision_grid_thw") is not None else None,
+                audio_feature=batch["audio_feature"].reshape(-1)
+                if batch.get("audio_feature") is not None else None,
             )
             for src_key, dst_key in rl_key_map:
                 sample[dst_key] = pad_or_truncate_last_dim(batch[src_key], pad_len,
@@ -970,7 +1045,22 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         # Schedule and pack with default dynamic CP scheduler.
         dev = torch.cuda.current_device()
-        packed_keys = ["tokens", "labels", "image_input_mask", "position_ids"]
+        # 获取audio_feature的最后两个dim的shape
+        audio_shape = torch.tensor(
+            [mel_bins, audio_data_len], dtype=torch.int32, device=dev
+        ) if mel_bins is not None else torch.tensor([0, 0], dtype=torch.int32, device=dev)
+        torch.distributed.all_reduce(
+            audio_shape, op=torch.distributed.ReduceOp.MAX, group=dp_cp_group
+        )
+
+        packed_keys = [
+            "tokens",
+            "labels",
+            "image_input_mask",
+            "position_ids",
+            "dyn_cp_response_start",
+            "dyn_cp_response_length",
+        ]
         packed_keys.extend(dst for _, dst in rl_key_map)
         if _opd_teacher_names is not None:
             packed_keys.append("teacher_log_probs")
@@ -979,8 +1069,9 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         if has_sample_mask:
             packed_keys.append("sample_mask")
 
-        cat_keys = ["vision_data", "vision_grid_thw"]
+        cat_keys = ["vision_data", "vision_grid_thw", "audio_feature"]
         global_id_seqlens_keys = (packed_keys + cat_keys + ["original_seq_len", "padded_seq_len"])
+        need_routing_info = kwargs.get("need_routing_info", True)
         new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, routing_info = (
             dyn_cp_schedule_default(
                 gbs_batches,
@@ -996,6 +1087,7 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 global_id_seqlens_keys=global_id_seqlens_keys,
                 dtype_map=dtype_map,
                 max_seqlen_per_dp_cp_rank=scheduler_max_seqlen,
+                need_routing_info=need_routing_info,
             )
         )
 
@@ -1020,8 +1112,15 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                     sample[k] = sample[k].reshape(-1, vision_data_last_dim)
                 elif k in ["vision_grid_thw"]:
                     sample[k] = sample[k].reshape(-1, 3)
+                elif k in ["audio_feature"]:
+                    # restore flattened [N*mel_bins*L] -> [N, mel_bins, L]
+                    if sample[k].numel() == 0:
+                        continue
+                    sample[k] = sample[k].reshape(-1, *audio_shape)
             if global_retention_ratio is not None:
                 sample["global_retention_ratio"] = global_retention_ratio
+            if entropy_aux_figures is not None:
+                sample["entropy_aux_figures"] = entropy_aux_figures
 
         return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, routing_info
 
@@ -1050,10 +1149,16 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         else:
             cp_group = parallel_state.get_context_parallel_group()
 
-        rl_token_keys = [
+        rollout_token_keys = [
             key for key in (
-                "advantages", "prev_log_probs", "ref_log_probs", "rollout_log_probs",
-                "teacher_log_probs", "sample_mask"
+                "advantages",
+                "prev_log_probs",
+                "ref_log_probs",
+                "rollout_log_probs",
+                "teacher_log_probs",
+                "prev_per_token_entropy",
+                "sample_mask",
+                "loss_mask",
             ) if key in batch
         ]
 
@@ -1066,11 +1171,9 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             index = get_thd_partitioned_indices(
                 batch["cu_seqlens_padded"], total_tokens, cp_size, cp_rank
             )
-            # tokens / image_input_mask need the full sequence; only loss-side
-            # fields are CP-split.
-            cp_split_keys = ["labels"] + rl_token_keys
-            if "loss_mask" in batch:
-                cp_split_keys.append("loss_mask")
+            # Like qwen3_vl: full tokens/image_input_mask; only label stream +
+            # position_ids are CP-sharded. Rollout stays replicated for response-pad.
+            cp_split_keys = ["labels"]
             for key in cp_split_keys:
                 batch[key] = batch[key].index_select(0, index)
             # position_ids is flattened mrope [3 * total_tokens]; reshape to the
@@ -1087,12 +1190,15 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         batch["tokens"] = batch["tokens"].view(1, total_tokens).contiguous()
         batch["image_input_mask"] = batch["image_input_mask"].view(1, total_tokens).contiguous()
         batch["labels"] = batch["labels"].view(1, cp_tokens).contiguous()
-        if "loss_mask" in batch:
-            batch["loss_mask"] = batch["loss_mask"].view(1, cp_tokens).contiguous()
         batch["position_ids"] = batch["position_ids"].view(1, cp_tokens, 3).permute(2, 0,
                                                                                     1).contiguous()
-        for key in rl_token_keys:
-            batch[key] = batch[key].view(1, cp_tokens).contiguous()
+        for key in rollout_token_keys:
+            if batch[key].numel() != total_tokens:
+                raise ValueError(
+                    f"dynamic-CP rollout tensor {key!r} has {batch[key].numel()} values, "
+                    f"expected {total_tokens}"
+                )
+            batch[key] = batch[key].view(1, total_tokens).contiguous()
 
         cu_seqlens_padded = batch["cu_seqlens_padded"]
         max_seqlen = batch["max_seqlen"].item()
@@ -1127,6 +1233,11 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             cp_img_num=None,
             packed_seq_params=packed_seq_params,
         )
+        # Audio features are carried through the dyn-cp reroute (see
+        # rl_reroute_data_for_dynamic_cp). Pass them so audio samples get their audio
+        # embeddings; the model splits audio for CP internally.
+        if batch.get("audio_feature") is not None:
+            fwd_kwargs["audio_feature"] = batch["audio_feature"]
         return batch, fwd_kwargs
 
     @override

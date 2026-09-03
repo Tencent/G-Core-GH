@@ -9,7 +9,9 @@ Gcore 当前支持以下 rollout sampling 策略：
 
 ## dynamic sampling
 
-coming soon ...
+V4 实现见 [Dynamic Sampling V4](dynamic_sampling.md)。
+
+每个 PPO step 过滤组内 reward 全相同的 group，不够就按 EMA expansion ratio refill，直到凑满 `rollout_gbs`。打开方式：`policy.rollout_gen_type: dynamic_sampling`，参数在 `training.dynamic_sampling`。
 
 ## partial rollout
 

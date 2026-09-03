@@ -251,7 +251,7 @@ class DpBalanceTestActor(GrpoTrainActor):
         infer_require_keys = list(dp_batches[0].keys())
         infer_require_keys = DPBalanceHelper.filter_keys(
             infer_require_keys,
-            add_custom_keys=getattr(self.config.task, "add_custom_keys", None),
+            add_custom_keys=self.config.policy.dp_balance_extra_keys,
         )
         logging_rank0(f"[TEST 1] dp_balance require_keys: {infer_require_keys}")
 

@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 from gpatch_v4.models.deepseek_v4.kernel.tilelang_indexer import v4_lighting_indexer
 from gpatch_v4.models.deepseek_v4.kernel.tilelang_indexer_fwd import (
-    _make_causal_cu_seqlens,
+    make_causal_cu_ks_and_cu_ke_for_bshd,
     batched_indexer_fwd,
 )
 from gpatch_v4.models.deepseek_v4.kernel.tilelang_sparse_mla_bwd import bwd as sparse_mqa_bwd
@@ -376,7 +376,7 @@ class TestIndexerKernel(unittest.TestCase):
             index_q.to(dev), index_k.to(dev), weights.to(dev)
         )
 
-        cu_ks, cu_ke = _make_causal_cu_seqlens(
+        cu_ks, cu_ke = make_causal_cu_ks_and_cu_ke_for_bshd(
             self.SQ, self.SKV, self.RATIO, dev
         )
         logits = batched_indexer_fwd(
@@ -407,7 +407,7 @@ class TestIndexerKernel(unittest.TestCase):
         _, topk_idx = v4_lighting_indexer(q, k, w, self.RATIO, self.TOPK)
 
         # 复算内部 logits（确定性，同输入 → 同 kernel 输出），自己做 topk + clean 无效区
-        cu_ks, cu_ke = _make_causal_cu_seqlens(
+        cu_ks, cu_ke = make_causal_cu_ks_and_cu_ke_for_bshd(
             self.SQ, self.SKV, self.RATIO, dev
         )
         logits = batched_indexer_fwd(q, k, w, cu_ks, cu_ke)
@@ -427,6 +427,36 @@ class TestIndexerKernel(unittest.TestCase):
         self.assertEqual(
             mism, 0.0, f"top-k indices mismatch fraction={mism:.3e}"
         )
+
+    def test_skip_clean_logits_topk_matches(self):
+        """modeling 路径：clean_logits=False + 后 mask，topk 应与默认 clean 一致。"""
+        index_q, index_k, weights = self._make_inputs(seed=3)
+        dev = self.device
+        q = index_q.to(dev, torch.bfloat16).contiguous()
+        k = index_k.to(dev, torch.bfloat16).contiguous()
+        w = weights.to(dev, torch.float32).contiguous()
+        cu_ks, cu_ke = make_causal_cu_ks_and_cu_ke_for_bshd(
+            self.SQ, self.SKV, self.RATIO, dev
+        )
+
+        logits_clean = batched_indexer_fwd(q, k, w, cu_ks, cu_ke, clean_logits=True)
+        logits_raw = batched_indexer_fwd(q, k, w, cu_ks, cu_ke, clean_logits=False)
+
+        s_pos = torch.arange(self.SQ, device=dev)
+        ke = ((s_pos + 1) // self.RATIO).clamp(max=self.SKV)
+        kv_pos = torch.arange(self.SKV, device=dev)
+        future_mask = kv_pos[None, :] >= ke[:, None]
+        logits_raw = logits_raw.masked_fill(future_mask[None], float("-inf"))
+
+        actual_topk = min(self.TOPK, self.SKV)
+        sc_c, idx_c = torch.topk(logits_clean, actual_topk, dim=-1)
+        sc_r, idx_r = torch.topk(logits_raw, actual_topk, dim=-1)
+        idx_c = idx_c.to(torch.int32).masked_fill(sc_c == float("-inf"), -1)
+        idx_r = idx_r.to(torch.int32).masked_fill(sc_r == float("-inf"), -1)
+
+        mism = (idx_c != idx_r).float().mean().item()
+        print(f"[indexer:skip_clean] index-mismatch fraction={mism:.3e}")
+        self.assertEqual(mism, 0.0, f"skip-clean top-k mismatch fraction={mism:.3e}")
 
 
 if __name__ == "__main__":

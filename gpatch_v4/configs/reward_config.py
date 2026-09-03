@@ -232,5 +232,29 @@ class ExternalRewardConfig(MappingProtocol):
     Attributes
     ----------
     reward_info : list of ExternalRewardInfo or None
+    async_eval : bool
+        Start evaluation reward requests asynchronously and report when
+        ready (polled each train step; forced wait at the next eval / exit).
+    eval_delay_s : float
+        Optional delay applied by compatible external rewards during
+        evaluation. ``0`` disables delay; ``>0`` sleeps that many seconds;
+        ``-1`` samples uniformly from ``[50, 200]`` seconds (test-only async
+        eval overlap).
     """
     reward_info: Optional[List[ExternalRewardInfo]] = field(default=None)
+    async_eval: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "Run external reward asynchronously during evaluation; "
+                "poll for completion each train step."
+        },
+    )
+    eval_delay_s: float = field(
+        default=0.0,
+        metadata={
+            "help":
+                "Test-only eval external-reward delay in seconds; "
+                "-1 = uniform random in [50, 200]."
+        },
+    )

@@ -158,6 +158,8 @@ class GrpoSamplerActor(BaseActor, TokenizerMixin):
             sgl_mamba_full_memory_ratio=infer_engine_config.sgl_mamba_full_memory_ratio,
             sgl_mamba_scheduler_strategy=infer_engine_config.sgl_mamba_scheduler_strategy,
             sgl_enable_spec_v2=infer_engine_config.sgl_enable_spec_v2,
+            return_original_logprob=config.ppo.use_original_logprob,
+            model_override_args=infer_engine_config.model_override_args,
             enable_return_routed_experts=config.training.moe_router_replay
             if hasattr(config, 'training') else False,
             apply_deterministic_mode=getattr(config.training, "apply_deterministic_mode", False),
@@ -341,6 +343,14 @@ class GrpoSamplerActor(BaseActor, TokenizerMixin):
         log("sampler flush_cache done", rank=0)
         return {"ret": True}
 
+    async def abort_all_requests(self, req_dict):
+        """Abort every in-flight generation request on this sampler."""
+        if not self._is_master_node:
+            return {"ret": True}
+        await self.infer_engine.abort_all_requests()
+        log("sampler abort_all_requests done", rank=0)
+        return {"ret": True}
+
     async def release_kv_cache_for_weight_update(self, req_dict=None):
         if not self._is_master_node:
             return {"ret": True}
@@ -385,6 +395,7 @@ class GrpoSamplerActor(BaseActor, TokenizerMixin):
             return {"ret": True}
         batched_data: Dict[str, List[Any]] = req_dict["batched_data"]
         repeat_n = req_dict["sampling_repeat"]
+        is_eval = bool(req_dict.get("is_eval", False))
         if hasattr(self.config, 'training'):
             rollout_mbs = self.config.training.rollout_mbs
             for k, v in batched_data.items():
@@ -398,8 +409,13 @@ class GrpoSamplerActor(BaseActor, TokenizerMixin):
             idx=self.idx,
             tokenizer=self.tokenizer,
             batched_data=batched_data,
-            sampling_repeat_n=repeat_n
+            sampling_repeat_n=repeat_n,
         )
+        gen_params = inspect.signature(self.generate_func).parameters
+        if "is_eval" in gen_params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in gen_params.values()
+        ):
+            gen_fn_kwargs["is_eval"] = is_eval
         for k in self._extra_gen_args:
             if hasattr(self, k):
                 gen_fn_kwargs[k] = getattr(self, k)

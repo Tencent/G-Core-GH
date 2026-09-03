@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import os
 import re
 from typing import Any, Dict, Optional
@@ -13,12 +14,47 @@ from gpatch_v4.configs.config import FinetuneConfig
 from gpatch_v4.utils.resumable_distributed_sampler import ResumableDistributedSampler
 
 
-def tokenize_text(tokenizer, seq_length, prompt, full_text):
+def _deterministic_prompt_expansion_factor(seed: int, idx: int) -> int:
+    digest = hashlib.blake2b(f"{seed}:{idx}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little") % 61 + 40
+
+
+def _expand_generation_prompt(
+    prompt_ids: list[int],
+    input_ids: list[int],
+    factor: int,
+    max_seq_length: int,
+) -> tuple[list[int], int]:
+    if input_ids[:len(prompt_ids)] != prompt_ids:
+        raise ValueError("generation prompt tokens must prefix the full SFT sequence")
+    answer_ids = input_ids[len(prompt_ids):]
+    if len(answer_ids) >= max_seq_length:
+        return answer_ids[-max_seq_length:], 0
+    prompt_budget = max_seq_length - len(answer_ids)
+    expanded_prompt_ids = (prompt_ids * factor)[-prompt_budget:]
+    return expanded_prompt_ids + answer_ids, len(expanded_prompt_ids)
+
+
+def tokenize_text(
+    tokenizer,
+    seq_length,
+    prompt,
+    full_text,
+    prompt_expansion_factor: Optional[int] = None,
+):
     assert tokenizer.pad_token is not None
     prompt_ids = tokenizer(prompt, add_special_tokens=False).input_ids
     input_ids = tokenizer(full_text, add_special_tokens=False).input_ids
 
-    prompt_len = len(prompt_ids)
+    if prompt_expansion_factor is None:
+        prompt_len = len(prompt_ids)
+    else:
+        input_ids, prompt_len = _expand_generation_prompt(
+            prompt_ids,
+            input_ids,
+            prompt_expansion_factor,
+            seq_length,
+        )
     labels = [-100] * prompt_len + input_ids[prompt_len:]
     real_seq_length = len(input_ids)
 
@@ -42,6 +78,21 @@ class SimpleDataset(Dataset):
 
         json_files = glob.glob(os.path.join(self.data_dir, json_pattern))
         self.dataset = load_dataset('json', data_files=json_files, split=split)
+        # dataset/smart-pad 要求每条样本都合法；超长样本在此过滤（num_proc=1 避免 Ray 内 fork）
+        len_src = len(self.dataset)
+        self.dataset = self.dataset.filter(self._is_valid, num_proc=1)
+        print(f"filter out num: {len_src - len(self.dataset)}", flush=True)
+
+    def _is_valid(self, example):
+        if "problem" in example:
+            q_str, a_str = example['problem'], example['solution']
+        elif "question" in example:
+            q_str, a_str = example['question'], example['target']
+        else:
+            return False
+        prompt, full_text, _ = self._apply_chat_template(q_str, a_str)
+        input_ids = self.tokenizer(full_text, add_special_tokens=False).input_ids
+        return len(input_ids) <= self.seq_len
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -62,11 +113,18 @@ class SimpleDataset(Dataset):
             raise ValueError(f"Unknown keys in example: {example.keys()}")
 
         prompt, full_text, messages = self._apply_chat_template(q_str, a_str)
+        prompt_expansion_factor = None
+        if self.config.debug.synthetic_generation_prompt_expansion:
+            prompt_expansion_factor = _deterministic_prompt_expansion_factor(
+                self.config.data.sampler_seed,
+                idx,
+            )
         input_ids, labels, seq_length, prompt_len = tokenize_text(
             self.tokenizer,
             self.seq_len,
             prompt,
             full_text,
+            prompt_expansion_factor,
         )
         return {
             'tokens': input_ids,
@@ -153,16 +211,20 @@ def get_dataset_and_dataloader(
         consumed_batches = resume_step * gas
         sampler.set_start_index(consumed_batches, config.training.train_mbs)
 
-    dataloader = DataLoader(
-        dataset,
-        sampler=sampler,
-        collate_fn=collate_fn,
-        pin_memory=config.data.dataloader_pin_memory,
-        batch_size=config.training.train_mbs,
-        num_workers=config.data.dataloader_num_workers,
-        drop_last=True,
-        multiprocessing_context=config.data.multiprocessing_method,
-    )
+    num_workers = config.data.dataloader_num_workers
+    dataloader_kwargs = {
+        "dataset": dataset,
+        "sampler": sampler,
+        "collate_fn": collate_fn,
+        "pin_memory": config.data.dataloader_pin_memory,
+        "batch_size": config.training.train_mbs,
+        "num_workers": num_workers,
+        "drop_last": True,
+        "multiprocessing_context": config.data.multiprocessing_method,
+    }
+    if num_workers > 0 and config.data.dataloader_prefetch_factor is not None:
+        dataloader_kwargs["prefetch_factor"] = config.data.dataloader_prefetch_factor
+    dataloader = DataLoader(**dataloader_kwargs)
     return {
         'train_dataset': dataset,
         'train_sampler': sampler,

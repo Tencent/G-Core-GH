@@ -17,6 +17,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 
 from gpatch_v4.configs.config import RewardConfig
 from gpatch_v4.core import parallel_state
+from gpatch_v4.core.adaptive_entropy import update_adaptive_entropy_after_train_step
 from gpatch_v4.core.mappings import all_gather_from_context_parallel_region
 from gpatch_v4.core.parallel_state import is_tp_and_cp_head
 from gpatch_v4.core.smart_pad_helper import CatedSmartPadInferHelper
@@ -34,6 +35,7 @@ from gpatch_v4.training_backend.megatron_backend.mixin import (
     BridgeUtilsMixin,
     CheckpointMixin,
     ForwardStepMixin,
+    MetricMixin,
 )
 from gpatch_v4.training_backend.megatron_backend.optimizer import (
     get_megatron_last_lr,
@@ -69,6 +71,7 @@ from gpatch_v4.utils.dynamic_cp_utils import reverse_reroute_logprobs
 from gpatch_v4.utils.training_utils import (
     from_parallel_logits_to_logprobs,
     get_dump_moe_metrics,
+    get_scale_as_float,
     logprobs_from_linear_ce,
 )
 
@@ -93,9 +96,44 @@ def is_post_clip_grad_norm_supported(optimizer) -> bool:
     return False
 
 
-class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixin, CheckpointMixin):
+def _propagate_fp8_overrides(policy_config, optimizer_config=None) -> None:
+    """``fp8_param_gather`` -> ``fp8_param`` + ddp/optimizer (Megatron-aligned)."""
+    tc = policy_config.override_transformer_config
+    if not tc.get("fp8"):
+        return
+
+    gather = bool(tc.pop("fp8_param_gather", False))
+    tc["fp8_param"] = gather
+    policy_config.override_ddp_config["fp8_param_gather"] = gather
+
+    if optimizer_config is None:
+        return
+    if optimizer_config.override_optimizer_config is None:
+        optimizer_config.override_optimizer_config = {}
+    optim = optimizer_config.override_optimizer_config
+    if "fp8_recipe" in tc:
+        optim["fp8_recipe"] = tc["fp8_recipe"]
+    if gather:
+        optim["use_precision_aware_optimizer"] = True
+
+
+class McoreEngine(
+    BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixin, CheckpointMixin, MetricMixin
+):
     def __init__(self, config, policy_config, tokenizer: AutoTokenizer, is_critic_model=False):
         super().__init__(config, policy_config, tokenizer)
+        _propagate_fp8_overrides(
+            self.policy_config,
+            optimizer_config=getattr(self.config, "optimizer", None),
+        )
+        if self.policy_config.use_megatron_fsdp:
+            assert not self.config.training.build_from_mbridge, (
+                "policy.use_megatron_fsdp=True requires training.build_from_mbridge=False "
+                "so gpatch_v4 uses the Megatron-Bridge path."
+            )
+            assert self.policy_config.wrap_with_ddp, (
+                "policy.use_megatron_fsdp=True requires policy.wrap_with_ddp=True."
+            )
 
         early_swap_model = getattr(self.config.training, "early_swap_model", False)
         if early_swap_model:
@@ -124,6 +162,57 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                     override_transformer_config=self.policy_config.override_transformer_config
                 )
         self.logits_cpu_buffer = None
+        self.teacher_output_weight = None
+
+    @torch.no_grad()
+    def setup_teacher_output_weight(self) -> None:
+        """Load a frozen Teacher lm-head shard on Student PP-last ranks.
+
+        The Teacher bridge mapping is used to resolve the architecture-specific
+        MCore output-layer name to its Hugging Face checkpoint key. Each TP
+        rank loads the full HF tensor and selects its vocabulary shard.
+        """
+        if not mpu.is_pipeline_last_stage():
+            self.teacher_output_weight = None
+            return
+
+        teacher_bridge, _ = self.build_bridge(
+            self.config.teacher.hf_model_path,
+            override_transformer_config=self.config.teacher.override_transformer_config,
+        )
+        assert not getattr(teacher_bridge.config, "use_mup", False), (
+            "Teacher hidden-state transfer does not yet support MuP logit scaling"
+        )
+        output_mappings = [
+            (mcore_name, hf_name) for mcore_name, hf_name in teacher_bridge._DIRECT_MAPPING.items()
+            if mcore_name.endswith("output_layer.weight")
+        ]
+        assert len(output_mappings) == 1, (
+            "Expected exactly one Teacher output-layer entry in mbridge _DIRECT_MAPPING, "
+            f"got {output_mappings}"
+        )
+        mcore_name, hf_name = output_mappings[0]
+        io = teacher_bridge._get_safetensor_io(self.config.teacher.hf_model_path)
+
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        assert self.vocab_size % tp_size == 0
+        hf_weight = io.load_one_hf_weight(hf_name)
+        full_weight = teacher_bridge._weight_to_mcore_format(mcore_name, [hf_weight])
+        assert full_weight.ndim == 2
+        assert full_weight.shape[0] == self.vocab_size, (
+            "Teacher vocab is larger than the Student padded vocab: "
+            f"{full_weight.shape[0]} vs {self.vocab_size}"
+        )
+        self.teacher_output_weight = (
+            full_weight.chunk(tp_size, dim=0)[tp_rank].to(
+                device=torch.cuda.current_device(), dtype=torch.bfloat16
+            ).contiguous().detach()
+        )
+        logging_rank0(
+            "Loaded frozen Teacher output-layer shard "
+            f"{tuple(self.teacher_output_weight.shape)} from {hf_name}"
+        )
 
     def setup_ref_model(self):
         save_latest_step = get_latest_checkpoint_folder(self.checkpoint_config.save_ref_ckpt_path)
@@ -226,6 +315,7 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                 load_latest_step,
                 bridge=self.bridge,
                 peft=self.peft,
+                use_megatron_fsdp=self.policy_config.use_megatron_fsdp,
             )
             self.optimizer, self.optimizer_scheduler = optimizer, optimizer_scheduler
 
@@ -271,7 +361,7 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                 )
                 self._warned_post_clip_unsupported_opt = True
             return None
-        return self.optimizer.get_grad_norm()
+        return get_scale_as_float(self.optimizer.get_grad_norm())
 
     def export_weights(self):
         if self.config.training.build_from_mbridge:
@@ -308,7 +398,11 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
         assert not self.is_critic_model
 
         log_prob_top_k = getattr(self.ppo_config, "log_prob_top_k", 0)
-        return_per_token_entropy = self.ppo_config.loss_func == "steer"
+        return_per_token_entropy = (
+            getattr(self.ppo_config, "loss_func", None) == "steer" or
+            getattr(self.ppo_config, "post_compute_logprobs", "none") != "none"
+        )
+
         if self.policy_config.smart_pad_infer:
             assert log_prob_top_k == 0, (
                 "policy.smart_pad_infer + ppo.log_prob_top_k > 0 is not supported yet; "
@@ -510,13 +604,14 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             self.onload_model()
             for model_module in self.model:
                 model_module.eval()
-            per_sample_prev = self._forward_packed_batches_unified(
-                self.model,
-                packed_batches,
-                num_micro_batches,
-                seqlen,
-                batch_log_str="get_policy_logprobs (dyn_cp) microbatch ",
-            )
+            with self.get_router_replay_ctx():
+                per_sample_prev = self._forward_packed_batches_unified(
+                    self.model,
+                    packed_batches,
+                    num_micro_batches,
+                    seqlen,
+                    batch_log_str="get_policy_logprobs (dyn_cp) microbatch ",
+                )
             prev_logps = self._reverse_and_collect(
                 per_sample_prev,
                 global_ids_this_rank,
@@ -643,7 +738,7 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
         if dumped_metrics_per_ppo_step is None or dumped_loss_fn_metrics is None:
             return
         dump_moe_topk = getattr(self.training_config, "ppo_dump_moe_topk", 0) or 0
-        if dump_moe_topk > 0:
+        if dump_moe_topk > 0 and not self.dist_config.dynamic_context_parallel:
             dumped_moe_topk_metrics = None
             if is_tp_and_cp_head():
                 dumped_moe_topk_metrics = get_dump_moe_metrics(
@@ -675,6 +770,7 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
 
         dumped_metrics_per_ppo_step = [] if self.should_dump_metrics else None
         metrics = {}
+
         for batch in dataloader_iter:
             for model_chunk in self.model:
                 model_chunk.zero_grad_buffer()
@@ -687,13 +783,15 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                 self._step_global_token_cnt,
             ) = self._compute_step_gbs_and_token_cnt(batch)
             dyn_cp_stats = None
+            routing_info = None
             if self.config.policy.dist_config.dynamic_context_parallel:
-                batch, mb_num_microbatches, seqlen_sum, seqlen_sq_sum, _ = (
+                batch, mb_num_microbatches, seqlen_sum, seqlen_sq_sum, routing_info = (
                     self.prepare_data.rl_reroute_data_for_dynamic_cp(
                         batch,
                         self.tokenizer.pad_token_id,
                         vocab_size=self.vocab_size,
                         pad_with_random_token=self.config.training.moe_pad_with_random_tokens,
+                        need_routing_info=self.should_dump_metrics,
                     )
                 )
                 dyn_cp_stats = {
@@ -704,7 +802,11 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
 
             # maybe enable r3 replay if required
             with self.get_router_replay_ctx():
-                _metric = self._update_policy(batch, num_microbatches=mb_num_microbatches)
+                _metric = self._update_policy(
+                    batch,
+                    num_microbatches=mb_num_microbatches,
+                    routing_info=routing_info,
+                )
 
             if dyn_cp_stats is not None:
                 _metric.update(dyn_cp_stats)
@@ -719,7 +821,7 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             )  # append the metric from this micro-batch to global metrics.
 
             update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
-            extend_value_to_dict(metrics, {"policy/grad_norm": grad_norm})
+            extend_value_to_dict(metrics, {"policy/grad_norm": get_scale_as_float(grad_norm)})
             post_clip_grad_norm = self.maybe_post_clip_grad_norm(update_successful)
             if post_clip_grad_norm is not None:
                 extend_value_to_dict(metrics, {"policy/post_clip_grad_norm": post_clip_grad_norm})
@@ -727,6 +829,17 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             if update_successful:
                 if self.config.optimizer.update_lr_by_train_step:
                     self.optimizer_scheduler.step(1)
+                if self.ppo_config.use_adaptive_entropy:
+                    assert "policy/scaled_entropy" in _metric, (
+                        "use_adaptive_entropy requires policy/scaled_entropy in train metrics"
+                    )
+                    extend_value_to_dict(
+                        metrics,
+                        update_adaptive_entropy_after_train_step(
+                            self.ppo_config,
+                            float(_metric["policy/scaled_entropy"]),
+                        ),
+                    )
             else:
                 raise RuntimeError("Optimizer step failed")
 
@@ -760,7 +873,7 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
         update_successful = logical_and_across_model_parallel_group(update_successful)
         # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
         # so we must gather across mp ranks
-        grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
+        grad_norm = reduce_max_stat_across_model_parallel_group(get_scale_as_float(grad_norm))
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
 
         metric["finetune/grad_norm"] = grad_norm
@@ -782,9 +895,72 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             clear_memory()
         return metric
 
+    @override
+    def pretrain_step(self, batch: List[Dict[str, Any]], num_microbatches: int, step: int):
+        """Packed-THD pretrain step. Microbatches may stay on CPU until each forward.
+
+        Uses ``prepare_data.pretrain_packed`` (not ``sft_train`` / expand).
+        Expects dataset-packed flat fields (``tokens``, ``cu_seqlens_padded``, ...).
+        """
+        assert num_microbatches == len(batch)
+        assert num_microbatches >= 1
+        for model_chunk in self.model:
+            model_chunk.zero_grad_buffer()
+        self.optimizer.zero_grad()
+
+        num_samples, num_tokens, num_label_tokens, num_pad_tokens = (
+            self._compute_pretrain_packed_batch_stats(batch)
+        )
+        metric = self._pretrain_step(batch, num_microbatches, forward_only=False)
+        update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+        post_clip_grad_norm = self.maybe_post_clip_grad_norm(update_successful)
+        lr = self.step_and_get_lr()
+
+        (
+            update_successful,
+            grad_norm,
+            num_zeros_in_grad,
+            post_clip_grad_norm,
+        ) = self.reduce_optimizer_stats_across_model_parallel_group(
+            update_successful,
+            get_scale_as_float(grad_norm),
+            get_scale_as_float(num_zeros_in_grad),
+            get_scale_as_float(post_clip_grad_norm),
+        )
+
+        metric["pretrain/num_samples_sum"] = num_samples
+        metric["pretrain/num_tokens_sum"] = num_tokens
+        metric["pretrain/num_label_tokens_sum"] = num_label_tokens
+        metric["pretrain/num_pad_tokens_sum"] = num_pad_tokens
+        metric["pretrain/grad_norm"] = grad_norm
+        metric["pretrain/lr"] = lr
+        metric["pretrain/num_zeros_in_grad"] = num_zeros_in_grad
+        if post_clip_grad_norm is not None:
+            metric["pretrain/post_clip_grad_norm"] = post_clip_grad_norm
+
+        if self.policy_config.manual_clear_memory and (
+            step + 1
+        ) % self.policy_config.manual_clear_memory_interval == 0:
+            clear_memory()
+        return metric
+
     @torch.no_grad()
     def eval_step(self, batch: List[Dict[str, Any]], num_microbatches: int):
+        if self.config.policy.dist_config.dynamic_context_parallel:
+            assert not self.config.training.use_dynamic_mbs
+            batch, num_microbatches, seqlen_sum, seqlen_sq_sum = (
+                self.prepare_data.sft_reroute_data_for_dynamic_cp(
+                    batch,
+                    self.tokenizer.pad_token_id,
+                    vocab_size=self.vocab_size,
+                    pad_with_random_token=self.config.training.moe_pad_with_random_tokens,
+                )
+            )
         metric = self._finetune_step(batch, num_microbatches=num_microbatches, forward_only=True)
+        if self.config.policy.dist_config.dynamic_context_parallel:
+            metric["eval/dyn_cp_seqlen_sum"] = seqlen_sum
+            metric["eval/dyn_cp_seqlen_sq_sum"] = seqlen_sq_sum
+            metric["eval/dyn_cp_num_micro_batches"] = num_microbatches
         clear_memory()
         return metric
 
@@ -796,28 +972,49 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
                 batch_log_str="[smart_pad] get_policy_logits microbatch ",
             )
         else:
-            return self.default_compute_logits(rollout_batches)
+            return self._compute_logits_or_hidden_states(rollout_batches, return_logits=True)
 
-    def default_compute_logits(self, rollout_batches: List[Dict[str, torch.Tensor]]):
+    def compute_hidden_states(
+        self, rollout_batches: List[Dict[str, torch.Tensor]]
+    ) -> tuple[None, List[Optional[torch.Tensor]]]:
+        return self._compute_logits_or_hidden_states(rollout_batches, return_logits=False)
+
+    def _compute_logits_or_hidden_states(
+        self,
+        rollout_batches: List[Dict[str, torch.Tensor]],
+        *,
+        return_logits: bool,
+    ) -> tuple[None, List[Optional[torch.Tensor]]]:
         begine_t = sync_cuda_and_get_time()
         assert rollout_batches[0]['tokens'].ndim == 1, f"{rollout_batches[0]['tokens'].ndim}"
 
         assert self.policy_config.without_ref
 
         self.set_model_eval()
-        logits_output = self._compute_logits(
+        output = self._compute_logits_or_hidden_states_impl(
             self.model,
             rollout_batches,
-            batch_log_str="get_policy_logits microbatch ",
+            batch_log_str=(
+                "get_policy_logits microbatch "
+                if return_logits else "get_teacher_hidden_states microbatch "
+            ),
+            return_logits=return_logits,
         )
         end_t = sync_cuda_and_get_time()
 
         if mpu.is_pipeline_last_stage():
-            assert logits_output is not None
-            log(f"default_compute_logits using time {end_t - begine_t}", rank=0)
+            assert output is not None
+            output_name = "logits" if return_logits else "hidden_states"
+            log(
+                f"compute_{output_name} using time {end_t - begine_t}",
+                rank=0,
+            )
         else:
-            logits_output = [None for _ in range(len(rollout_batches))]
-        return None, logits_output
+            output = [None for _ in range(len(rollout_batches))]
+        return None, output
+
+    def default_compute_logits(self, rollout_batches: List[Dict[str, torch.Tensor]]):
+        return self._compute_logits_or_hidden_states(rollout_batches, return_logits=True)
 
     @override
     def set_model_eval(self):
@@ -944,7 +1141,9 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
     ):
         fwd_bwd_function = get_forward_backward_func()
         value_microbatches = fwd_bwd_function(
-            forward_step_func=self.get_logits_output_only_func(seq_length, inference_only=True),
+            forward_step_func=self.get_logits_or_hidden_state_only_func(
+                seq_length, inference_only=True
+            ),
             data_iterator=batch_iter,
             model=self._smart_pad_current_model,
             num_microbatches=num_microbatches,
@@ -1061,7 +1260,7 @@ class McoreEngine(BaseEngine, BridgeUtilsMixin, EngineSwapMixin, ForwardStepMixi
             )  # append the metric from this micro-batch to global metrics.
 
             update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
-            extend_value_to_dict(metrics, {"value/grad_norm": grad_norm})
+            extend_value_to_dict(metrics, {"value/grad_norm": get_scale_as_float(grad_norm)})
             post_clip_grad_norm = self.maybe_post_clip_grad_norm(update_successful)
             if post_clip_grad_norm is not None:
                 extend_value_to_dict(metrics, {"value/post_clip_grad_norm": post_clip_grad_norm})

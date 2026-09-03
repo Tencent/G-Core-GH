@@ -28,7 +28,7 @@ import os
 import re
 import shutil
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -196,20 +196,27 @@ def _layer_id(key: str) -> int:
     return int(m.group(1))
 
 
-def _compute_total_tensor_bytes(dst_dir: str, shard_to_keys: Dict[str, List[str]]) -> int:
+def _compute_total_tensor_bytes(
+    dst_dir: str,
+    shard_to_keys: Dict[str, List[str]],
+    phantom_keys: Optional[List[str]] = None,
+) -> int:
     """HF convention: ``total_size`` is the sum of tensor data bytes (not file size)."""
     total = 0
     for shard, keys in shard_to_keys.items():
         with safe_open(os.path.join(dst_dir, shard), framework="pt", device="cpu") as f:
             for k in keys:
+                if phantom_keys is not None and k in phantom_keys:
+                    continue
                 sl = f.get_slice(k)
                 shape = sl.get_shape()
-                dtype = str(sl.get_dtype())
+                dtype = str(sl.get_dtype()).split("_")[0]
                 total += _shape_bytes(shape, dtype)
     return total
 
 
 _DTYPE_BYTES = {
+    "F8": 1,
     "BF16": 2,
     "F16": 2,
     "F32": 4,
@@ -278,7 +285,10 @@ def _copy_aux_files(src_dir: str, dst_dir: str, force: bool = False) -> None:
             try:
                 os.link(s, d)
             except OSError:
-                shutil.copy2(s, d)
+                try:
+                    shutil.copy2(s, d)
+                except shutil.SameFileError:
+                    pass
 
 
 def _copy_routing_map(routing_map_path: str, dst_dir: str) -> None:

@@ -25,13 +25,14 @@ from gpatch_v4.configs.config import RlConfig
 from gpatch_v4.utils.resumable_distributed_sampler import ResumableDistributedSampler
 
 
-def _load_dataset_auto(data_dir: str, split: str):
-    """Auto-detect file format (jsonl or parquet) and load via HF datasets.
+def _load_dataset_auto(data_path: str, split: str):
+    """Load a jsonl/parquet file or a directory containing either format.
 
     Parameters
     ----------
-    data_dir : str
-        Directory containing either ``*.jsonl`` or ``*.parquet`` files.
+    data_path : str
+        A ``.jsonl`` / ``.parquet`` file, or a directory containing either
+        ``*.jsonl`` or ``*.parquet`` files.
     split : str
         Dataset split name (used as the HF datasets split label).
 
@@ -44,8 +45,16 @@ def _load_dataset_auto(data_dir: str, split: str):
     AssertionError
         If no supported files are found in ``data_dir``.
     """
-    jsonl_files = glob.glob(os.path.join(data_dir, "*.jsonl"))
-    parquet_files = glob.glob(os.path.join(data_dir, "*.parquet"))
+    if os.path.isfile(data_path):
+        if data_path.endswith(".jsonl"):
+            jsonl_files, parquet_files = [data_path], []
+        elif data_path.endswith(".parquet"):
+            jsonl_files, parquet_files = [], [data_path]
+        else:
+            raise AssertionError(f"unsupported dataset file format: {data_path}")
+    else:
+        jsonl_files = glob.glob(os.path.join(data_path, "*.jsonl"))
+        parquet_files = glob.glob(os.path.join(data_path, "*.parquet"))
 
     if jsonl_files:
         return load_dataset("json", data_files={split: jsonl_files}, split=split)
@@ -53,7 +62,7 @@ def _load_dataset_auto(data_dir: str, split: str):
         return load_dataset("parquet", data_files={split: parquet_files}, split=split)
     else:
         raise AssertionError(
-            f"no *.jsonl or *.parquet files found in {data_dir}. "
+            f"no *.jsonl or *.parquet files found at {data_path}. "
             f"Download DAPO-Math-17K and place files there."
         )
 
@@ -111,15 +120,20 @@ class DapoMathDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         example = self.dataset[idx]
-        assert "prompt" in example, f"missing 'prompt' field at idx={idx}"
-
-        question = example["prompt"]
-        if "label" in example:
+        if "prompt" in example and "label" in example:
+            question = example["prompt"]
             target = str(example["label"])
-        elif "reward_model" in example:
-            target = str(example["reward_model"]["ground_truth"])
+        elif "problem" in example and "answer" in example:
+            # HuggingFaceH4/aime_2024 stores a plain problem string instead
+            # of a chat message list. Convert it to the DAPO chat format.
+            question = [{"role": "user", "content": example["problem"]}]
+            target = str(example["answer"])
         else:
-            raise AssertionError(f"missing 'label' or 'reward_model' field at idx={idx}")
+            raise AssertionError(
+                "expected either DAPO fields ('prompt', 'label') or "
+                "AIME fields ('problem', 'answer') at "
+                f"idx={idx}, got {sorted(example)}"
+            )
 
         prompt, _ = self._apply_chat_template(question)
         input_ids, prompt_len = tokenize_text(

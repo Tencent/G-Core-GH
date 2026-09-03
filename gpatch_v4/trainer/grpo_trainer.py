@@ -1,12 +1,13 @@
 import asyncio
 
 from gpatch_v4 import orches
-from gpatch_v4.configs.config import RlConfig
+from gpatch_v4.configs.config import AgenticOnPolicyDistillConfig, RlConfig
 from gpatch_v4.orches.placement_group import (
     create_bt_rm_group,
     create_gen_rm_group,
     create_placement_groups,
     create_sampler_group,
+    create_teacher_groups,
     create_train_group,
 )
 from gpatch_v4.trainer.helper import convert_mcore_to_hf, set_nnodes_default
@@ -25,6 +26,7 @@ class GrpoTrainer(TrainerRetryMixin):
         self.sampler_group = None
         self.gen_rm_group = None
         self.bt_rm_group = None
+        self.teacher_groups: dict = {}
         self.train_group = None
 
     async def conv_mcore_to_hf(self, config: RlConfig):
@@ -53,6 +55,14 @@ class GrpoTrainer(TrainerRetryMixin):
             await grp.init_setup()
         await asyncio.gather(*(grp.init_load() for grp in self.gen_rm_group))
 
+    async def _init_teacher_groups(self, config, pgs):
+        """Initialize teacher groups for agentic on-policy distillation."""
+        if not isinstance(config, AgenticOnPolicyDistillConfig):
+            return
+        self.teacher_groups = create_teacher_groups(config, pgs)
+        for teacher_group in self.teacher_groups.values():
+            await teacher_group.init()
+
     async def launch(self, config: RlConfig):
         """Launch the full LLM GRPO training pipeline.
 
@@ -77,6 +87,8 @@ class GrpoTrainer(TrainerRetryMixin):
         if config.training.use_bt_rm_reward:
             self.bt_rm_group = create_bt_rm_group(config, pgs)
             await self.bt_rm_group.init()
+
+        await self._init_teacher_groups(config, pgs)
 
         self.train_group = create_train_group(config, pgs)
         await self.train_group.init()
@@ -105,6 +117,8 @@ class GrpoTrainer(TrainerRetryMixin):
         if config.training.use_bt_rm_reward:
             self.bt_rm_group = create_bt_rm_group(config, pgs)
             await self.bt_rm_group.init()
+
+        await self._init_teacher_groups(config, pgs)
 
         self.train_group = create_train_group(config, pgs)
         await self.train_group.init()

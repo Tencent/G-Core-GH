@@ -4,7 +4,7 @@ import os
 import time
 import traceback
 from functools import partial
-from typing import Any, Dict, List
+from typing import Dict, List
 
 import torch
 import torch.distributed
@@ -155,7 +155,10 @@ class DpoActor(FinetuneActor):
                 cpu_barrier()
 
                 train_step += 1
-                if train_step % training_config.save_interval == 0:
+                if (
+                    train_step % training_config.save_interval == 0 and
+                    not self.config.debug.disable_save_checkpoint
+                ):
                     self.model_engine.save_checkpoint(train_step)
 
                 if train_step == training_config.exit_step:
@@ -167,7 +170,10 @@ class DpoActor(FinetuneActor):
         self.train_step_finished = True
 
         cpu_barrier()
-        if train_step % training_config.save_interval != 0:
+        if (
+            train_step % training_config.save_interval != 0 and
+            not self.config.debug.disable_save_checkpoint
+        ):
             self.model_engine.save_checkpoint(train_step)
 
         if is_last_rank():

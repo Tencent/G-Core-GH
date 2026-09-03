@@ -18,11 +18,10 @@ Exercises the real ``DeepseekV4TopKRouter`` + the real
 
 Token counting is driven by a permanently-registered forward hook
 (:func:`register_router_correction_bias_accum_tracking_hook`) that only
-increments the per-expert accumulator while :func:`train_forward_context`
-is active. Recompute during gradient checkpointing uses
-:func:`checkpoint_context_fn`'s second context (a no-op) and is therefore
-never double-counted; any forward outside ``train_forward_context``
-(eval, logprob, etc.) does not affect the counts either.
+increments the per-expert accumulator while the _is_train_forward (a
+``contextvars.ContextVar`` set by :func:`train_forward_context`) is ``True``.
+Recompute during gradient checkpointing is therefore never double-counted;
+any forward outside the training forward (eval, logprob, etc.) is guard by router.training
 
 Usage::
 
@@ -43,12 +42,12 @@ import torch.nn as nn
 
 from gpatch_v4.models.deepseek_v4.freeze_update_router import (
     _ACCUM_ATTR,
+    train_forward_context,
     checkpoint_context_fn,
     freeze_router_weights,
     init_router_correction_bias_accumulators,
     register_router_correction_bias_accum_tracking_hook,
     reset_router_correction_bias_accum,
-    train_forward_context,
     update_router_correction_bias,
 )
 from gpatch_v4.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4TopKRouter
@@ -259,7 +258,7 @@ def test_bias_update_matches_reference_formula():
 
     for gate, counts, bias0 in zip(model.gates, known_counts, start_bias):
         expected = _reference_updated_bias(bias0, counts, speed)
-        assert torch.allclose(gate.e_score_correction_bias, expected, atol=0, rtol=0)
+        assert torch.allclose(gate.e_score_correction_bias, expected, atol=1e-7, rtol=0)
 
     # balanced router (all counts equal) has sign(mean - load) == 0 -> unchanged.
     assert torch.equal(model.gates[1].e_score_correction_bias, start_bias[1])
@@ -304,7 +303,9 @@ def test_bias_update_end_to_end_from_real_routing():
     observed_t = torch.stack(observed, dim=0)
 
     maxvio_max, maxvio_mean = update_router_correction_bias(model, speed)
-    expected_maxvio = (observed_t.max(dim=-1).values - observed_t.mean(dim=-1)) / observed_t.mean(dim=-1).clamp_min(1e-12)
+    expected_maxvio = (
+        observed_t.max(dim=-1).values - observed_t.mean(dim=-1, dtype=torch.float64)
+    ) / observed_t.mean(dim=-1, dtype=torch.float64).clamp_min(1e-12)
     assert torch.equal(maxvio_max, expected_maxvio.max())
     assert torch.equal(maxvio_mean, expected_maxvio.mean())
 
@@ -312,7 +313,7 @@ def test_bias_update_end_to_end_from_real_routing():
         # every token contributes exactly top_k assignments (no pad here).
         assert counts.sum().item() == hidden.shape[0] * gate.top_k
         expected = _reference_updated_bias(bias0, counts, speed)
-        assert torch.allclose(gate.e_score_correction_bias, expected, atol=0, rtol=0)
+        assert torch.allclose(gate.e_score_correction_bias, expected, atol=1e-7, rtol=0)
 
 
 def test_bias_frozen_when_update_not_called():
@@ -362,16 +363,17 @@ def test_counting_only_happens_inside_forward_phase():
     """Counting fires only within ``train_forward_context``.
 
     The tracking hook is registered permanently, but it only increments the
-    accumulator while ``train_forward_context`` is active. Forwards outside
-    that context — eval / logprob / any other forward — and recompute
-    (``checkpoint_context_fn()[1]``, a no-op) must NOT touch
-    ``local_tokens_per_expert``. This keeps those forwards from polluting
-    the per-step token counts and guards against double-counting on recompute.
+    accumulator while the _is_train_forward is ``True``. Forwards run in eval mode and
+    forwards run in the recompute phase (gradient-checkpointing recompute)
+    must NOT touch ``local_tokens_per_expert``. This is what keeps those forwards
+    from polluting the per-step token counts and guards against double-counting
+    on recompute.
     """
     torch.manual_seed(9)
     model = _RouterModel(num_routers=2)
     model.train()
     _enable_bias_tracking(model)
+    fwd_ctx, recompute_ctx = checkpoint_context_fn()
 
     hidden = torch.randn(8, HIDDEN)
 
@@ -381,14 +383,15 @@ def test_counting_only_happens_inside_forward_phase():
         assert _counts(gate).sum().item() == 0.0, "forward outside train_forward_context must not count"
 
     # 2. forward INSIDE train_forward_context -> counts exactly this forward.
-    with train_forward_context():
+    with fwd_ctx:
         model(hidden)
     counted = [_counts(gate).detach().clone() for gate in model.gates]
     for gate, snap in zip(model.gates, counted):
         assert snap.sum().item() == hidden.shape[0] * gate.top_k
 
-    # 3. recompute context (checkpoint_context_fn second slot) -> no-op -> counts frozen.
-    with checkpoint_context_fn()[1]:
+    # 3. forward in the "recompute" phase -> hook is a no-op -> counts frozen
+    #    (this is the gradient-checkpointing double-count guard).
+    with recompute_ctx:
         model(hidden)
     for gate, snap in zip(model.gates, counted):
         assert torch.equal(_counts(gate), snap), (

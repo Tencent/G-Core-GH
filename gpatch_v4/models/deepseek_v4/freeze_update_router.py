@@ -15,6 +15,8 @@ never re-triggers it, and every token is counted exactly once.
 from __future__ import annotations
 
 import contextvars
+import os
+import sys
 from contextlib import contextmanager, nullcontext
 from typing import Iterator, Literal, Optional, Tuple
 
@@ -25,7 +27,6 @@ import torch.nn as nn
 from gpatch_v4.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4TopKRouter
 
 _ACCUM_ATTR = "local_tokens_per_expert"
-ComputePhase = Literal["outside", "forward", "recompute"]
 _is_train_forward: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "is_train_forward", default=False
 )
@@ -65,7 +66,7 @@ def init_router_correction_bias_accumulators(model: nn.Module) -> None:
         bias = router.e_score_correction_bias
         router.register_buffer(
             _ACCUM_ATTR,
-            torch.zeros_like(bias, dtype=torch.float32),
+            torch.zeros_like(bias, dtype=torch.int64),
             persistent=False,
         )
 
@@ -91,7 +92,7 @@ def register_router_correction_bias_accum_tracking_hook(model: nn.Module):
             indices = out[2].detach().clone()
             flat = indices.reshape(-1)
             num_experts = router.e_score_correction_bias.shape[0]
-            counts = torch.bincount(flat, minlength=num_experts).to(torch.float32)
+            counts = torch.bincount(flat, minlength=num_experts)
             router.get_buffer(_ACCUM_ATTR).add_(counts)
 
         return hook
@@ -121,7 +122,9 @@ def checkpoint_context_fn():
 def update_router_correction_bias(
     model: nn.Module,
     update_speed: float,
-    use_abs_update: bool = True
+    use_abs_update: bool = True,
+    dump_and_exit: bool = False,
+    dump_path: str = "debug-tmp/debug_moe_router/counts.pt",
 ) -> Tuple[Optional[float], Optional[float]]:
     """Apply the loss-free load-balancing update to every TopKRouter correction bias.
     See https://arxiv.org/abs/2408.15664 §3 for more details.
@@ -138,9 +141,18 @@ def update_router_correction_bias(
     #   if using TP, each token may be counted multiple times in different TP ranks
     dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
 
-    avg = counts.mean(dim=-1)  # [L]
-    assert (avg == avg[0]
-           ).all(), (f"avg load should be the same for all routers, S * K / E, but got {avg}")
+    avg = counts.mean(dim=-1, dtype=torch.float64)  # [L]
+    assert (avg == avg[0]).all(), (
+        f"avg load should be the same for all routers, S * K / E, but got {avg}"
+    )
+
+    if dump_and_exit:
+        if dist.get_rank() == 0:
+            os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+            torch.save(counts, dump_path)
+            print(f"[Debug dump] Dumped expert token counts to {dump_path}. Exit now.")
+        dist.barrier()
+        sys.exit(0)
 
     for i, router in enumerate(routers):
         if use_abs_update:

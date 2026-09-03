@@ -59,3 +59,64 @@ class TestQwen3VLOnPolicyDistill(unittest.IsolatedAsyncioTestCase):
     @requires_vllm
     async def test_train_one_step_and_save_vllm(self):
         await self._reuse_train_one_step_and_save("vllm")
+
+
+class TestQwen3VLOriginalLogprob(unittest.IsolatedAsyncioTestCase):
+    """Sampler vs actor logprob scale at temperature=0.5.
+
+    Both ``use_original_logprob`` True (raw / T=1 recompute) and False
+    (processed / T=0.5 recompute) should keep
+    ``policy/off_policy_correction/kl`` near zero.
+    """
+
+    KL_KEY = "policy/off_policy_correction/kl"
+    # sglang vs megatron residual at T=0.5 on this VL e2e is ~7e-4 (raw)
+    # / ~1.4e-3 (processed); 5e-4 is too tight. Scale match is still
+    # ppl_ratio≈1.001 / ppo_ratio=1.0.
+    KL_ABS_TOL = 2e-3
+
+    def tearDown(self):
+        kill_all_actors_and_shutdown_ray()
+
+    async def _run_one_step(self, use_original_logprob):
+        config = load_config("test_qwen3_vl_on_distill", OnPolicyDistillConfig)
+        config.sampler.backend = "sglang"
+        ie = config.sampler.infer_engine_configs[0]
+        ie.temperature = 0.5
+        ie.generate_params.temperature = 0.5
+        config.ppo.use_original_logprob = use_original_logprob
+        config.data.eval_data_pathes = list(config.data.data_pathes)
+        config.training.eval_before_train = False
+        config.training.total_eval_step = 0
+
+        save_path = f"unittest_onpd_orig_logprob_{int(use_original_logprob)}"
+        config.checkpoint.load_ckpt_path = save_path
+        config.checkpoint.save_ckpt_path = save_path
+        shutil.rmtree(save_path, ignore_errors=True)
+        try:
+            trainer = OnPolicyDistillTrainer()
+            metrics_list = await trainer.launch_then_run_with_recovery(config)
+        finally:
+            shutil.rmtree(save_path, ignore_errors=True)
+
+        assert metrics_list is not None and len(metrics_list) > 0
+        for dp_metrics in metrics_list:
+            assert len(dp_metrics) >= 1
+            for step_metric in dp_metrics:
+                assert self.KL_KEY in step_metric, (
+                    f"missing {self.KL_KEY}, keys={list(step_metric.keys())}"
+                )
+                kl = float(step_metric[self.KL_KEY])
+                assert np.isfinite(kl), f"{self.KL_KEY} not finite: {kl}"
+                assert abs(kl) < self.KL_ABS_TOL, (
+                    f"{self.KL_KEY}={kl} exceeds {self.KL_ABS_TOL} "
+                    f"(use_original_logprob={use_original_logprob}, temperature=0.5)"
+                )
+
+    @requires_sglang
+    async def test_use_original_logprob_true(self):
+        await self._run_one_step(True)
+
+    @requires_sglang
+    async def test_use_original_logprob_false(self):
+        await self._run_one_step(False)

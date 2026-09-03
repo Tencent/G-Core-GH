@@ -9,6 +9,7 @@ import torch.distributed
 from megatron.core import mpu
 
 from gpatch_v4.core.parallel_state import cpu_barrier, is_last_rank, is_mp_and_cp_head
+from gpatch_v4.core.ppo_feature_store import ppo_step_interval
 from gpatch_v4.core.smart_pad_helper import (
     DPBalanceHelper,
     smart_pad_train_get_reorder_rollout_batches,
@@ -33,6 +34,7 @@ from gpatch_v4.utils import (
     save_data,
     sync_cuda_and_get_time,
 )
+from gpatch_v4.utils.common_utils import compress_ppo_save_train_data
 
 from .grpo_train_actor import GrpoTrainActor
 from .mixin import OnloadManager
@@ -185,7 +187,7 @@ class GrpoAsyncTrainActor(GrpoTrainActor):
             rebalanced_batches, restore_info = DPBalanceHelper.rebalance_for_compute_log_probs(
                 rollout_batches,
                 samples_per_batch,
-                add_custom_keys=getattr(self.config.task, "add_custom_keys", None),
+                add_custom_keys=self.config.policy.dp_balance_extra_keys,
             )
             origin_rollout_batches = rollout_batches
             rollout_batches = rebalanced_batches
@@ -285,65 +287,94 @@ class GrpoAsyncTrainActor(GrpoTrainActor):
         training_config = self.config.training
 
         timers("process_rollout", log_level=0).start(barrier=True)
-        rollout_batches, metrics = self._process_rollout_from_ref(ppo_step, dp_refs)
-        cpu_barrier()
-        timers("process_rollout").stop()
-
-        rollout_gbs = training_config.rollout_gbs
-        keep_n = training_config.sampling_keep_n
-        rb_m = getattr(training_config, "rb_multiplier", 1)
-
-        expanded_rbs = expand_rollout_batches(rollout_batches)
-        total_samples = rollout_gbs * keep_n * rb_m
-        assert len(expanded_rbs) * mpu.get_data_parallel_world_size() == total_samples
-
-        if getattr(self.config.policy, 'balance_dp_seqlen', False):
-            expanded_rbs = DPBalanceHelper.rebalance_row_batches_for_train(
-                expanded_rbs,
-                add_custom_keys=getattr(self.config.task, "add_custom_keys", None),
-            )
-
-        if self.config.policy.smart_pad_train:
-            num_global_batch = rollout_gbs * keep_n * rb_m // training_config.train_gbs
-            expanded_rbs = smart_pad_train_get_reorder_rollout_batches(
-                expanded_rbs,
-                num_global_batch,
-                training_config.train_gbs // mpu.get_data_parallel_world_size(),
-                training_config.pad_to_mulitiple_of,
-                reorder_seed=ppo_step,
-            )
-
-        timers("train_step", log_level=0).start(barrier=True)
-        if self.require_critic_model():
-            logging_rank0("train value model")
-            with OnloadManager(self.critic_engine, True):
-                for _ in range(training_config.ppo_max_epochs_2):
-                    num_train_global_steps = rollout_gbs * keep_n * rb_m // training_config.train_gbs
-                    ppo_step_iters = get_iterator_k_split_list(expanded_rbs, num_train_global_steps)
-                    _metrics = self.critic_engine.rl_train_value(ppo_step_iters)
-                    extend_value_to_dict(metrics, _metrics)
-                lr = self.critic_engine.step_and_get_lr()
-                metrics["value/lr"] = lr
+        with ppo_step_interval(
+            ppo_step=ppo_step,
+            enabled=self.config.ppo.feature_store_enable,
+        ) as extra_iv:
+            rollout_batches, metrics = self._process_rollout_from_ref(ppo_step, dp_refs)
             cpu_barrier()
-            logging_rank0("train value model done")
+            timers("process_rollout").stop()
 
-        self.policy_engine.onload_optimizer()
-        logging_rank0("train policy model")
-        for _ in range(training_config.ppo_max_epochs_2):
-            if ppo_step >= self.get_critic_model_warmup_step():
-                num_train_global_steps = rollout_gbs * keep_n * rb_m // training_config.train_gbs
-                ppo_step_iters = get_iterator_k_split_list(expanded_rbs, num_train_global_steps)
-                _metrics = self.policy_engine.rl_train_actor(ppo_step_iters)
-                extend_value_to_dict(metrics, _metrics)
-        cpu_barrier()
-        logging_rank0("train policy model done")
-        timers("train_step").stop()
+            rollout_gbs = training_config.rollout_gbs
+            keep_n = training_config.sampling_keep_n
+            rb_m = getattr(training_config, "rb_multiplier", 1)
 
-        lr = self.policy_engine.step_and_get_lr()
-        metrics["policy/lr"] = lr
-        end_time = sync_cuda_and_get_time()
-        metrics["time_perf/total_time"] = end_time - begin_time
+            expanded_rbs = expand_rollout_batches(rollout_batches)
+            total_samples = rollout_gbs * keep_n * rb_m
+            assert len(expanded_rbs) * mpu.get_data_parallel_world_size() == total_samples
+
+            should_dump = training_config.ppo_dump_metrics_interval > 0 and (
+                ppo_step + 1
+            ) % training_config.ppo_dump_metrics_interval == 0
+
+            if getattr(self.config.policy, 'balance_dp_seqlen', False):
+                dp_balance_extra_keys = list(self.config.policy.dp_balance_extra_keys or [])
+                if should_dump:
+                    for k in ("rewards", "rewards_details", "gt_label"):
+                        if k in expanded_rbs[0] and k not in dp_balance_extra_keys:
+                            dp_balance_extra_keys.append(k)
+                expanded_rbs = DPBalanceHelper.rebalance_row_batches_for_train(
+                    expanded_rbs,
+                    add_custom_keys=dp_balance_extra_keys or None,
+                )
+
+            if self.config.policy.smart_pad_train:
+                num_global_batch = rollout_gbs * keep_n * rb_m // training_config.train_gbs
+                expanded_rbs = smart_pad_train_get_reorder_rollout_batches(
+                    expanded_rbs,
+                    num_global_batch,
+                    training_config.train_gbs // mpu.get_data_parallel_world_size(),
+                    training_config.pad_to_mulitiple_of,
+                    reorder_seed=ppo_step,
+                )
+
+            timers("train_step", log_level=0).start(barrier=True)
+            if self.require_critic_model():
+                logging_rank0("train value model")
+                with OnloadManager(self.critic_engine, True):
+                    for _ in range(training_config.ppo_max_epochs_2):
+                        num_train_global_steps = rollout_gbs * keep_n * rb_m // training_config.train_gbs
+                        ppo_step_iters = get_iterator_k_split_list(
+                            expanded_rbs, num_train_global_steps
+                        )
+                        _metrics = self.critic_engine.rl_train_value(ppo_step_iters)
+                        extend_value_to_dict(metrics, _metrics)
+                    lr = self.critic_engine.step_and_get_lr()
+                    metrics["value/lr"] = lr
+                cpu_barrier()
+                logging_rank0("train value model done")
+
+            # The policy model may still be offloaded here
+            self.policy_engine.onload_model()
+            self.policy_engine.onload_optimizer()
+            logging_rank0("train policy model")
+            for epoch_idx in range(training_config.ppo_max_epochs_2):
+                if ppo_step >= self.get_critic_model_warmup_step():
+                    num_train_global_steps = (
+                        rollout_gbs * keep_n * rb_m // training_config.train_gbs
+                    )
+                    ppo_step_iters = get_iterator_k_split_list(expanded_rbs, num_train_global_steps)
+                    self.policy_engine.should_dump_metrics = should_dump
+                    _metrics = self.policy_engine.rl_train_actor(ppo_step_iters)
+                    if should_dump:
+                        self._save_dumped_metrics(_metrics, expanded_rbs, ppo_step, epoch_idx)
+                    extend_value_to_dict(metrics, _metrics)
+            cpu_barrier()
+            logging_rank0("train policy model done")
+            timers("train_step").stop()
+
+            if should_dump and torch.distributed.get_rank() == 0:
+                self.compact_thread = compress_ppo_save_train_data(
+                    self.compact_thread, training_config.ppo_dump_metrics_dir
+                )
+
+            lr = self.policy_engine.step_and_get_lr()
+            metrics["policy/lr"] = lr
+            end_time = sync_cuda_and_get_time()
+            metrics["time_perf/total_time"] = end_time - begin_time
+
         output_metrics = reduce_metrics(metrics)
+        self.report_extra_metrics(output_metrics, extra_iv.final_values)
 
         time_log_keys = [
             "process_rollout",

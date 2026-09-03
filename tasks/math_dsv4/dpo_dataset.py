@@ -109,10 +109,13 @@ def dpo_collate_fn(examples):
 
     tokens_list = [torch.tensor(s["tokens"], dtype=torch.long) for s in all_samples]
     labels_list = [torch.tensor(s["labels"], dtype=torch.long) for s in all_samples]
+    pair_ids = [torch.tensor(i, dtype=torch.long) for i in range(len(examples))]
 
     return {
         "tokens": tokens_list,
         "labels": labels_list,
+        "dpo_pair_id": pair_ids + pair_ids,
+        "dpo_is_chosen": [True] * len(examples) + [False] * len(examples),
     }
 
 

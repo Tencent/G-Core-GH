@@ -75,7 +75,7 @@ def test_mbridge_save_hf_uses_existing_safetensor_io(tmp_path, monkeypatch):
     monkeypatch.setattr(checkpoint, "save_args_json", Mock())
     monkeypatch.setattr(checkpoint.torch.distributed, "get_rank", Mock(return_value=0))
 
-    checkpoint._mbridge_save_hf(config, 3, ["wrapped"], bridge)
+    checkpoint._mbridge_save_hf(config, 3, ["wrapped"], bridge, peft=None)
 
     bridge._get_safetensor_io.assert_not_called()
     bridge.save_weights.assert_called_once()

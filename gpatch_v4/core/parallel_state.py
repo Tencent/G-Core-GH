@@ -67,7 +67,19 @@ def set_random_seed(config, data_parallel_random_init: bool = False):
         tensor_parallel.model_parallel_cuda_manual_seed(seed)
 
 
-def _disable_flash_attn_3():
+def is_rtx_pro_5000() -> bool:
+    """Return True when GPU 0 is an NVIDIA RTX PRO 5000."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        name = torch.cuda.get_device_name(0)
+    except Exception:
+        return False
+    normalized = name.upper().replace("-", " ")
+    return "PRO 5000" in normalized or "PRO5000" in normalized
+
+
+def disable_flash_attn_3():
     """Disable Flash Attention 3 in TransformerEngine.
 
     FA3's deterministic backward is broken (dQ accumulation uses
@@ -97,6 +109,54 @@ def _disable_flash_attn_3():
         pass
 
 
+def disable_flash_attn_4():
+    """Disable Flash Attention 4 in TransformerEngine.
+
+    FA4 on RTX PRO 5000 (sm_120) is unstable for packed-THD vision
+    training (async CUDA IMA). Monkey-patch TE so FA4 is not selected
+    and TE falls back to FA2.
+
+    Must be called AFTER TE is imported, but BEFORE the first DPA forward.
+
+    注意：升级 TE 后，这里不一定能用
+    """
+    try:
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            FlashAttentionUtils,
+        )
+        was_installed = FlashAttentionUtils.v4_is_installed
+        FlashAttentionUtils.v4_is_installed = False
+        if was_installed:
+            logging.info(
+                "Disabled FA4 (v%s), falling back to FA2 (v%s)",
+                FlashAttentionUtils.fa4_version,
+                FlashAttentionUtils.version,
+            )
+    except ImportError:
+        pass
+
+
+def apply_flash_attn_disables(training) -> None:
+    """Apply ``training.disable_flash_attn_{3,4}`` to the local TE runtime.
+
+    RTX PRO 5000 forces ``disable_flash_attn_4=True`` even if the yaml
+    left it false.
+    """
+    if training is None:
+        return
+    # TODO(guanyouhe): 后续 fa4 支持 pro5000 后加上
+    if is_rtx_pro_5000() and not training.disable_flash_attn_4:
+        logging.info(
+            "RTX PRO 5000 detected (%s): set disable_flash_attn_4=True",
+            torch.cuda.get_device_name(0),
+        )
+        training.disable_flash_attn_4 = True
+    if training.disable_flash_attn_3:
+        disable_flash_attn_3()
+    if training.disable_flash_attn_4:
+        disable_flash_attn_4()
+
+
 def enable_deterministic_mode():
     """Enable deterministic mode for training.
 
@@ -105,11 +165,11 @@ def enable_deterministic_mode():
     ``enable_deterministic_mode_env()`` early (before
     ``torch.distributed.init_process_group``), then call this function
     afterward to set the remaining torch-level flags.
+
+    FA3/FA4 TE monkey-patches are applied separately via
+    ``apply_flash_attn_disables`` from ``training.disable_flash_attn_*``.
     """
     enable_deterministic_mode_env()
-
-    if os.environ.get("GPATCH_DISABLE_FA3") == "1":
-        _disable_flash_attn_3()
 
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.deterministic = True
@@ -188,6 +248,7 @@ def initlize_parallel_state(config, dist_config):
         set_random_seed(config, data_parallel_random_init=config.training.data_parallel_random_init)
         if config.training.apply_deterministic_mode:
             enable_deterministic_mode()
+        apply_flash_attn_disables(config.training)
     else:
         set_random_seed(config, False)
 

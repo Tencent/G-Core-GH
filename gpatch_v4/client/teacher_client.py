@@ -7,7 +7,7 @@ from typing_extensions import override
 from megatron.core import mpu
 
 from gpatch_v4.client.base_client import BaseClientAbc, TeacherClientMixin
-from gpatch_v4.configs.config import OnPolicyDistillConfig
+from gpatch_v4.configs.config import OffPolicyDistillConfig, OnPolicyDistillConfig
 from gpatch_v4.utils.common_utils import log, logging_rank0
 
 
@@ -30,18 +30,23 @@ def get_mp_cp_rank():
 
 
 class TeacherClient(BaseClientAbc, TeacherClientMixin):
-    """Client for communicating with a named teacher model.
+    """Client for communicating with a teacher model.
 
     Parameters
     ----------
-    config : OnPolicyDistillConfig
-    teacher_name : str
-        Name of the teacher. Corresponds to a key in ``config.teachers``
-        and the Ray actor group prefix ``teacher_{teacher_name}``.
+    config : OnPolicyDistillConfig or OffPolicyDistillConfig
+    teacher_name : str or None
+        Named teachers use the ``teacher_{teacher_name}`` Ray actor prefix;
+        the singular off-policy teacher uses ``teacher``.
     teacher_config : object
         The teacher's ``BasePolicyConfig`` (or dict equivalent).
     """
-    def __init__(self, config: OnPolicyDistillConfig, teacher_name: str, teacher_config):
+    def __init__(
+        self,
+        config: OnPolicyDistillConfig | OffPolicyDistillConfig,
+        teacher_name: str | None,
+        teacher_config,
+    ):
         self.config = config
         self.teacher_name = teacher_name
         policy_config = self.config.policy
@@ -54,7 +59,7 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
         self.dp_rank = mpu.get_data_parallel_rank()
         self.dp_size = mpu.get_data_parallel_world_size()
 
-        ray_actor_pname = f"teacher_{teacher_name}"
+        ray_actor_pname = ("teacher" if teacher_name is None else f"teacher_{teacher_name}")
 
         rpc_client = None
         svr_cluster = None
@@ -213,8 +218,10 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
         resp = await self.rpc_client.call(target_ep, "get_calc_logps_result", req_dict)
         return resp
 
-    async def issue_calc_logits(self, batched_data: Dict[str, List[Any]], ppo_step, sample_idx):
-        """Submit a logit computation request to the teacher.
+    async def issue_calc_hidden_states(
+        self, batched_data: Dict[str, List[Any]], ppo_step, sample_idx
+    ):
+        """Submit a hidden-state computation request to the teacher.
 
         Parameters
         ----------
@@ -236,12 +243,12 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
         for k in req_dict.keys():
             assert k not in batched_data
         req_dict.update(batched_data)
-        resp = await self.rpc_client.call(target_ep, "issue_calc_logits", req_dict)
+        resp = await self.rpc_client.call(target_ep, "issue_calc_hidden_states", req_dict)
         assert resp["ret"] is True
         return resp
 
-    async def get_calc_logits_result(self, ppo_step, sample_idx) -> Dict[str, Any]:
-        """Retrieve teacher logit results.
+    async def get_calc_hidden_states_result(self, ppo_step, sample_idx) -> Dict[str, Any]:
+        """Retrieve teacher hidden-state results.
 
         Parameters
         ----------
@@ -259,5 +266,5 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
             "sample_idx": sample_idx,
             "ppo_step": ppo_step,
         }
-        resp = await self.rpc_client.call(target_ep, "get_calc_logits_result", req_dict)
+        resp = await self.rpc_client.call(target_ep, "get_calc_hidden_states_result", req_dict)
         return resp

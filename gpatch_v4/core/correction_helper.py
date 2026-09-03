@@ -1,9 +1,9 @@
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
 from gpatch_v4.configs.config import RlConfig
-from gpatch_v4.utils import masked_mean, masked_statistic, masked_sum
+from gpatch_v4.utils import logging_rank0, masked_mean, masked_statistic, masked_sum
 
 
 def masked_sum_expand(x: torch.Tensor, mask: torch.Tensor, expand: bool = False) -> torch.Tensor:
@@ -16,19 +16,82 @@ def masked_mean_expand(x: torch.Tensor, mask: torch.Tensor, expand: bool = False
     return result.expand_as(x) if expand else result
 
 
+def masked_reduce_thd_expand(
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    local_cp_group: Optional[Any] = None,
+    reduction: str = "sum",
+) -> torch.Tensor:
+    """Reduce each packed THD segment and expand the result back to its tokens."""
+    local_cp_size = (
+        torch.distributed.get_world_size(local_cp_group) if local_cp_group is not None else 1
+    )
+    assert reduction in ("sum", "mean")
+    assert cu_seqlens_padded.numel() >= 2
+    assert torch.all(cu_seqlens_padded % local_cp_size == 0
+                    ), ("Every THD boundary must be divisible by local_cp_size")
+
+    x_flat = torch.where(mask.bool(), x, 0).reshape(-1)
+    mask_flat = mask.reshape(-1)
+    cu_for_values = cu_seqlens_padded // local_cp_size
+    assert int(cu_for_values[0].item()) == 0
+    assert int(cu_for_values[-1].item()) == x_flat.numel(), (
+        f"THD boundary {int(cu_for_values[-1].item())} does not match "
+        f"the local tensor length {x_flat.numel()}"
+    )
+
+    segment_sums = []
+    segment_counts = []
+    for start, end in zip(cu_for_values[:-1], cu_for_values[1:]):
+        start_idx = int(start.item())
+        end_idx = int(end.item())
+        segment_sums.append(x_flat[start_idx:end_idx].sum())
+        segment_counts.append(mask_flat[start_idx:end_idx].sum())
+
+    segment_sums = torch.stack(segment_sums)
+    segment_counts = torch.stack(segment_counts)
+    if local_cp_group is not None and local_cp_size > 1:
+        reduced = torch.stack((segment_sums, segment_counts))
+        torch.distributed.all_reduce(
+            reduced, group=local_cp_group, op=torch.distributed.ReduceOp.SUM
+        )
+        segment_sums, segment_counts = reduced[0], reduced[1]
+
+    segment_values = (
+        segment_sums / segment_counts.clamp_min(1) if reduction == "mean" else segment_sums
+    )
+    result = torch.empty_like(x_flat)
+    for idx, (start, end) in enumerate(zip(cu_for_values[:-1], cu_for_values[1:])):
+        result[int(start.item()):int(end.item())] = segment_values[idx]
+    return result.reshape_as(x)
+
+
 def calculate_veto_mask(
     log_ratio: torch.Tensor,
     mask: torch.Tensor,
     veto_threshold: Optional[float],
     metrics: Dict[str, list[torch.Tensor]],
+    cu_seqlens_padded: Optional[torch.Tensor] = None,
+    local_cp_group: Optional[Any] = None,
 ) -> torch.Tensor:
     if veto_threshold is None:
         return torch.ones_like(log_ratio)
     log_veto_threshold = torch.log(torch.tensor(veto_threshold, device=log_ratio.device))
     # For each sequence, if it has any catastrophic tokens, return 0 for the sequence
     catastrophic_tokens = ((log_ratio < log_veto_threshold)) & mask.bool()
-    has_catastrophic = catastrophic_tokens.any(dim=-1, keepdim=True)
-    veto_mask = (~has_catastrophic).float().expand_as(log_ratio)
+    if cu_seqlens_padded is None:
+        has_catastrophic = catastrophic_tokens.any(dim=-1, keepdim=True)
+        veto_mask = (~has_catastrophic).float().expand_as(log_ratio)
+    else:
+        catastrophic_count = masked_reduce_thd_expand(
+            catastrophic_tokens.float(),
+            mask,
+            cu_seqlens_padded,
+            local_cp_group,
+            reduction="sum",
+        )
+        veto_mask = (catastrophic_count == 0).float()
 
     metrics["catastrophic_fraction"] = (catastrophic_tokens * mask
                                        ).sum().float() / torch.clamp_min(mask.sum().float(), 1)
@@ -178,6 +241,8 @@ def compute_off_policy_correction_weights(
     prev_log_probs: torch.Tensor,
     rollout_log_probs: torch.Tensor,
     mask: torch.Tensor,
+    cu_seqlens_padded: Optional[torch.Tensor] = None,
+    local_cp_group: Optional[Any] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Compute the importance sampling (IS) weights and metrics between the inference and training engine.
@@ -194,6 +259,9 @@ def compute_off_policy_correction_weights(
         mask: masks. 1D tensor each.
             Note that for single turn RL, the mask is [1] * response_length tensor for each sequence
             For multi-turn RL, the tool response will be marked as 0 in the mask.
+        cu_seqlens_padded: sample boundaries for packed THD inputs.
+        local_cp_group: dynamic context-parallel communication group. When set,
+            per-sequence sums/counts are reduced across this group.
 
     Returns:
         weights: importance sampling weights (safety-bounded; zeroed at padding only). 1D tensor each.
@@ -234,10 +302,35 @@ def compute_off_policy_correction_weights(
         log_ratio_for_metrics = raw_log_ratio_diff
     elif level == "sequence":
         # Product of ratios (unbiased but high variance)
-        log_ratio_for_metrics = masked_sum_expand(raw_log_ratio_diff, mask, expand=True)
+        if cu_seqlens_padded is None:
+            # debug， 后面删除
+            logging_rank0(
+                f"[dyn_cp_tis] sequence masked_sum_expand "
+                f"prev={tuple(prev_log_probs.shape)} "
+                f"rollout={tuple(rollout_log_probs.shape)} "
+                f"mask={tuple(mask.shape)} cu_seqlens=None"
+            )
+            log_ratio_for_metrics = masked_sum_expand(raw_log_ratio_diff, mask, expand=True)
+        else:
+            log_ratio_for_metrics = masked_reduce_thd_expand(
+                raw_log_ratio_diff,
+                mask,
+                cu_seqlens_padded,
+                local_cp_group,
+                reduction="sum",
+            )
     elif level == "geometric":
         # Geometric mean of ratios (biased but low variance)
-        log_ratio_for_metrics = masked_mean_expand(raw_log_ratio_diff, mask, expand=True)
+        if cu_seqlens_padded is None:
+            log_ratio_for_metrics = masked_mean_expand(raw_log_ratio_diff, mask, expand=True)
+        else:
+            log_ratio_for_metrics = masked_reduce_thd_expand(
+                raw_log_ratio_diff,
+                mask,
+                cu_seqlens_padded,
+                local_cp_group,
+                reduction="mean",
+            )
     else:
         raise ValueError(f"Invalid importance sampling level: {level}")
 
@@ -312,6 +405,8 @@ def compute_off_policy_correction_weights(
             mask,
             config.ppo.off_policy_correction_veto_threshold,
             metrics,
+            cu_seqlens_padded,
+            local_cp_group,
         )
         modified_mask = modified_mask * veto_mask
 

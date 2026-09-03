@@ -29,8 +29,8 @@ from gpatch_v4.orches.placement_group import _create_placement_group
 
 HF_MODEL_PATH = "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
 WORLD_SIZE = 32
-EP_SIZE = 8
-CP_SIZE = 8
+EP_SIZE = 16
+CP_SIZE = 16
 SEQ_LEN = 256 * 1024
 PAD_TO_MULTIPLE_OF = 128
 WARMUP_STEPS = 2
@@ -117,7 +117,6 @@ def _profile_forward_worker(
             label_ignore_index=-100,
         )
 
-        # TODO enable deepEP
         model = _build_model(hf_model_path)
         model = apply_hp(
             model,
@@ -126,7 +125,7 @@ def _profile_forward_worker(
             amp_fp32=False,
             attn_backend="fused",
             indexer_backend="fused",
-            ep_backend="deepep",
+            ep_backend="eager",
             fp8=False,
             moe_router_force_load_balancing=True,
         )

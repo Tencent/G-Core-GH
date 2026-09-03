@@ -102,6 +102,14 @@ class DistillStudentActor(GrpoTrainActor):
             self.bt_rm_client,
             **extra_kwargs,
         )
+        self.eval_rollout_generator = RolloutGeneratorFactory.get_rollout_generator(
+            self.config,
+            self.sampler_client,
+            self.gen_rm_client,
+            self.bt_rm_client,
+            run_eval=True,
+            **extra_kwargs,
+        )
 
     @override
     async def _compute_log_probs(
@@ -123,7 +131,7 @@ class DistillStudentActor(GrpoTrainActor):
             rebalanced_batches, restore_info = DPBalanceHelper.rebalance_for_compute_log_probs(
                 rollout_batches,
                 samples_per_batch,
-                add_custom_keys=getattr(self.config.task, "add_custom_keys", None),
+                add_custom_keys=self.config.policy.dp_balance_extra_keys,
             )
             origin_rollout_batches = rollout_batches
             rollout_batches = rebalanced_batches
@@ -439,7 +447,7 @@ class DistillStudentActor(GrpoTrainActor):
         if getattr(self.config.policy, 'balance_dp_seqlen', False):
             expanded_rbs = DPBalanceHelper.rebalance_row_batches_for_train(
                 expanded_rbs,
-                add_custom_keys=getattr(self.config.task, "add_custom_keys", None),
+                add_custom_keys=self.config.policy.dp_balance_extra_keys,
             )
 
         # ---- smart_pad_train: sort samples by seqlen for efficient padding ----

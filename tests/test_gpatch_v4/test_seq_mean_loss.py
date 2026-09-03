@@ -5,13 +5,16 @@
 - 死样本（sample_mask=0）不计入分子；
 - 与 token-weighted mean 在序列长度不等时确有区别。
 
-同时验证 ``masked_sum_and_count_per_sample_or_token``（返回 3 对值）：
+同时验证 legacy ``masked_sum_and_count_per_sample_or_token``（返回 3 对值）：
 1. 无梯度 token-sum / token-count
 2. 无梯度 sample-sum / sample-count
 3. 有梯度 bwd-sum / bwd-count（由 calculate_per_token_loss 选择）
+
+New-loss ``agg`` is ``[B, S]`` only and is covered lightly below.
 """
 import torch
 
+from gpatch_v4.training_backend.loss.utils import agg
 from gpatch_v4.training_backend.loss_factory import (
     _thd_cu_seqlens_for_values,
     _thd_per_sample_sum_and_count_local,
@@ -49,6 +52,24 @@ def _seq_mean(values, mask, sample_mask=None):
     return s / n
 
 
+class TestNewLossAggRejectsThd:
+    def test_agg_rejects_cu_seqlens(self):
+        values = torch.randn(2, 4)
+        mask = torch.ones(2, 4)
+        try:
+            agg(values, mask, cu_seqlens_padded=torch.tensor([0, 4, 8]))
+            raise AssertionError("expected assert")
+        except AssertionError as exc:
+            assert "response-padded" in str(exc)
+
+    def test_agg_bshd_per_token(self):
+        values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        mask = torch.tensor([[1.0, 0.0], [1.0, 1.0]])
+        bwd_sum, bwd_count = agg(values, mask, calculate_per_token_loss=True)
+        assert torch.allclose(bwd_sum, torch.tensor(8.0))
+        assert torch.allclose(bwd_count, torch.tensor(3.0))
+
+
 def _unpack_bwd(result):
     """取第 3 对（有梯度的 bwd sum/count）。"""
     return result[4], result[5]
@@ -63,6 +84,15 @@ def _unpack_sample_det(result):
 
 
 class TestPartitionInvariance:
+    def test_nan_mask_entries_are_excluded(self):
+        values = torch.tensor([[2.0, 100.0, 4.0], [10.0, 20.0, 30.0]])
+        mask = torch.tensor([[1.0, float("nan"), 1.0], [float("nan"), 0.0, 1.0]])
+
+        result = masked_sum_per_seq(values, mask)
+
+        # (2 + 4) / 2 + 30 / 1
+        assert torch.allclose(result, torch.tensor(33.0))
+
     def test_sum_invariant_to_microbatch_split(self):
         # 把 8 条序列任意切成多个 mb，各 mb 的 S_b 求和应等于整批 S。
         torch.manual_seed(0)

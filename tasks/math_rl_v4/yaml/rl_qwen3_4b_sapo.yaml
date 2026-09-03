@@ -1,7 +1,7 @@
 # @package _global_
 _target_: gpatch_v4.configs.config.RlConfig
 
-# Qwen3-4B-Base (dense) | SAPO | sglang rollout + mcore training | DAPO-Math-17k
+# Qwen3-8B-Base-Base (dense) | SAPO | sglang rollout + mcore training | DAPO-Math-17k
 # 对齐 verl examples/sapo_trainer/run_qwen3_8b_fsdp.sh：
 #   - batch：train_batch_size=256 prompts × rollout.n=16 = 4096 样本，
 #     ppo_mini_batch_size=64 prompts × 16 = 1024/step -> 每 rollout 4 个 off-policy step。
@@ -25,7 +25,7 @@ training:
   train_gbs: 256
   train_mbs: 1
   data_parallel_random_init: False
-  save_interval: 10
+  save_interval: 100
   eval_interval: 10
   eval_before_train: True
   build_from_mbridge: True
@@ -36,12 +36,12 @@ training:
     - "acc_reward"
     - "fmt_reward"
     - "overlong_penalty"
-  eval_rollout_gbs: 16
+  eval_rollout_gbs: 128
   eval_rollout_mbs: 1
 
 checkpoint:
-  load_ckpt_path: ckpt_qwen3_4b_sapo
-  save_ckpt_path: ckpt_qwen3_4b_sapo
+  load_ckpt_path: ckpt_qwen3_8b_sapo
+  save_ckpt_path: ckpt_qwen3_8b_sapo
   convert_mcore_to_hf_online: True
   mbridge_distributed_filesystem: True
 
@@ -58,7 +58,7 @@ data:
   data_pathes:
     - "hf-hub/zhuzilin/dapo-math-17k"
   eval_data_pathes:
-    - "local/local_aime"
+    - "hf-hub/aime-2024_bigger/"
   py_path: "tasks/math_rl_v4/dapo_dataset.py"
   fn_name: "get_dataset_and_dataloader"
   system_prompt: "Please reason step by step, keep your reasoning as short as possible, overlong response will be penalized, and put your final answer within \\boxed{}."
@@ -71,9 +71,9 @@ policy:
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 1
   model_arch: "qwen3"
-  hf_model_path: "/mnt/ceph-hz1-csp/mm-base-plt2/user_yeazhao/ckpt/Qwen3-4B"
-  hf_tokenizer_path: "/mnt/ceph-hz1-csp/mm-base-plt2/user_yeazhao/ckpt/Qwen3-4B"
-  ref_hf_model_path: "/mnt/ceph-hz1-csp/mm-base-plt2/user_yeazhao/ckpt/Qwen3-4B"
+  hf_model_path: "hf-hub/Qwen/Qwen3-8B-Base"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen3-8B-Base"
+  ref_hf_model_path: "hf-hub/Qwen/Qwen3-8B-Base"
   sampler_client:
     rpc_type: ray
     update_weight_max_size_mb: 512
@@ -84,10 +84,6 @@ policy:
   balance_dp_seqlen: True
   smart_pad_infer: True
   smart_pad_train: True
-  override_transformer_config:
-    recompute_granularity: full
-    recompute_method: uniform
-    recompute_num_layers: 1
 
 sampler:
   backend: sglang
@@ -95,14 +91,14 @@ sampler:
     nnodes: -1
   model_info:
     - model_arch: "qwen3"
-      hf_model_path: "/mnt/ceph-hz1-csp/mm-base-plt2/user_yeazhao/ckpt/Qwen3-4B"
+      hf_model_path: "hf-hub/Qwen/Qwen3-8B-Base"
   infer_engine_configs:
     - dist_config:
         nnodes: -1
         tensor_model_parallel_size: 2
       use_fast_tokenizer: True
       gpu_memory_utilization: 0.7
-      max_running_requests: 64
+      max_running_requests: 128
       temperature: 1.0
       top_p: 1.0
       generate_max_tokens: 8192
@@ -113,7 +109,7 @@ bt_rm:
   reward_type: "rule_only"
   reward_model_info:
     - model_arch: "qwen3"
-      hf_model_path: "/mnt/ceph-hz1-csp/mm-base-plt2/user_yeazhao/ckpt/Qwen3-4B"
+      hf_model_path: "hf-hub/Qwen/Qwen3-8B-Base"
       reward_py_path: tasks/math_rl_v4/bt_reward_sapo.py
       parse_reward_fn_name: acc_only_rule_reward
       reward_weight: 1.0

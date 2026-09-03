@@ -1,12 +1,14 @@
 """Action parsing for FrozenLake / Sokoban agentic envs (ported from roll_webshop)."""
 import re
 
+from gpatch_v4.utils import log
+
 
 def default_parser_action_func(text, action_pattern, action_lookup, special_token_list):
     if special_token_list is not None:
         for special_token in special_token_list:
             text = text.replace(special_token, "").strip()
-    # print(f"parsing action: {text}", flush=True)
+    log(f"parsing action: {text}")
     action = None
     match = re.search(action_pattern, text, re.DOTALL)
     if not match:

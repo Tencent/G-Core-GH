@@ -1,0 +1,69 @@
+# @package _global_
+
+training:
+  training_backend: fsdp2
+  use_fast_tokenizer: True
+  train_gbs: 32
+  train_mbs: 1
+  seq_length: 4096
+  data_parallel_random_init: False
+  save_interval: 999999
+  num_train_epoches: 1
+  comput_attn_mask: False
+  sort_batched: False
+  auto_load_from_save_ckpt: False
+  exit_step: 1
+  recompute: True
+  enable_mtp: False
+  enable_dspark: True
+  online_train_dspark: True
+  dspark_num_anchors: 2
+  freeze_router_correction_bias: True
+
+policy:
+  dist_config:
+    nnodes: 4
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 4
+    context_parallel_size: 1
+  model_arch: "deepseek_v4"
+  ppo_pack_seq: True
+  attn_implementation: "fused"
+  indexer_backend: "fused"
+  fp8: False
+  without_ref: True
+  hf_model_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash-0731"
+  hf_tokenizer_path: "hf-hub/deepseek-ai/DeepSeek-V4-Flash-0731"
+
+checkpoint:
+  load_ckpt_path: unittest_dsv4_sft_dspark_0731
+  save_ckpt_path: unittest_dsv4_sft_dspark_0731
+  convert_mcore_to_hf_online: False
+  mbridge_distributed_filesystem: True
+  override_tokenizer_special_token:
+    eos_token: "<｜end▁of▁sentence｜>"
+
+optimizer:
+  lr: 1.0e-5
+  lr_warmup_steps: 0
+  lr_decay_style: "cosine"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+data:
+  data_pathes:
+    - "hf-hub/AI-MO/NuminaMath-CoT-jsonl/train/"
+  py_path: "tasks/math_dsv4/finetune_dataset.py"
+  fn_name: "get_dataset_and_dataloader"
+  system_prompt: "Please reason step by step, keep your reasoning as short as possible, and put your final answer within \\boxed{}."
+  dataloader_num_workers: 1
+  dataloader_pin_memory: True
+
+debug:
+  save_first_rollout_data: False
+  debug_truncate_num_hidden_layers: 8
+  disable_save_checkpoint: True
+  trainer_return_ppo_step_metrics: True

@@ -20,7 +20,7 @@ from transformers import AutoTokenizer
 from gpatch_v4.configs.config import FinetuneConfig
 from gpatch_v4.utils.resumable_distributed_sampler import ResumableDistributedSampler
 
-from tasks.math_dsv4.encoding.encoding_dsv4 import (
+from gpatch_v4.models.deepseek_v4.encoding_dsv4 import (
     bos_token,
     encode_messages,
     merge_tool_messages,
@@ -221,7 +221,7 @@ def _encode_prefix(
         return bos_token  # ``add_default_bos_token=True`` always emits BOS.
     prefix = bos_token
     for i in range(upto):
-        from tasks.math_dsv4.encoding.encoding_dsv4 import render_message  # local import: cheap
+        from gpatch_v4.models.deepseek_v4.encoding_dsv4 import render_message
         prefix += render_message(
             i,
             norm_messages,
@@ -364,9 +364,17 @@ def dpo_collate_fn(examples):
     tokens_list = [torch.tensor(s["tokens"], dtype=torch.long) for s in all_samples]
     labels_list = [torch.tensor(s["labels"], dtype=torch.long) for s in all_samples]
 
+    seq_length_list = [torch.tensor(s["seq_length"], dtype=torch.long) for s in all_samples]
+    prompt_len_list = [torch.tensor(s["prompt_len"], dtype=torch.long) for s in all_samples]
+    pair_ids = [torch.tensor(i, dtype=torch.long) for i in range(len(examples))]
+
     return {
         "tokens": tokens_list,
         "labels": labels_list,
+        "sequence_lengths": seq_length_list,
+        "prompt_lengths": prompt_len_list,
+        "dpo_pair_id": pair_ids + pair_ids,
+        "dpo_is_chosen": [True] * len(examples) + [False] * len(examples),
     }
 
 

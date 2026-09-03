@@ -40,6 +40,7 @@ def _calc_grpo_advantages_func(
     grpo_sampling_times=1,
     grpo_advantage_epsilon=1e-6,
     sample_mask: List[torch.Tensor] = None,
+    norm_adv_by_std_in_grpo: bool = True,
     **kwargs,
 ):
     """Compute GRPO group-normalized advantages from scalar rewards.
@@ -52,6 +53,9 @@ def _calc_grpo_advantages_func(
     grpo_advantage_epsilon : float, optional
     sample_mask : list of torch.Tensor, optional
         Per-sample validity mask (0 or 1). 0 means invalid, 1 means valid.
+    norm_adv_by_std_in_grpo : bool, optional
+        If True, divide by group std (original GRPO). If False, only center
+        by group mean (Dr.GRPO / verl ``norm_adv_by_std_in_grpo=False``).
 
     Returns
     """
@@ -85,7 +89,9 @@ def _calc_grpo_advantages_func(
         std_grouped_rewards = scores.view(-1, grpo_sampling_times).std(dim=1)
     mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(grpo_sampling_times, dim=0)
     std_grouped_rewards = std_grouped_rewards.repeat_interleave(grpo_sampling_times, dim=0)
-    advantages = (scores - mean_grouped_rewards) / (std_grouped_rewards + grpo_advantage_epsilon)
+    advantages = scores - mean_grouped_rewards
+    if norm_adv_by_std_in_grpo:
+        advantages = advantages / (std_grouped_rewards + grpo_advantage_epsilon)
     return advantages
 
 
@@ -94,6 +100,7 @@ def calculate_grpo_advantages(
     mask: List[torch.Tensor],
     grpo_sampling_times=1,
     grpo_advantage_epsilon=1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
     **kwargs,
 ):
     """Compute GRPO group-normalized advantages from scalar rewards.
@@ -104,6 +111,8 @@ def calculate_grpo_advantages(
     mask : list of torch.Tensor
     grpo_sampling_times : int, optional
     grpo_advantage_epsilon : float, optional
+    norm_adv_by_std_in_grpo : bool, optional
+        See ``_calc_grpo_advantages_func``.
 
     Returns
     -------
@@ -111,7 +120,12 @@ def calculate_grpo_advantages(
         ``(advantages, returns)``.
     """
     advantages = _calc_grpo_advantages_func(
-        rewards, mask, grpo_sampling_times, grpo_advantage_epsilon, **kwargs
+        rewards,
+        mask,
+        grpo_sampling_times,
+        grpo_advantage_epsilon,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        **kwargs,
     )
     advantages_mask = []
     for advantage, m in zip(advantages.chunk(len(rewards)), mask):

@@ -211,5 +211,52 @@ class TestTileKernelsPerBlockCast(unittest.TestCase):
                 print(f"  shape ({m}, {n}): PASS")
 
 
+class TestTileKernelsVsEagerFp8Block(unittest.TestCase):
+    """tile_kernels.per_block_cast(round_sf=True) vs quant_fp8_e4m3_scale_e8m0。"""
+
+    device = "cuda"
+
+    def test_pow2_block_vs_eager_e8m0(self):
+        from tile_kernels.quant import per_block_cast
+
+        from gpatch_v4.kernel.quantize.eager_quant_kernels import (
+            quant_fp8_e4m3_scale_e8m0,
+        )
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 512, device=self.device, dtype=torch.float32)
+        q_tk, s_tk = per_block_cast(x.contiguous(), "e4m3", (128, 128), round_sf=True)
+        q_eager, s_eager = quant_fp8_e4m3_scale_e8m0(x, block_size=(128, 128))
+
+        scale_rel = (s_tk - s_eager.float()).abs().max() / s_eager.float().abs().max()
+        mismatch = (q_tk.view(torch.int8) != q_eager.view(torch.int8)).float().mean()
+        # tile vs eager: scale_rel=0.0000e+00, fp8_mismatch=0.0000e+00, s_tk.dtype=torch.float32, s_eager.dtype=torch.float8_e8m0fnu
+        print(
+            f"  tile vs eager: scale_rel={scale_rel.item():.4e}, "
+            f"fp8_mismatch={mismatch.item():.4e}, "
+            f"s_tk.dtype={s_tk.dtype}, s_eager.dtype={s_eager.dtype}"
+        )
+        self.assertLess(scale_rel.item(), 1e-6)
+        self.assertLess(mismatch.item(), 0.02)
+
+    def test_zero_block_scale_differs(self):
+        """文档化已知差异：全零 block 上 tile_kernels clamp_min=1e-4 ≠ eager scale=1。"""
+        from tile_kernels.quant import per_block_cast
+
+        from gpatch_v4.kernel.quantize.eager_quant_kernels import (
+            quant_fp8_e4m3_scale_e8m0,
+        )
+
+        x = torch.zeros(128, 128, device=self.device, dtype=torch.float32)
+        _, s_tk = per_block_cast(x.contiguous(), "e4m3", (128, 128), round_sf=True)
+        _, s_eager = quant_fp8_e4m3_scale_e8m0(x, block_size=(128, 128))
+        # tests/test_gfused/test_deepseek_tilekernels_quant.py::TestTileKernelsVsEagerFp8Block::test_zero_block_scale_differs   zero-block: s_tk=2.38419e-07, s_eager=1
+        print(
+            f"  zero-block: s_tk={s_tk.item():.6g}, "
+            f"s_eager={s_eager.float().item():.6g}"
+        )
+        self.assertNotEqual(s_tk.item(), s_eager.float().item())
+
+
 if __name__ == "__main__":
     unittest.main()

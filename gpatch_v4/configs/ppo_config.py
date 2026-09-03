@@ -15,10 +15,11 @@ class PpoConfig(MappingProtocol):
         ``"gdpo_sample_bn"`` / ``"custom"``.
     loss_func : str
         ``"grpo"`` / ``"steer"`` / ``"gspo"`` / ``"fipo"`` / ``"sapo"`` /
-        ``"cispo"``.
+        ``"cispo"`` / ``"vespo"``.
     use_legacy_loss : bool
         If True (default), use ``loss_factory`` policy losses. If False, use
-        ``gpatch_v4.training_backend.loss`` (grpo/steer/cispo/gspo/sapo only).
+        ``gpatch_v4.training_backend.loss`` (grpo/steer/cispo/gspo/sapo/vespo
+        only). ``"vespo"`` exists only on the non-legacy path.
     ppo_value_truncate_head : bool
         When aligning full-token values or per-token rewards to next-token
         log probabilities, truncate the first entry instead of the last.
@@ -100,11 +101,28 @@ class PpoConfig(MappingProtocol):
     sapo_tau_neg : float
         SAPO soft-gate temperature for negative-advantage tokens (``> τ_pos``
         recommended). See `arXiv:2511.20347 <https://arxiv.org/pdf/2511.20347>`_.
+    vespo_c1_pos : float
+        VESPO kernel exponent ``c1`` for ``A >= 0`` sequences; damps ``W < 1``.
+        ``>= 1`` keeps the variance bound non-trivial.
+    vespo_c2_pos : float
+        VESPO kernel decay ``c2`` for ``A >= 0`` sequences; damps ``W > 1``.
+    vespo_c1_neg : float
+        VESPO kernel exponent ``c1`` for ``A < 0`` sequences.
+    vespo_c2_neg : float
+        VESPO kernel decay ``c2`` for ``A < 0`` sequences.
+    use_original_logprob : bool
+        If True (default), sampler returns pre-temperature (raw) logprobs and
+        actor/ref recompute with temperature=1.0. If False, sampler returns
+        post-temperature / processed logprobs (verl default) and actor/ref
+        recompute with ``generate_params.temperature`` so IS ratios are on
+        the same scale. SGLang: ``SGLANG_RETURN_ORIGINAL_LOGPROB``. vLLM:
+        ``logprobs_mode=raw_logprobs`` vs ``processed_logprobs``.
     """
     advantage_type: str = field(default="grpo", metadata={"help": "Whether to use advantage."})
     # use_grpo: bool = field(default=True, metadata={"help": "Whether to use grpo."})
     loss_func: str = field(
-        default="grpo", metadata={"help": "Loss function. [grpo, steer, gspo, fipo, sapo, cispo]"}
+        default="grpo",
+        metadata={"help": "Loss function. [grpo, steer, gspo, fipo, sapo, cispo, vespo]"}
     )
     use_legacy_loss: bool = field(
         default=True,
@@ -122,7 +140,12 @@ class PpoConfig(MappingProtocol):
     )
     custom_advantage_py_path: Optional[str] = field(
         default=None,
-        metadata={"help": "Absolute path to a .py file containing a custom advantage function."},
+        metadata={
+            "help":
+                "Path to a custom advantage function. Legacy actor: "
+                "(AdvantageContext) -> AdvantageResult. dynamic_batch_train: "
+                "(config, samples) -> (advantages, returns, init_policy_kl)."
+        },
     )
     custom_advantage_py_name: Optional[str] = field(
         default=None,
@@ -136,6 +159,18 @@ class PpoConfig(MappingProtocol):
             "help":
                 "Name of the post-advantage function to import from custom_post_advantage_py_path."
         },
+    )
+    custom_reward_normalize_py_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help":
+                "Path to a dynamic-batch Controller module for custom reward "
+                "normalization: (config, samples) -> metrics."
+        },
+    )
+    custom_reward_normalize_py_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Function name to import from custom_reward_normalize_py_path."},
     )
 
     ppo_value_truncate_head: bool = field(
@@ -152,6 +187,38 @@ class PpoConfig(MappingProtocol):
     )
     ppo_gae_lambda: float = field(default=0.95, metadata={"help": "Ppo gae lambda."})
     ppo_entropy_bonus: float = field(default=0.0, metadata={"help": "Ppo entropy bonus."})
+    use_adaptive_entropy: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "TRL-style adaptive entropy control (Skywork-OR1). When True, "
+                "ppo_entropy_bonus is the initial coefficient; after each train "
+                "step the coefficient and last_world_entropy are stored in "
+                "PpoFeatureStore via set/get. Requires feature_store_enable=True."
+        },
+    )
+    entropy_target: float = field(
+        default=0.2,
+        metadata={
+            "help":
+                "Target mean per-token entropy (nats) for adaptive entropy. "
+                "Bonus is applied only when last_world_entropy <= this value. "
+                "Default 0.2 matches TRL and only engages near collapse; tune "
+                "to early-training entropy for normal runs."
+        },
+    )
+    entropy_coef_delta: float = field(
+        default=0.005,
+        metadata={"help": "Adaptive entropy coefficient step size per train step."},
+    )
+    entropy_coef_min: float = field(
+        default=0.0,
+        metadata={"help": "Lower bound for adaptive entropy_coef."},
+    )
+    entropy_coef_max: float = field(
+        default=1.0,
+        metadata={"help": "Upper bound for adaptive entropy_coef."},
+    )
     steer_token_weight_min: float = field(
         default=0.8,
         metadata={
@@ -224,6 +291,15 @@ class PpoConfig(MappingProtocol):
     )
 
     grpo_kl_loss_beta: float = field(default=1e-3, metadata={"help": "Grpo kl loss beta."})
+    norm_adv_by_std_in_grpo: bool = field(
+        default=True,
+        metadata={
+            "help":
+                "If True (default, original GRPO), divide group-centered advantages by "
+                "group std. If False (Dr.GRPO / verl default for AudioRL), only subtract "
+                "the group mean."
+        },
+    )
     # Importance Sampling
     enable_off_policy_correction: bool = False
     # Aggregation level for importance sampling weights:
@@ -325,6 +401,25 @@ class PpoConfig(MappingProtocol):
         },
     )
 
+    # VESPO (Variational sEquence-level Soft Policy Optimization) configuration
+    # ref: https://arxiv.org/abs/2602.10693
+    vespo_c1_pos: float = field(
+        default=2.0,
+        metadata={"help": "VESPO kernel exponent c1 for positive-advantage sequences."},
+    )
+    vespo_c2_pos: float = field(
+        default=3.0,
+        metadata={"help": "VESPO kernel decay c2 for positive-advantage sequences."},
+    )
+    vespo_c1_neg: float = field(
+        default=3.0,
+        metadata={"help": "VESPO kernel exponent c1 for negative-advantage sequences."},
+    )
+    vespo_c2_neg: float = field(
+        default=2.0,
+        metadata={"help": "VESPO kernel decay c2 for negative-advantage sequences."},
+    )
+
     gdpo_reward_weights: dict[str, Any] = field(default_factory=dict)
 
     skip_prev_logps: bool = field(
@@ -337,6 +432,46 @@ class PpoConfig(MappingProtocol):
                 "condition: train_gbs == rollout_gbs * sampling_keep_n and "
                 "ppo_max_epochs_2 == 1."
         },
+    )
+    use_original_logprob: bool = field(
+        default=True,
+        metadata={
+            "help":
+                "If True (default), sampler returns pre-temperature (raw) logprobs "
+                "and actor/ref recompute with temperature=1.0. If False, sampler "
+                "returns post-temperature / processed logprobs (verl default) and "
+                "actor/ref recompute with generate_params.temperature so IS ratios "
+                "are on the same scale. SGLang: SGLANG_RETURN_ORIGINAL_LOGPROB; "
+                "vLLM: logprobs_mode raw_logprobs vs processed_logprobs."
+        },
+    )
+
+    # When True, GRPO actors init PpoFeatureStore and run ppo_step_interval finalize.
+    feature_store_enable: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "Enable process-local PpoFeatureStore (interval finalize, sidecar save/load, "
+                "extra/* metrics). Custom loss/advantage that call get_ppo_feature_store() "
+                "require this to be True."
+        },
+    )
+    post_compute_logprobs: str = field(
+        default="none",
+        metadata={
+            "help":
+                "Named hook after compute_logprobs writes prev/ref logprobs into rollout "
+                "batches. Builtin: 'none' (no-op). Custom names require "
+                "post_compute_logprobs_py_path / post_compute_logprobs_py_name."
+        },
+    )
+    post_compute_logprobs_py_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Absolute path to a .py file for a custom post_compute_logprobs hook."},
+    )
+    post_compute_logprobs_py_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Callable name to import from post_compute_logprobs_py_path."},
     )
 
     def __post_init__(self):
@@ -354,10 +489,57 @@ class PpoConfig(MappingProtocol):
             "identity",
         }
         if self.advantage_type not in builtin_types:
-            assert self.custom_advantage_py_path is not None and self.custom_advantage_py_name is not None, (
+            assert (
+                self.custom_advantage_py_path is not None and
+                self.custom_advantage_py_name is not None
+            ), (
                 f"Non-builtin advantage_type '{self.advantage_type}' requires "
-                f"custom_advantage_py_path and custom_advantage_py_name to be set."
+                "custom_advantage_py_path and custom_advantage_py_name."
             )
+        if self.custom_reward_normalize_py_path is not None:
+            assert self.custom_reward_normalize_py_name is not None, (
+                "custom_reward_normalize_py_path requires custom_reward_normalize_py_name"
+            )
+        if self.loss_func == "vespo":
+            self._validate_vespo()
+        if self.use_adaptive_entropy:
+            assert self.feature_store_enable, (
+                "use_adaptive_entropy=True requires feature_store_enable=True "
+                "(controller state is stored via PpoFeatureStore set/get)."
+            )
+            assert self.ppo_entropy_regularization_type is None, (
+                "use_adaptive_entropy is incompatible with "
+                f"ppo_entropy_regularization_type={self.ppo_entropy_regularization_type!r}"
+            )
+            assert self.entropy_coef_min <= self.entropy_coef_max, (
+                f"entropy_coef_min ({self.entropy_coef_min}) must be <= "
+                f"entropy_coef_max ({self.entropy_coef_max})"
+            )
+
+    def _validate_vespo(self):
+        assert not self.use_legacy_loss, (
+            "loss_func='vespo' is only implemented on the new loss path; "
+            "set ppo.use_legacy_loss=False."
+        )
+        assert not self.skip_prev_logps, (
+            "loss_func='vespo' requires prev_log_probs; with skip_prev_logps the "
+            "sequence weight W collapses to 1 and the kernel degenerates."
+        )
+        for name, value in (
+            ("vespo_c1_pos", self.vespo_c1_pos), ("vespo_c1_neg", self.vespo_c1_neg)
+        ):
+            assert value >= 1.0, (
+                f"{name} must be >= 1.0, otherwise the VESPO variance bound is vacuous "
+                f"(Prop. 3.1), got {value}."
+            )
+        for name, value in (
+            ("vespo_c2_pos", self.vespo_c2_pos), ("vespo_c2_neg", self.vespo_c2_neg)
+        ):
+            assert value > 0.0, f"{name} must be > 0.0, got {value}."
+        assert not self.enable_off_policy_correction, (
+            "loss_func='vespo' folds the rollout IS ratio into W before the kernel; "
+            "enable_off_policy_correction would apply it a second time."
+        )
 
 
 @dataclass
@@ -457,6 +639,17 @@ class DistillConfig(PpoConfig):
             "help":
                 "Beta coefficient for the teacher-student KL loss in the OPD loss. "
                 "Controls the weight of KL(teacher || student) relative to the actor loss."
+        }
+    )
+    opd_ignore_env_reward: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "Pure-OPD switch: when True, drop env-side ``rewards`` before computing "
+                "OPD advantages so the advantage is purely -KL(student||teacher) with no "
+                "GRPO reward term. Reward is still surfaced for metrics/wandb. Only honored "
+                "by ``advantage_type='on_policy_distill'`` (and is a no-op for g_opd, which "
+                "has its own ``g_opd_mix_reward_advantage`` toggle)."
         }
     )
     log_prob_top_k: int = field(

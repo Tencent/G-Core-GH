@@ -6,6 +6,7 @@ import ray
 from ray.util.queue import Queue
 
 from gpatch_v4.core.device import get_propagate_env_keys
+from gpatch_v4.orches.utils import get_propagated_env_value
 from gpatch_v4.utils.logging_utils import (
     CAPTURE_INFER_ENGINE_LOG_ENV,
     DEBUG_LOG_TO_FILE_ENV,
@@ -34,7 +35,6 @@ PROPAGATE_ENV_KEYS = [
     "CUDA_DEVICE_MAX_CONNECTIONS",
     "PYTORCH_CUDA_ALLOC_CONF",
     "SGLANG_EMPTY_CACHE_INTERVAL",
-    "SGLANG_RETURN_ORIGINAL_LOGPROB",
     TASK_LOG_DIR_ENV,
     LOG_LEVEL_ENV,
     DEBUG_LOG_TO_FILE_ENV,
@@ -74,7 +74,7 @@ def init(config=None):
 
     runtime_env_vars = {}
     for key in PROPAGATE_ENV_KEYS:
-        val = os.environ.get(key)
+        val = get_propagated_env_value(key)
         if val is not None:
             runtime_env_vars[key] = val
     print(f"init ray with env_vars: {runtime_env_vars}")

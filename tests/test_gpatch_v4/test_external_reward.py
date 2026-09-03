@@ -1,6 +1,8 @@
+import asyncio
 import json
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import torch
 
@@ -34,6 +36,53 @@ def _make_batch(tokens_list, seq_lens, gt_labels, prev_rewards=None):
 
 
 class MathRuleExternalRewardTest(unittest.IsolatedAsyncioTestCase):
+    async def test_eval_delay_is_awaited_when_configured(self):
+        tok = _make_mock_tokenizer(["\\boxed{42}"])
+        config = SimpleNamespace(
+            external_reward=SimpleNamespace(eval_delay_s=60),
+        )
+        reward = MathRuleExternalReward(config=config, tokenizer=tok)
+        batch = _make_batch(
+            tokens_list=[[1, 2, 3, 4]],
+            seq_lens=[4],
+            gt_labels=[json.dumps({"answer": 42})],
+        )
+
+        with patch(
+            "tasks.math_rl_v4.math_external_reward.asyncio.sleep",
+            new_callable=AsyncMock,
+        ) as sleep:
+            await reward.calc_external_reward([batch], ppo_step=0, is_eval=True)
+
+        sleep.assert_awaited_once_with(60)
+
+    async def test_eval_delay_minus_one_uses_random_uniform(self):
+        tok = _make_mock_tokenizer(["\\boxed{42}"])
+        config = SimpleNamespace(
+            external_reward=SimpleNamespace(eval_delay_s=-1),
+        )
+        reward = MathRuleExternalReward(config=config, tokenizer=tok)
+        batch = _make_batch(
+            tokens_list=[[1, 2, 3, 4]],
+            seq_lens=[4],
+            gt_labels=[json.dumps({"answer": 42})],
+        )
+
+        with (
+            patch(
+                "tasks.math_rl_v4.math_external_reward.random.uniform",
+                return_value=12.5,
+            ) as uniform,
+            patch(
+                "tasks.math_rl_v4.math_external_reward.asyncio.sleep",
+                new_callable=AsyncMock,
+            ) as sleep,
+        ):
+            await reward.calc_external_reward([batch], ppo_step=0, is_eval=True)
+
+        uniform.assert_called_once_with(50.0, 200.0)
+        sleep.assert_awaited_once_with(12.5)
+
     async def test_calc_external_reward_output_schema(self):
         tok = _make_mock_tokenizer(
             ["The final answer is \\boxed{42}", "The final answer is \\boxed{7}"]
@@ -147,6 +196,157 @@ class AgentLoopActorSetupExternalRewardTest(unittest.TestCase):
         self.assertEqual(type(actor.external_reward).__name__, "MathRuleExternalReward")
         self.assertTrue(callable(getattr(actor.external_reward, "calc_external_reward", None)))
         self.assertIs(actor.external_reward.tokenizer, actor.tokenizer)
+
+
+class AsyncEvalExternalRewardTest(unittest.IsolatedAsyncioTestCase):
+    class _EvalRolloutGenerator:
+        def __init__(self):
+            self.clear_data_cache = MagicMock()
+
+        async def __call__(self, data_iter, num_microbatches, ppo_step):
+            return [{"ppo_step": ppo_step}]
+
+        def add_back_rollout_attr_after_sampling(self, rollout_batches):
+            return rollout_batches
+
+    class _DelayedExternalReward:
+        def __init__(self):
+            self.release = asyncio.Event()
+            self.calls = []
+
+        async def calc_external_reward(
+            self,
+            rollout_batches,
+            ppo_step,
+            is_eval=False,
+            _started_event=None,
+        ):
+            self.calls.append((ppo_step, is_eval))
+            if _started_event is not None:
+                _started_event.set()
+            await self.release.wait()
+            return [{} for _ in rollout_batches]
+
+    def _make_actor(self):
+        from gpatch_v4.actor.grpo_train_actor import GrpoTrainActor
+
+        actor = object.__new__(GrpoTrainActor)
+        actor.config = SimpleNamespace(
+            training=SimpleNamespace(
+                use_external_reward=True,
+                total_eval_step=1,
+            ),
+            external_reward=SimpleNamespace(async_eval=True),
+        )
+        actor.external_reward = self._DelayedExternalReward()
+        actor._pending_eval_external_rewards = None
+        actor.eval_rollout_generator = self._EvalRolloutGenerator()
+        actor.eval_dataloader = [object()]
+        actor.policy_engine = SimpleNamespace(
+            set_model_eval=MagicMock(),
+            set_model_train=MagicMock(),
+        )
+        actor.get_num_eval_rollout_micro_batches = MagicMock(return_value=1)
+        actor.compute_rollout_metrics = MagicMock(return_value={"rewards": 1.0})
+        actor.eval_logging = MagicMock()
+        return actor
+
+    async def test_async_rewards_report_on_next_eval_and_final_flush(self):
+        from gpatch_v4.actor import grpo_train_actor as actor_module
+
+        actor = self._make_actor()
+        timers = MagicMock()
+
+        with (
+            patch(
+                "gpatch_v4.actor.grpo_train_actor.TimerSingleton.get_timer",
+                return_value=timers,
+            ),
+            patch("gpatch_v4.actor.grpo_train_actor.cpu_barrier"),
+            patch("gpatch_v4.actor.grpo_train_actor.clear_memory"),
+            patch("gpatch_v4.actor.grpo_train_actor.check_rollout_batches", return_value=True),
+            patch.object(
+                actor_module.BroadcastUtils,
+                "broadcast_rollout_batch",
+                side_effect=lambda batches: batches,
+            ),
+        ):
+            await actor._eval_loop(10)
+
+            self.assertEqual(actor.external_reward.calls, [(10, True)])
+            actor.eval_logging.assert_not_called()
+            self.assertIsNotNone(actor._pending_eval_external_rewards)
+
+            second_eval = asyncio.create_task(actor._eval_loop(20))
+            await asyncio.sleep(0)
+            self.assertFalse(second_eval.done())
+
+            actor.external_reward.release.set()
+            await second_eval
+
+            actor.eval_logging.assert_called_once_with(
+                {"eval-rewards": 1.0},
+                10,
+                report_step=20,
+                commit=False,
+            )
+            self.assertEqual(actor.external_reward.calls, [(10, True), (20, True)])
+
+            await actor._maybe_report_pending_eval_external_rewards(commit=True, force=True)
+            self.assertEqual(
+                actor.eval_logging.call_args_list,
+                [
+                    call({"eval-rewards": 1.0}, 10, report_step=20, commit=False),
+                    call({"eval-rewards": 1.0}, 20, commit=True),
+                ],
+            )
+            self.assertIsNone(actor._pending_eval_external_rewards)
+            self.assertEqual(actor.eval_rollout_generator.clear_data_cache.call_count, 2)
+
+    async def test_async_rewards_report_on_train_step_poll(self):
+        from gpatch_v4.actor import grpo_train_actor as actor_module
+
+        actor = self._make_actor()
+        timers = MagicMock()
+
+        with (
+            patch(
+                "gpatch_v4.actor.grpo_train_actor.TimerSingleton.get_timer",
+                return_value=timers,
+            ),
+            patch("gpatch_v4.actor.grpo_train_actor.cpu_barrier"),
+            patch("gpatch_v4.actor.grpo_train_actor.clear_memory"),
+            patch("gpatch_v4.actor.grpo_train_actor.check_rollout_batches", return_value=True),
+            patch.object(
+                actor_module.BroadcastUtils,
+                "broadcast_rollout_batch",
+                side_effect=lambda batches: batches,
+            ),
+        ):
+            await actor._eval_loop(10)
+            self.assertIsNotNone(actor._pending_eval_external_rewards)
+
+            await actor._maybe_report_pending_eval_external_rewards(report_step=11)
+            actor.eval_logging.assert_not_called()
+            self.assertIsNotNone(actor._pending_eval_external_rewards)
+
+            actor.external_reward.release.set()
+            await asyncio.sleep(0)
+
+            await actor._maybe_report_pending_eval_external_rewards(report_step=12)
+            actor.eval_logging.assert_called_once_with(
+                {"eval-rewards": 1.0},
+                10,
+                report_step=12,
+                commit=False,
+            )
+            self.assertIsNone(actor._pending_eval_external_rewards)
+
+            await actor._eval_loop(20)
+            self.assertEqual(actor.external_reward.calls, [(10, True), (20, True)])
+            # Previous pending already reclaimed; new eval is pending again.
+            actor.eval_logging.assert_called_once()
+            self.assertIsNotNone(actor._pending_eval_external_rewards)
 
 
 if __name__ == "__main__":

@@ -371,3 +371,63 @@ class TestCispoSampleMask:
 
         _, metrics = cispo_loss_func(config, loss_input)
         assert "valid_sample_ratio" in metrics
+
+    @patch(_REDUCE_METRICS_PATH)
+    def test_sample_mean_drops_dead_rows(self, mock_reduce):
+        """Dead rows must not contribute to the seq-mean numerator."""
+        config = _make_config(grpo_kl_loss_beta=0.0)
+        curr = torch.tensor(
+            [[1.0, 1.0], [10.0, 10.0], [2.0, 2.0]],
+            requires_grad=True,
+        )
+        loss_input = PolicyLossInput(
+            advantages=-torch.ones_like(curr),
+            prev_log_probs=curr.detach().clone(),
+            ref_log_probs=None,
+            curr_log_probs=curr,
+            response_mask=torch.ones_like(curr),
+            scaled_entropy=torch.tensor(0.0),
+            per_token_entropy=torch.zeros_like(curr),
+            sample_mask=torch.tensor([1.0, 0.0, 1.0]),
+            calculate_per_token_loss=False,
+        )
+
+        bwd_loss, metrics = cispo_loss_func(config, loss_input)
+
+        # With ratio=1: actor_loss = -A * logπ = logπ; seq means are 1 and 2.
+        assert torch.allclose(bwd_loss, torch.tensor(3.0))
+        assert torch.allclose(metrics["policy_loss_sample"][1], torch.tensor(2.0))
+
+    @patch(_REDUCE_METRICS_PATH)
+    def test_retention_does_not_rescale_bwd_loss(self, mock_reduce):
+        """Backend already divides by retention * gbs; factory must not divide again."""
+        config = _make_config(grpo_kl_loss_beta=0.0)
+        curr = torch.ones(2, 3, requires_grad=True)
+        base_input = PolicyLossInput(
+            advantages=-torch.ones_like(curr),
+            prev_log_probs=curr.detach().clone(),
+            ref_log_probs=None,
+            curr_log_probs=curr,
+            response_mask=torch.ones_like(curr),
+            scaled_entropy=torch.tensor(0.0),
+            per_token_entropy=torch.zeros_like(curr),
+            calculate_per_token_loss=False,
+        )
+        retained = PolicyLossInput(
+            advantages=base_input.advantages,
+            prev_log_probs=base_input.prev_log_probs,
+            ref_log_probs=None,
+            curr_log_probs=curr,
+            response_mask=base_input.response_mask,
+            scaled_entropy=base_input.scaled_entropy,
+            per_token_entropy=base_input.per_token_entropy,
+            calculate_per_token_loss=False,
+            global_retention_ratio=torch.tensor(0.5),
+        )
+
+        loss_no_ret, _ = cispo_loss_func(config, base_input)
+        loss_with_ret, metrics = cispo_loss_func(config, retained)
+
+        assert torch.allclose(loss_with_ret, loss_no_ret)
+        assert "loss_dead_aware" in metrics
+        assert torch.allclose(metrics["loss_dead_aware"][0], loss_no_ret.detach() / 0.5)

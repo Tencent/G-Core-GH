@@ -4,7 +4,7 @@ MEGATRON_BRIDGE_PATH="/root/Megatron-Bridge"
 
 export PYTHONPATH="$PWD:$MCORE_PATH:$MBRIDGE_PATH:$MEGATRON_BRIDGE_PATH/src:$PYTHONPATH"
 
-export GCORE_NNODES=2
+export GCORE_NNODES=1
 source tasks/math_rl_v4/scripts/mpirun-init-ray.sh
 
 python3 -u gpatch_v4/entry/train_lm_finetune.py \

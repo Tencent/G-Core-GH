@@ -42,10 +42,16 @@ from megatron_datasets.mm_dataset import (
     refact_conversations,
 )
 from megatron_datasets.tools.lmdb_read_cli import fetch_images_from_lmdb
-from megatron_datasets.utils import get_iterator, random_pad_list
+from megatron_datasets.utils import (
+    build_forbidden_token_ids,
+    get_iterator,
+    random_pad_list,
+)
 
 from mbridge.core.util import expand_thw, qwen2vl_pad_and_split
 from mbridge.models.qwen3_vl.utils import reorganize_inputs
+
+from gpatch_v4.utils.training_utils import pad_or_truncate_last_dim
 
 # copy from: https://github.com/QwenLM/Qwen2-VL/blob/main/qwen-vl-utils/src/qwen_vl_utils/vision_process.py
 # 目前只保存读image的
@@ -177,6 +183,55 @@ def get_mrope_kwargs(mrope_index, input_ids: torch.Tensor) -> dict:
         return {}
 
     return {"mm_token_type_ids": build_mm_token_type_ids(mrope_index, input_ids)}
+
+
+def flatten_omni_audio_features(
+    input_features: torch.Tensor,
+    feature_attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flatten Whisper/Omni mels to WeLM packed ``(mel, T_valid)`` + lengths.
+
+    Parameters
+    ----------
+    input_features : Tensor
+        ``(B, mel, T)``, possibly padded on ``T``.
+    feature_attention_mask : Tensor
+        ``(B, T)``; 1 marks valid frames.
+
+    Returns
+    -------
+    packed : Tensor
+        ``(mel, sum_valid_frames)``.
+    lengths : Tensor
+        ``(B,)`` int64 valid-frame counts.
+    """
+    assert input_features.ndim == 3, f"expected (B, mel, T), got {input_features.shape=}"
+    assert feature_attention_mask.ndim == 2, (
+        f"expected (B, T), got {feature_attention_mask.shape=}"
+    )
+    bsz, mel, frames = input_features.shape
+    assert feature_attention_mask.shape == (bsz, frames), (
+        f"mask shape {tuple(feature_attention_mask.shape)} != {(bsz, frames)}"
+    )
+    lengths = feature_attention_mask.sum(dim=1).to(dtype=torch.int64)
+    packed = (
+        input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0).contiguous()
+    )
+    assert packed.shape[0] == mel
+    assert packed.shape[1] == int(lengths.sum())
+    return packed, lengths
+
+
+def get_omni_rope_index_kwargs(
+    item: dict,
+    input_ids: torch.Tensor,
+) -> tuple[torch.Tensor, dict]:
+    # Omni get_rope_index 无 None 兜底；全 1 也避免 GRPO padding 把 position_ids 打成 0。
+    kwargs = {
+        "audio_seqlens": item["audio_feature_lengths"],
+        "second_per_grids": item["video_second_per_grid"],
+    }
+    return torch.ones_like(input_ids), kwargs
 
 
 class UserQwen3OmniFeatureExtractor(WhisperFeatureExtractor):
@@ -338,6 +393,9 @@ class QwenVlDatasetMap(MultiModalDatasetMap):
         self.feature_extractor = self.processor.feature_extractor if hasattr(
             self.processor, "feature_extractor"
         ) else None
+        # Keep the composite Omni config for forbidden-token collection
+        # (vision_start lives on talker_config). Unwrap thinker for mapping.
+        raw_hf_config = hf_config
         self.hf_config = hf_config.thinker_config if hasattr(
             hf_config, "thinker_config"
         ) else hf_config
@@ -351,6 +409,8 @@ class QwenVlDatasetMap(MultiModalDatasetMap):
         else:
             self.pad_token_id = self.tokenizer._tokenizer.pad_token_id
         assert self.pad_token_id is not None
+
+        self.forbidden_token_ids = build_forbidden_token_ids(raw_hf_config)
 
         if self.use_grpo:
             assert self.grpo_resp_length is not None
@@ -444,8 +504,10 @@ class QwenVlDatasetMap(MultiModalDatasetMap):
             if is_last:
                 chat_template_kwargs["return_dict"] = True
                 chat_template_kwargs["return_tensors"] = "pt"
-            if self.config is not None and not getattr(self.config, 'ignore_thinking_flag', False):
-                chat_template_kwargs["enable_thinking"] = self.config.training.enable_thinking
+            # Read from training.*; ignore_thinking_flag omits enable_thinking
+            # (verl-style empty apply_chat_template_kwargs).
+            if self.config is not None:
+                chat_template_kwargs.update(self.config.training.chat_template_thinking_kwargs())
 
             inputs_dict = self.processor.apply_chat_template(
                 conversations[:i + 1],
@@ -487,12 +549,8 @@ class QwenVlDatasetMap(MultiModalDatasetMap):
     def truncate_by_max_seqlen(self, input_ids, labels, attention_mask):
         if len(input_ids) < self.max_seq_len + 1:
             if self.moe_pad_with_random_token:
-                ban_token_ids = [
-                    self.hf_config.image_token_id, self.hf_config.video_token_id,
-                    self.hf_config.vision_start_token_id, self.hf_config.vision_end_token_id
-                ]
                 input_ids = random_pad_list(
-                    input_ids, self.max_seq_len + 1 - len(input_ids), ban_token_ids
+                    input_ids, self.max_seq_len + 1 - len(input_ids), self.forbidden_token_ids
                 )
             else:
                 input_ids += [self.pad_token_id] * (self.max_seq_len + 1 - len(input_ids))
@@ -571,7 +629,6 @@ class QwenVlDatasetMap(MultiModalDatasetMap):
         data_dict["input_features"] = input_features.type(
             torch.bfloat16
         ) if input_features is not None else None
-        data_dict["feature_attention_mask"] = feature_attention_mask
         data_dict["video_second_per_grid"] = video_second_per_grid.type(
             torch.int64
         ) if video_second_per_grid is not None else None
@@ -598,6 +655,19 @@ class QwenVlDatasetMap(MultiModalDatasetMap):
             # 跳过样本
             if total_audio_token > sum_audio_token:
                 return f"Invalid Sample: audio token-ids too long"
+
+        if data_dict["input_features"] is not None:
+            assert feature_attention_mask is not None, (
+                "input_features requires feature_attention_mask from the processor"
+            )
+            packed, lengths = flatten_omni_audio_features(
+                data_dict["input_features"],
+                feature_attention_mask,
+            )
+            data_dict["input_features"] = packed
+            data_dict["audio_feature_lengths"] = lengths
+        else:
+            data_dict["audio_feature_lengths"] = None
 
         # prompt_len 是指原来没有截断过样本的 prompt_len，一般是给 grpo 使用的
         data_dict["prompt_len"] = torch.tensor(prompt_len, dtype=torch.int64)
@@ -842,7 +912,11 @@ class DataCollatorForQwenVl(object):
                 del instance["imgs_np_array"]
             meta_info_list.append(instance["meta_info"])
             del instance["meta_info"]
-            for omni_key in ["input_features", "feature_attention_mask", "video_second_per_grid"]:
+            for omni_key in [
+                "input_features",
+                "audio_feature_lengths",
+                "video_second_per_grid",
+            ]:
                 if omni_key in instance:
                     del instance[omni_key]
 
@@ -899,7 +973,7 @@ class DataCollatorForQwenVl(object):
             )
             if self.model_arch in [
                 "qwen3_vl_moe", "qwen3_vl", "qwen3_5", "qwen3_5_moe", "qwen3_omni_moe",
-                "wemm3_embedding"
+                "wemm3_embedding", "wemm3_5_embedding", "wemm3_5_moe_embedding"
             ]:
                 for image_padded in images_padded:
                     assert not image_padded, "not support image padded now"
@@ -1004,7 +1078,6 @@ class TrainerV4DataCollatorForQwenVl(object):
         is_dpo=False,
         use_grpo=False,
         hf_config_path=None,
-        only_return_last_hidden_state=False,
     ):
         super().__init__()
         # qwen2vl所有的模型merge_size都为2，因此它本来就是2*2的倍数
@@ -1014,7 +1087,6 @@ class TrainerV4DataCollatorForQwenVl(object):
         self.is_dpo = is_dpo
         self.use_grpo = use_grpo
         self.hf_config_path = hf_config_path
-        self.only_return_last_hidden_state = only_return_last_hidden_state
         self.mrope_index = get_index_helper(model_arch, self.hf_config_path)
 
         self.pad_token_id = None
@@ -1049,7 +1121,7 @@ class TrainerV4DataCollatorForQwenVl(object):
         if self.use_grpo:
             extra_keys.extend(["json_data", "imgs_np_array"])
         if self.model_arch == "qwen3_omni_moe":
-            extra_keys.extend(["input_features", "feature_attention_mask", "video_second_per_grid"])
+            extra_keys.extend(["input_features", "audio_feature_lengths", "video_second_per_grid"])
             if self.use_grpo:
                 extra_keys.append("audios_np_array")
         k_map = {
@@ -1061,24 +1133,11 @@ class TrainerV4DataCollatorForQwenVl(object):
                                    for instance in instances]).view(-1).max().item()
         ret_res = defaultdict(list)
         for instance in instances:
-            attention_mask = None
-            kwargs = {}
-            if self.model_arch == "qwen3_omni_moe":
-                if instance["feature_attention_mask"] is not None:
-                    kwargs["audio_seqlens"] = torch.sum(instance["feature_attention_mask"], dim=1)
-                else:
-                    kwargs["audio_seqlens"] = None
-                kwargs["second_per_grids"] = instance["video_second_per_grid"]
             input_ids = instance["input_ids"].unsqueeze(0)
+            attention_mask = None
+            omni_rope_kwargs = {}
             if self.model_arch == "qwen3_omni_moe":
-                # GRPO 训练时 input_ids 长度为 seq_length（含 padding），
-                # 真实 attention_mask 只覆盖 prompt，会导致 prompt 之外的
-                # position_ids 全部为 0，影响后续 rollout 推理时的外推。
-                # 这里传 全 1 的 attention_mask 让所有 token 都能拿到正确的
-                # 顺序 position_ids，与 qwen3_vl 的处理保持一致
-                # (qwen3_vl 的 get_rope_index 在 attention_mask=None 时会
-                # 内部用 ones_like 兜底，qwen3_omni 没有兜底所以这里显式传)。
-                attention_mask = torch.ones_like(input_ids)
+                attention_mask, omni_rope_kwargs = get_omni_rope_index_kwargs(instance, input_ids)
             mrope_kwargs = get_mrope_kwargs(self.mrope_index, input_ids)
             position_ids, _ = self.mrope_index.get_rope_index(
                 input_ids,
@@ -1086,7 +1145,7 @@ class TrainerV4DataCollatorForQwenVl(object):
                 video_grid_thw=instance["video_grid_thw"],
                 attention_mask=attention_mask,
                 **mrope_kwargs,
-                **kwargs,
+                **omni_rope_kwargs,
             )
             # can reorganize_inputs at dataset
             vision_data, vision_grid_thw, vision_mask = reorganize_inputs(
@@ -1104,8 +1163,8 @@ class TrainerV4DataCollatorForQwenVl(object):
 
             if vision_data is not None:
                 vision_grid_thw = expand_thw(vision_grid_thw)
-                ret_res["vision_data"].append(vision_data)
-                ret_res["vision_grid_thw"].append(vision_grid_thw)
+            ret_res["vision_data"].append(vision_data)
+            ret_res["vision_grid_thw"].append(vision_grid_thw)
 
             ret_res["image_input_mask"].append(vision_mask)
             ret_res["position_ids"].append(position_ids.clone())
@@ -1115,7 +1174,6 @@ class TrainerV4DataCollatorForQwenVl(object):
             loss_mask[label == self.pad_token_id] = 0.0  # mask paddings
             loss_mask[label == -100] = 0.0  # mask prompts
             ret_res["loss_mask"].append(loss_mask)
-            ret_res["only_return_last_hidden_state"].append(self.only_return_last_hidden_state)
 
             for k in extra_keys:
                 new_k = k
@@ -1132,6 +1190,191 @@ class TrainerV4DataCollatorForQwenVl(object):
             assert len(ret_res[k]) == batch_size, f"error: {k=} {batch_size=} {len(ret_res[k])=}"
 
         return ret_res
+
+
+class TrainerV4DataCollatorForQwenVlPacked:
+    """Collate shifted Qwen-VL samples into one packed THD sample."""
+
+    _PACK_CAT_DIMS = {
+        "pixel_values": 0,
+        "image_grid_thw": 0,
+        "image_input_mask": 0,
+        "video_grid_thw": 0,
+        "video_input_mask": 0,
+        "pixel_values_videos": 0,
+        "video_second_per_grid": 0,
+    }
+    _PACK_LIST_KEYS = (
+        "input_features",
+        "audio_feature_lengths",
+    )
+
+    def __init__(
+        self,
+        model_arch="qwen2vl",
+        tokenizer=None,
+        hf_config_path=None,
+        pad_with_random_token=False,
+    ):
+        self.mrope_index = get_index_helper(model_arch, hf_config_path)
+        self.model_arch = model_arch
+        if hasattr(tokenizer, "pad_token_id"):
+            self.pad_token_id = tokenizer.pad_token_id
+        else:
+            self.pad_token_id = tokenizer._tokenizer.pad_token_id
+        assert self.pad_token_id is not None
+        self.pad_token_id = int(self.pad_token_id)
+        self.vocab_size = (
+            int(tokenizer.vocab_size)
+            if hasattr(tokenizer, "vocab_size") and tokenizer.vocab_size else int(len(tokenizer))
+        )
+        self.pad_with_random_token = bool(pad_with_random_token)
+        special_token_ids = getattr(tokenizer, "all_special_ids", None)
+        if special_token_ids is None and hasattr(tokenizer, "_tokenizer"):
+            special_token_ids = tokenizer._tokenizer.all_special_ids
+        forbidden_token_ids = {self.pad_token_id}
+        for token_id in special_token_ids or ():
+            if isinstance(token_id, int) and not isinstance(token_id, bool):
+                forbidden_token_ids.add(int(token_id))
+        forbidden_token_ids.update(build_forbidden_token_ids(self.mrope_index.config))
+        self.forbidden_token_ids = sorted(forbidden_token_ids)
+
+    def __call__(
+        self,
+        items: list[dict],
+        *,
+        align: int,
+        pack_bin_size: int,
+    ) -> dict:
+        token_parts = []
+        label_parts = []
+        loss_mask_parts = []
+        position_id_parts = []
+        original_lens = []
+        padded_lens = []
+        extra_parts = {name: [] for name in (*self._PACK_CAT_DIMS, *self._PACK_LIST_KEYS)}
+
+        for item in items:
+            tokens = item["input_ids"].to(torch.long)
+            labels = item["labels"].to(torch.long)
+            assert tokens.shape == labels.shape, f"{tokens.shape=}, {labels.shape=}"
+            raw_len = int(tokens.shape[-1])
+            pad_len = ceil_by_factor(raw_len, align)
+            tokens = pad_or_truncate_last_dim(
+                tokens,
+                pad_len,
+                self.pad_token_id,
+                pad_with_random_token=self.pad_with_random_token,
+                vocab_size=self.vocab_size,
+                forbidden_token_ids=self.forbidden_token_ids,
+            )
+            labels = pad_or_truncate_last_dim(labels, pad_len, -100)
+            loss_mask_parts.append((labels != -100).to(torch.float32))
+
+            input_ids = tokens.unsqueeze(0)
+            rope_kwargs = get_mrope_kwargs(self.mrope_index, input_ids)
+            attention_mask = None
+            if self.model_arch == "qwen3_omni_moe":
+                attention_mask, omni_rope_kwargs = get_omni_rope_index_kwargs(item, input_ids)
+                rope_kwargs.update(omni_rope_kwargs)
+            position_ids, _ = self.mrope_index.get_rope_index(
+                input_ids,
+                image_grid_thw=item.get("image_grid_thw"),
+                video_grid_thw=item.get("video_grid_thw"),
+                attention_mask=attention_mask,
+                **rope_kwargs,
+            )
+            position_ids = position_ids.squeeze(1).contiguous()
+            assert position_ids.shape[-1] == pad_len, (
+                f"packed position_ids length {position_ids.shape[-1]} "
+                f"!= padded sample length {pad_len}"
+            )
+
+            token_parts.append(tokens)
+            label_parts.append(labels)
+            position_id_parts.append(position_ids)
+            original_lens.append(raw_len)
+            padded_lens.append(pad_len)
+            for name in extra_parts:
+                value = item.get(name)
+                if value is not None and name in (
+                    "image_input_mask",
+                    "video_input_mask",
+                ):
+                    value = pad_or_truncate_last_dim(value, pad_len, 0)
+                extra_parts[name].append(value)
+
+        tokens = torch.cat(token_parts, dim=0)
+        labels = torch.cat(label_parts, dim=0)
+        total = int(tokens.shape[0])
+        assert total <= pack_bin_size, f"{total=} > {pack_bin_size=}"
+        assert total % align == 0, (f"packed length {total} not divisible by align={align}")
+
+        original_seq_len = torch.tensor(original_lens, dtype=torch.int32)
+        padded_seq_len = torch.tensor(padded_lens, dtype=torch.int32)
+        cu_seqlens = torch.zeros(len(items) + 1, dtype=torch.int32)
+        cu_seqlens[1:] = torch.cumsum(original_seq_len, dim=0)
+        cu_seqlens_padded = torch.zeros(len(items) + 1, dtype=torch.int32)
+        cu_seqlens_padded[1:] = torch.cumsum(padded_seq_len, dim=0)
+        packed = {
+            "tokens": tokens,
+            "labels": labels,
+            "loss_mask": torch.cat(loss_mask_parts, dim=0),
+            "position_ids": torch.cat(position_id_parts, dim=-1),
+            "cu_seqlens": cu_seqlens,
+            "cu_seqlens_padded": cu_seqlens_padded,
+            "max_seqlen": int(padded_seq_len.max().item()),
+            "original_seq_len": original_seq_len,
+            "padded_seq_len": padded_seq_len,
+            "keys": [item.get("key") for item in items],
+            "num_docs": len(items),
+        }
+        for name, dim in self._PACK_CAT_DIMS.items():
+            present = [value for value in extra_parts[name] if value is not None]
+            packed[name] = torch.cat(present, dim=dim) if present else None
+        feat_parts = []
+        len_parts = []
+        for i, item in enumerate(items):
+            feat = extra_parts["input_features"][i]
+            lengths = extra_parts["audio_feature_lengths"][i]
+            if feat is None:
+                assert lengths is None, "audio_feature_lengths set without input_features"
+                continue
+            assert feat.ndim == 2, f"expected (mel, T), got {feat.shape=}"
+            packed_len = lengths.to(dtype=torch.int64)
+            assert int(packed_len.sum()) == feat.shape[1], (
+                "audio_feature_lengths sum "
+                f"{int(packed_len.sum())} != packed frames {feat.shape[1]}"
+            )
+            feat_parts.append(feat)
+            len_parts.append(packed_len)
+        packed["input_features"] = torch.cat(feat_parts, dim=1) if feat_parts else None
+        packed["audio_feature_lengths"] = (torch.cat(len_parts, dim=0) if len_parts else None)
+
+        image_input_mask = packed.pop("image_input_mask")
+        video_input_mask = packed.pop("video_input_mask")
+        if image_input_mask is None:
+            image_input_mask = torch.zeros_like(tokens, dtype=torch.bool)
+        if video_input_mask is None:
+            video_input_mask = torch.zeros_like(tokens, dtype=torch.bool)
+        vision_data, vision_grid_thw, vision_mask = reorganize_inputs(
+            input_ids=tokens.unsqueeze(0),
+            pixel_values=packed.pop("pixel_values"),
+            pixel_values_videos=packed.pop("pixel_values_videos"),
+            image_grid_thw=packed.pop("image_grid_thw"),
+            video_grid_thw=packed.pop("video_grid_thw"),
+            image_input_mask=image_input_mask.unsqueeze(0),
+            video_input_mask=video_input_mask.unsqueeze(0),
+            image_token_id=self.mrope_index.config.image_token_id,
+            video_token_id=self.mrope_index.config.video_token_id,
+            square_merge_size=(self.mrope_index.config.vision_config.spatial_merge_size**2),
+        )
+        if vision_data is not None:
+            vision_grid_thw = expand_thw(vision_grid_thw)
+        packed["image_input_mask"] = vision_mask
+        packed["vision_data"] = vision_data
+        packed["vision_grid_thw"] = vision_grid_thw
+        return packed
 
 
 class TrainerV4DataCollatorForQwenVlGRPO(TrainerV4DataCollatorForQwenVl):
@@ -1169,19 +1412,19 @@ class TrainerV4DataCollatorForQwenVlGRPO(TrainerV4DataCollatorForQwenVl):
 
         vision_data = None
         vision_grid_thw = None
-        if "vision_data" in data:
-            assert len(data["vision_data"]) == 1
-            assert len(data["vision_grid_thw"]) == 1
+        assert len(data["vision_data"]) == 1
+        assert len(data["vision_grid_thw"]) == 1
+        if data["vision_data"][0] is not None:
             vision_data = data["vision_data"][0].type(torch.bfloat16)
             vision_grid_thw = data["vision_grid_thw"][0]
 
         input_features = None
-        feature_attention_mask = None
+        audio_feature_lengths = None
         if "input_features" in data:
             assert len(data["input_features"]) == 1
-            assert len(data["feature_attention_mask"]) == 1
+            assert len(data["audio_feature_lengths"]) == 1
             input_features = data["input_features"][0]
-            feature_attention_mask = data["feature_attention_mask"][0]
+            audio_feature_lengths = data["audio_feature_lengths"][0]
 
         cache_keys = [
             "position_ids",
@@ -1190,7 +1433,7 @@ class TrainerV4DataCollatorForQwenVlGRPO(TrainerV4DataCollatorForQwenVl):
             "vision_data",
         ]
         if input_features is not None:
-            cache_keys.extend(["input_features", "feature_attention_mask"])
+            cache_keys.extend(["input_features", "audio_feature_lengths"])
 
         batch_data = dict(
             # type is list
@@ -1209,8 +1452,11 @@ class TrainerV4DataCollatorForQwenVlGRPO(TrainerV4DataCollatorForQwenVl):
         if "audios_np_array" in data:
             batch_data["audios_np_array_list"] = data["audios_np_array"]
         if input_features is not None:
+            assert audio_feature_lengths is not None, (
+                "input_features set without audio_feature_lengths"
+            )
             batch_data["input_features"] = input_features
-            batch_data["feature_attention_mask"] = feature_attention_mask
+            batch_data["audio_feature_lengths"] = audio_feature_lengths
         return batch_data
 
 
@@ -1227,7 +1473,8 @@ def get_processor(args, model_arch=None):
     if hasattr(args, "model_arch"):
         model_arch = args.model_arch
     if model_arch in [
-        "qwen3_vl_moe", "qwen3_vl", "qwen3_5", "qwen3_5_moe", "qwen3_omni_moe", "wemm3_embedding"
+        "qwen3_vl_moe", "qwen3_vl", "qwen3_5", "qwen3_5_moe", "qwen3_omni_moe", "wemm3_embedding",
+        "wemm3_5_embedding", "wemm3_5_moe_embedding"
     ]:
         # set the user param
         if args.min_pixels_num is not None:
@@ -1376,7 +1623,8 @@ def build_train_valid_test_data_iter(
         hw_factor *= args.tensor_model_parallel_size
     # grpo数据先不pad
     if args.use_grpo or args.model_arch in [
-        "qwen3_vl_moe", "qwen3_vl", "qwen3_5", "qwen3_5_moe", "qwen3_omni_moe", "wemm3_embedding"
+        "qwen3_vl_moe", "qwen3_vl", "qwen3_5", "qwen3_5_moe", "qwen3_omni_moe", "wemm3_embedding",
+        "wemm3_5_embedding", "wemm3_5_moe_embedding"
     ]:
         hw_factor = 1
 

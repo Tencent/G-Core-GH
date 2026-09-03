@@ -122,6 +122,9 @@ hf download --repo-type model $repo_id --local-dir $DFS/$repo_id
 repo_id=tatsu-lab/alpaca
 hf download --repo-type dataset $repo_id --local-dir $DFS/$repo_id
 
+repo_id=yifengzhu-hf/LIBERO-datasets
+hf download --repo-type dataset $repo_id --local-dir $DFS/$repo_id
+
 # 闭源，从 private repo 拉取
 
 # 从腾讯内部这两个文档获取 username / token：

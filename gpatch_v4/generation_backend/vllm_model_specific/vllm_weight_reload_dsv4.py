@@ -1133,7 +1133,7 @@ def iter_model_aware_quantized_weights(
     expert_dtype: str,
 ) -> list[tuple[str, torch.Tensor]]:
     """Quantize DSV4 bf16 disk/HF keys by reflecting the live vLLM model."""
-    from gpatch_v4.models.deepseek_v4.fp_quantize import (
+    from gpatch_v4.kernel.quantize.eager_quant_kernels import (
         quant_fp4_e2m1_scale_e8m0_packed,
         quant_fp8_e4m3_scale_e8m0,
     )
@@ -1150,11 +1150,13 @@ def iter_model_aware_quantized_weights(
             assert name.endswith(".weight"), name
             scale_name = name[:-len(".weight")] + ".scale"
             if expert_dtype == "fp4":
-                packed, scale = quant_fp4_e2m1_scale_e8m0_packed(tensor)
+                # BF16 view, not FP32 master: keep group scales in lockstep
+                # with the trainer forward's fake-quant input.
+                packed, scale = quant_fp4_e2m1_scale_e8m0_packed(tensor.bfloat16().float())
                 quantized.append((name, packed.contiguous()))
                 quantized.append((scale_name, scale.contiguous()))
             else:
-                qfp8, scale = quant_fp8_e4m3_scale_e8m0(tensor)
+                qfp8, scale = quant_fp8_e4m3_scale_e8m0(tensor.bfloat16().float())
                 quantized.append((name, qfp8.contiguous()))
                 quantized.append((scale_name, scale.contiguous()))
             continue
@@ -1166,7 +1168,7 @@ def iter_model_aware_quantized_weights(
             _module_weight_dtype(module) == torch.float8_e4m3fn
         ):
             scale_name = name[:-len(".weight")] + ".scale"
-            qfp8, scale = quant_fp8_e4m3_scale_e8m0(tensor)
+            qfp8, scale = quant_fp8_e4m3_scale_e8m0(tensor.bfloat16().float())
             quantized.append((name, qfp8.contiguous()))
             quantized.append((scale_name, scale.contiguous()))
             continue

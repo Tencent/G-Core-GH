@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 
 import torch
@@ -16,6 +15,43 @@ from .modeling_deepseek_v4 import (
     DeepseekV4RMSNorm,
     DeepseekV4SparseMoeBlock,
 )
+
+try:
+    from gpatch_v4.kernel.quantize.qat import fp8_qat_linear
+except ImportError:
+    fp8_qat_linear = None
+
+
+def _pad_to_idx(values, layer_idx: int, fill):
+    out = list(values)
+    while len(out) <= layer_idx:
+        out.append(fill)
+    return out
+
+
+# MTP / DSpark ``layer_idx`` can index past backbone ``layer_types``.
+# Keep runtime knobs on ``parent``; only the indexed lists are local.
+class _SyntheticLayerConfig:
+    def __init__(self, parent, layer_idx: int) -> None:
+        d = self.__dict__
+        d["_parent"] = parent
+        d["layer_types"] = _pad_to_idx(parent.layer_types, layer_idx, "sliding_attention")
+        d["mlp_layer_types"] = _pad_to_idx(parent.mlp_layer_types, layer_idx, "moe")
+
+    def __getattr__(self, name: str):
+        return getattr(self._parent, name)
+
+    def __setattr__(self, name: str, value) -> None:
+        if name in self.__dict__:
+            self.__dict__[name] = value
+        else:
+            setattr(self._parent, name, value)
+
+
+def config_for_synthetic_layer(config, layer_idx: int):
+    if (layer_idx < len(config.layer_types) and layer_idx < len(config.mlp_layer_types)):
+        return config
+    return _SyntheticLayerConfig(config, layer_idx)
 
 
 def mtp_roll_tensor(
@@ -195,7 +231,7 @@ class DeepseekV4MTPBlock(GradientCheckpointingLayer):
         self.e_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.h_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
-        # Build an attention config that can index layer_types/compress_ratios
+        # Build an attention config that can index layer_types / mlp_layer_types
         # at the synthetic MTP layer index.
         #
         # DSV4-Flash MTP blocks always use ``sliding_attention`` (no CSA/HCA
@@ -206,20 +242,7 @@ class DeepseekV4MTPBlock(GradientCheckpointingLayer):
         # rather than appending the backbone's last layer_type, because
         # truncated models may have a CSA/HCA layer at the end, which would
         # wrongly create compressor params that don't exist in the checkpoint.
-        attn_cfg = config
-        if layer_idx >= len(config.layer_types):
-            attn_cfg = copy.deepcopy(config)
-            attn_cfg.layer_types = list(config.layer_types)
-            while len(attn_cfg.layer_types) <= layer_idx:
-                attn_cfg.layer_types.append("sliding_attention")
-            if getattr(attn_cfg, "mlp_layer_types", None) is not None:
-                attn_cfg.mlp_layer_types = list(attn_cfg.mlp_layer_types)
-                while len(attn_cfg.mlp_layer_types) <= layer_idx:
-                    attn_cfg.mlp_layer_types.append("moe")
-            if getattr(attn_cfg, "compress_ratios", None) is not None:
-                attn_cfg.compress_ratios = list(attn_cfg.compress_ratios)
-                while len(attn_cfg.compress_ratios) <= layer_idx:
-                    attn_cfg.compress_ratios.append(0)
+        attn_cfg = config_for_synthetic_layer(config, layer_idx)
 
         self.config = attn_cfg
         self.self_attn = DeepseekV4Attention(attn_cfg, layer_idx=layer_idx)
@@ -246,8 +269,12 @@ class DeepseekV4MTPBlock(GradientCheckpointingLayer):
         if hidden_states.dim() != 4:
             raise ValueError(f"MTP expects HC hidden [B,S,hc,H], got {tuple(hidden_states.shape)}")
 
-        e = self.e_proj(self.enorm(embed_input)).unsqueeze(2)
-        h = self.h_proj(self.hnorm(hidden_states))
+        if self.config.fp8_qat:
+            e = fp8_qat_linear(self.e_proj, self.enorm(embed_input), 128).unsqueeze(2)
+            h = fp8_qat_linear(self.h_proj, self.hnorm(hidden_states), 128)
+        else:
+            e = self.e_proj(self.enorm(embed_input)).unsqueeze(2)
+            h = self.h_proj(self.hnorm(hidden_states))
         hidden_states = e + h
 
         if position_ids is None:

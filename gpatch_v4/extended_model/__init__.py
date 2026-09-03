@@ -35,6 +35,15 @@ from gpatch_v4.extended_model.qwen3_vl import (
     Qwen3VLOffPoilicyDistillPrepareDataForward,
     Qwen3VLPrepareDataForward,
 )
+
+try:
+    from gpatch_v4.extended_model.qwen4_exp import (
+        Qwen4ExpPostInitModel,
+        Qwen4ExpPrepareDataForwardLLM,
+    )
+except Exception:
+    Qwen4ExpPostInitModel = None
+    Qwen4ExpPrepareDataForwardLLM = None
 from gpatch_v4.extended_model.rollout_attr_hook import ApplySamplingRolloutAttrLLM
 from gpatch_v4.extended_model.wemm3_embedding import Wemm3EmbeddingPrepareDataForward
 from gpatch_v4.extended_model.wemm_video import WemmVideoPrepareDataForward
@@ -164,6 +173,15 @@ REGISTER_SFT_PREPARE_DATA_FORWARD = {
         Wemm3EmbeddingPrepareDataForward,
     MODEL_ARCH.WELM_OMNI_V4_5:
         WelmOmniV45PrepareDataForward,
+    MODEL_ARCH.WEMM3_5_EMBEDDING:
+        Wemm3EmbeddingPrepareDataForward,
+    MODEL_ARCH.WEMM3_5_MOE_EMBEDDING:
+        Wemm3EmbeddingPrepareDataForward,
+    **(
+        {
+            MODEL_ARCH.QWEN4_EXP: Qwen4ExpPrepareDataForwardLLM
+        } if Qwen4ExpPrepareDataForwardLLM else {}
+    ),
 }
 
 REGISTER_OFF_POLICY_DISTILL_PREPARE_DATA_FORWARD = {
@@ -209,7 +227,10 @@ REGISTER_POST_INIT_MODEL = {
     DEFAULT: PostInitModel,
     **({
         MODEL_ARCH.DEEPSEEK_V4: DeepseekV4PostInitModel,
-    } if DeepseekV4PostInitModel else {})
+    } if DeepseekV4PostInitModel else {}),
+    **({
+        MODEL_ARCH.QWEN4_EXP: Qwen4ExpPostInitModel,
+    } if Qwen4ExpPostInitModel else {}),
 }
 
 REGISTER_CHECKPOINT_CONTEXT_FN = {

@@ -1,5 +1,9 @@
 import asyncio
 
+from gpatch_v4.compat import ensure_typing_self
+
+ensure_typing_self()
+
 import hydra
 import torch
 

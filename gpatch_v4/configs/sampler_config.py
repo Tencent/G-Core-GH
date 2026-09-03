@@ -60,3 +60,6 @@ class SamplerConfig(MappingProtocol):
 
     def __post_init__(self):
         assert self.sampler_type in ["sampler", "off-policy-sampler"]
+        if self.infer_engine_configs is not None:
+            for ie_cfg in self.infer_engine_configs:
+                ie_cfg.ensure_generate_params()

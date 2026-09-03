@@ -33,6 +33,8 @@ import gc
 import re
 import shutil
 import unittest
+from packaging.version import Version
+from importlib.metadata import version as pkg_version
 
 import ray
 import torch
@@ -367,14 +369,18 @@ def _save_load_worker(
 
     # gpatch_v4 modeling 把 ``sinks`` / ``position_bias`` wrap 进了
     # ``_Fp32ParamHolder``；归一化回 HF modeling 的扁平名后才能跟 sd_ref 比对。
-    def _strip_holder(name: str) -> str:
-        return (
+    # transformers>=5.10.1 把 ``weights_proj.weight`` 移到了 ``scorer`` 层。
+    def _to_hf_key(name: str) -> str:
+        name = (
             name.replace("._sink_holder.weight", ".sinks")
                 .replace("._position_bias_holder.weight", ".position_bias")
         )
+        if Version(pkg_version("transformers")) >= Version("5.10.1"):
+            name = name.replace(".compressor.indexer.weights_proj.weight", ".compressor.indexer.scorer.weights_proj.weight")
+        return name
 
     def _check_sd1(name: str, t1: torch.Tensor) -> None:
-        name = _strip_holder(name)
+        name = _to_hf_key(name)
         if name.startswith('mtp.'):
             return
         seen_keys_sd1.add(name)
@@ -423,7 +429,7 @@ def _save_load_worker(
     seen_keys_sd2: set[str] = set()
 
     def _check_sd2(name: str, t2: torch.Tensor) -> None:
-        name = _strip_holder(name)
+        name = _to_hf_key(name)
         if name.startswith('mtp.'):
             return
         seen_keys_sd2.add(name)

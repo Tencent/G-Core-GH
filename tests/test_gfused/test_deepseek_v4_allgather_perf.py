@@ -175,7 +175,7 @@ class AllGatherPerfWorker:
         call in ``DeepseekV4Indexer.forward`` (modeling_deepseek_v4.py). Both
         cases share identical tensor shapes ``[S, B, H, D]`` / ``[T, B, D]`` and
         differ only in the per-query causal range ``[cu_ks, cu_ke)`` built with
-        ``_make_causal_cu_seqlens``:
+        ``make_causal_cu_ks_and_cu_ke_for_bshd``:
 
           * **head** — queries sit at the very start of the context
             (``positions = arange(S)``); early queries attend to almost no
@@ -185,7 +185,7 @@ class AllGatherPerfWorker:
             the full ``T`` compressed entries, so each tile scans the whole KV.
         """
         from gpatch_v4.models.deepseek_v4.kernel.tilelang_indexer_fwd import (
-            _make_causal_cu_seqlens,
+            make_causal_cu_ks_and_cu_ke_for_bshd,
             clean_logits_,
             tl_indexer_fwd_impl,
         )
@@ -215,10 +215,10 @@ class AllGatherPerfWorker:
 
         positions_head = torch.arange(local_s, device=device, dtype=torch.int32)
         positions_tail = positions_head + (kv_len - local_s)
-        cu_ks_head, cu_ke_head = _make_causal_cu_seqlens(
+        cu_ks_head, cu_ke_head = make_causal_cu_ks_and_cu_ke_for_bshd(
             local_s, compressed_kv_len, compress_rate, device, positions=positions_head,
         )
-        cu_ks_tail, cu_ke_tail = _make_causal_cu_seqlens(
+        cu_ks_tail, cu_ke_tail = make_causal_cu_ks_and_cu_ke_for_bshd(
             local_s, compressed_kv_len, compress_rate, device, positions=positions_tail,
         )
 

@@ -4,17 +4,9 @@ import traceback
 
 from typing_extensions import override
 
-from gpatch_v4 import orches
 from gpatch_v4.configs.config import RlConfig
-from gpatch_v4.orches.placement_group import (
-    create_bt_rm_group,
-    create_placement_groups,
-    create_rollout_controller,
-    create_sampler_group,
-    create_train_group,
-)
+from gpatch_v4.orches.placement_group import create_rollout_controller
 from gpatch_v4.trainer.grpo_trainer import GrpoTrainer
-from gpatch_v4.trainer.helper import set_nnodes_default
 from gpatch_v4.utils import log
 from gpatch_v4.utils.placement import (
     is_partial_colocated,
@@ -46,6 +38,10 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
         # the last trained step of each sampler-weight window.  All timestamps
         # are recorded in the driver process so they are comparable.
         self._pipeline_ts = {}
+        # abort_to_idle from the previous window; merged into the next
+        # train_step because wait_all_inflight runs after train on
+        # colocate / disagg.
+        self._pending_abort_metrics = {}
 
     def get_pipeline_stats(self):
         """Return pipeline timeline stats for overlap verification.
@@ -55,35 +51,6 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
         dict[int, dict[str, float]]
         """
         return dict(self._pipeline_ts)
-
-    @override
-    async def debug_update_weight(self, config: RlConfig):
-        """Debug helper for rollout-controller weight updates."""
-
-        orches.init(config)
-        set_nnodes_default(config)
-        pgs = create_placement_groups(config)
-
-        self.sampler_group = create_sampler_group(config, pgs)
-        await self.sampler_group.init()
-
-        if config.training.use_gen_rm_reward:
-            await self._init_gen_rm_groups(config, pgs)
-
-        if config.training.use_bt_rm_reward:
-            self.bt_rm_group = create_bt_rm_group(config, pgs)
-            await self.bt_rm_group.init()
-
-        self.train_group = create_train_group(config, pgs)
-        await self.train_group.init()
-
-        await self.train_group.setup_client()
-        await self.train_group.setup_rollout_generator()
-
-        await self.train_group.debug_update_weight(stage=1)
-        await self.train_group.setup_model_and_optimizer()
-
-        await self.train_group.debug_update_weight(stage=2)
 
     @override
     async def launch_then_run_with_recovery(self, config: RlConfig):
@@ -144,9 +111,15 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
         total_ppo_step = train_info["total_ppo_step"]
         ppo_step_per_epoch = train_info["ppo_step_per_epoch"]
         prev_ppo_step = train_info["prev_ppo_step"]
+        # Align with GrpoTrainActor: exit_step (>=1) caps how many PPO steps run.
+        exit_step = training_cfg.exit_step
+        if exit_step is not None and int(exit_step) > 0:
+            total_ppo_step = min(total_ppo_step, int(exit_step))
 
         train_step = prev_ppo_step
         fired_step = prev_ppo_step
+        if prev_ppo_step > 0:
+            await rc.load_data_source.remote(prev_ppo_step)
         steps_since_update = 0
         # DEBUG: short-circuit driver-side rollout entirely.
         debug_skip_rollout = config.debug.skip_rollout_load_from_disk
@@ -196,6 +169,11 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
                         await grp.write_engine_log_marker(
                             fired_step, phase=f"fire ppo_step {fired_step}..{target - 1}"
                         )
+                if not debug_skip_rollout:
+                    # Open the tail-batching window for every PPO step this
+                    # call is about to fire; a no-op when the feature is off.
+                    num_mb_per_step = training_cfg.rollout_gbs // training_cfg.rollout_mbs
+                    await rc.begin_step.remote((target - fired_step) * num_mb_per_step)
             while fired_step < target:
                 epoch = epoch_for(fired_step)
                 epoch_end = (epoch + 1) * ppo_step_per_epoch
@@ -228,8 +206,10 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
             # ``collect_rollout_step`` pulls from the first-finished queue;
             # with ``rollout_ordered_collection`` it waits for the original
             # ``train_step`` rollout and preserves microbatch order.
+            abort_metrics = {}
             if debug_skip_rollout:
                 dp_refs = None
+                extra_metrics = {}
                 t_collect_done = time.monotonic()
                 fire_rollout_elapsed = 0.0
                 collect_elapsed = 0.0
@@ -237,8 +217,9 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
                 t_collect_start = time.monotonic()
                 gen_result = await rc.collect_rollout_step.remote(train_step)
                 if is_partial:
-                    await rc.wait_all_inflight.remote()
+                    abort_metrics = await rc.wait_all_inflight.remote() or {}
                 dp_refs = gen_result.dp_refs
+                extra_metrics = getattr(gen_result, "metrics", {}) or {}
                 t_collect_done = time.monotonic()
                 fire_time = self._pipeline_ts[train_step]["fire"]
                 fire_rollout_elapsed = t_collect_done - fire_time
@@ -247,15 +228,20 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
             await tg.log_memory(f"memory tracking after collect ppo_step {train_step}")
 
             t_train_start = time.monotonic()
-            driver_timing = {
-                "time_perf/fire_rollout_elapsed": fire_rollout_elapsed,
-                "time_perf/rollout": collect_elapsed,
-            }
+            extra_metrics.update(self._pending_abort_metrics)
+            self._pending_abort_metrics = {}
+            extra_metrics.update(abort_metrics)
+            extra_metrics.update(
+                {
+                    "time_perf/fire_rollout_elapsed": fire_rollout_elapsed,
+                    "time_perf/rollout": collect_elapsed,
+                }
+            )
             step_metrics_per_actor = await tg.train_step(
                 epoch_for(train_step),
                 train_step,
                 dp_refs,
-                extra_metrics=driver_timing,
+                extra_metrics=extra_metrics,
             )
             t_train_done = time.monotonic()
             self._pipeline_ts.setdefault(train_step, {})["train_done"] = t_train_done
@@ -286,14 +272,18 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
 
             if reached_window_boundary or at_end_of_training:
                 # Save-checkpoint first, THEN wait for sampler to drain.
-                if train_step % training_cfg.save_interval == 0:
+                if (
+                    not config.debug.disable_save_checkpoint and
+                    train_step % training_cfg.save_interval == 0
+                ):
                     await tg.save_checkpoint(train_step)
+                    await rc.save_data_source.remote(train_step)
 
                 # Drain inflight rollout so the sampler is idle before we
                 # change its weights.  Skipped when
                 # ``debug_skip_rollout`` is enabled (no sampler activity).
                 if not debug_skip_rollout:
-                    await rc.wait_all_inflight.remote()
+                    self._pending_abort_metrics = (await rc.wait_all_inflight.remote() or {})
 
                 # Always offload before exporting weights. Disaggregated runs
                 # still need headroom for mbridge TP gather/merge buffers.
@@ -317,9 +307,13 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
                     )
 
         # final save checkpoint, 避免 train_step % training_cfg.save_interval 保存两次
-        if train_step % training_cfg.save_interval != 0:
+        if (
+            not config.debug.disable_save_checkpoint and
+            train_step % training_cfg.save_interval != 0
+        ):
             await tg.prepare_for_final_save()
             await tg.save_checkpoint(train_step)
+            await rc.save_data_source.remote(train_step)
 
         return ret_metrics
 

@@ -521,13 +521,42 @@ class TestRedistributeRewards(unittest.TestCase):
         self.assertTrue(torch.allclose(result, expected))
 
     def test_orig_gap_no_reenc_gap(self):
-        """Orig has extra tokens in a gap but reenc has none."""
+        """Orig-only gap is filled by interpolating adjacent reenc rewards."""
         orig = [1, 10, 11, 2]
         reenc = [1, 2]
         rewards = torch.tensor([1.0, 2.0])
         result = redistribute_rewards(orig, reenc, rewards)
-        expected = torch.tensor([1.0, 0.0, 0.0, 2.0])
+        expected = torch.tensor([1.0, 1.5, 1.5, 2.0])
         self.assertTrue(torch.allclose(result, expected))
+
+    def test_orig_gap_preserves_constant_reward(self):
+        """Redistribution must not inject zero into a constant reward field."""
+        orig = [1, 10, 2]
+        reenc = [1, 2]
+        rewards = torch.tensor([-4.0, -4.0])
+        result = redistribute_rewards(orig, reenc, rewards)
+        expected = torch.tensor([-4.0, -4.0, -4.0])
+        self.assertTrue(torch.equal(result, expected))
+
+    def test_orig_gap_no_reenc_gap_at_boundaries(self):
+        """A one-sided boundary gap uses its only available neighbor."""
+        start_result = redistribute_rewards(
+            [10, 11, 1, 2],
+            [1, 2],
+            torch.tensor([3.0, 4.0]),
+        )
+        self.assertTrue(
+            torch.allclose(start_result, torch.tensor([3.0, 3.0, 3.0, 4.0]))
+        )
+
+        end_result = redistribute_rewards(
+            [1, 2, 10, 11],
+            [1, 2],
+            torch.tensor([3.0, 4.0]),
+        )
+        self.assertTrue(
+            torch.allclose(end_result, torch.tensor([3.0, 4.0, 4.0, 4.0]))
+        )
 
     def test_reenc_gap_no_orig_gap(self):
         """Reenc has extra tokens in a gap but orig has none."""

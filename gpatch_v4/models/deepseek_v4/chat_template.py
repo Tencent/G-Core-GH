@@ -12,8 +12,8 @@ enforced against the official DSV4 encoder by the alignment test.
 """
 
 # DSV4-Flash/Pro tokenizer ships without a `chat_template` field, so we
-# inject one that mirrors the canonical encoder shipped inside the ckpt at
-# ``encoding/encoding_dsv4.py::encode_messages``. The full alignment
+# inject one that mirrors
+# ``gpatch_v4.models.deepseek_v4.encoding_dsv4.encode_messages``. The full alignment
 # contract (text + token ids, chat / thinking, single / multi-turn, with /
 # without system) is exercised by
 # ``tests/test_gfused/test_dsv4_chat_template.py`` -- if you touch this

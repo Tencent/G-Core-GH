@@ -17,7 +17,8 @@
 import json
 import os
 import unittest
-
+from packaging.version import Version
+from importlib.metadata import version as pkg_version
 
 # DSV4-Flash 标准 checkpoint 路径（与 test_tmp.py / test_save_load.py 一致）
 _HF_INDEX = "hf-hub/deepseek-ai/DeepSeek-V4-Flash/model.safetensors.index.json"
@@ -83,6 +84,16 @@ class TestRenameTableRoundTrip(unittest.TestCase):
 
         base_convs = _build_checkpoint_conversion_mapping()["deepseek_v4"]
         renamings = [m for m in base_convs if isinstance(m, WeightRenaming)]
+        # Adapt to transformers>=5.10.1 where ``weights_proj.weight`` is moved into ``scorer`` layer.
+        if Version(pkg_version("transformers")) >= Version("5.10.1"):
+            renamings.extend(
+                [
+                    WeightRenaming(
+                        source_patterns=r"^(.*\.)?self_attn\.compressor\.indexer\.scorer\.weights_proj\.weight$",
+                        target_patterns=r"\1self_attn.compressor.indexer.weights_proj.weight",
+                    ),
+                ]
+            )
 
         disk_keys, source = _gather_disk_keys()
         print(f"[rename_table_test] {source}")

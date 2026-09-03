@@ -13,8 +13,10 @@ The quantization scope follows Miles's ``quantizer_fp8.py``:
 * Dense attention projections (``wq_a/wq_b/wkv/wo_b``, indexer ``wq_b``)
 * MTP projections (``e_proj/h_proj``)
 
-Weights that are NOT quantized (norms, biases, embeddings, gate weights,
-``wo_a`` [bf16 by default in sglang]) pass through unchanged.
+Weights that are NOT quantized (norms, biases, embeddings, gate weights)
+pass through unchanged.  ``wo_a`` also passes through, except under
+``fp4_qat`` where it is pushed as bf16 values projected onto the trainer's
+128×128 FP8 QAT grid (see :func:`simulate_fp8_wo_a`).
 
 The scale format (float32 vs ue8m0) depends on whether sglang is using
 DeepGEMM at runtime.  We support both by attempting to import sglang's
@@ -31,7 +33,7 @@ from dataclasses import dataclass
 
 import torch
 
-from gpatch_v4.models.deepseek_v4.kernel.quantize_kernels import fp4_qat_to_sgl_fp8
+from gpatch_v4.kernel.quantize.fused_quant_kernels import fp4_qat_then_to_fp8
 from gpatch_v4.utils import log
 
 # ---------------------------------------------------------------------------
@@ -39,6 +41,14 @@ from gpatch_v4.utils import log
 # ---------------------------------------------------------------------------
 
 _EXPERT_RE = re.compile(r"\.experts\.\d+\.w[123]\.weight$")
+
+# wo_a stays BF16 at runtime (SGL mirror layout), so it cannot receive an FP8
+# qweight+scale pair.  When fp4_qat is on, the official fp4-expert checkpoint
+# stores wo_a as FP8 (128×128) and the training forward fake-quants it the same
+# way; the update then pushes the fake-quantized values back in bf16 (E4M3
+# codes x 2^k are exactly representable in bf16), keeping sampler, trainer
+# forward and ckpt aligned.
+_WO_A_RE = re.compile(r"^(?:.*\.)?layers\.\d+\.attn\.wo_a\.weight$|^mtp\.\d+\.attn\.wo_a\.weight$")
 
 _FP8_DENSE_PATTERNS: tuple[str, ...] = (
     # attention projections
@@ -281,7 +291,10 @@ def quantize_fp8(
     _init_fp8_quantizers()
 
     assert name.endswith(".weight"), f"Expected .weight suffix, got {name!r}"
-    weight = weight.contiguous()
+    # Quantize the BF16 view, not the FP32 master — same rationale as
+    # quantize_fp4_qat_expert: keep export in lockstep with the QAT forward,
+    # which fake-quants the BF16 compute view of the weight.
+    weight = weight.bfloat16().float().contiguous()
 
     if weight.dim() == 1:
         raise ValueError(f"Cannot FP8-quantize 1D weight {name!r}")
@@ -316,13 +329,14 @@ def quantize_fp4_qat_expert(
 ) -> list[tuple[str, torch.Tensor]]:
     """Deploy an FP4-QAT routed expert through SGLang's FP8 loader.
 
-    Quantize the FP32 master parameter directly to E2M1 1×32 and rebase it
+    Quantize the BF16 view of the master parameter to E2M1 1×32 and rebase it
     into SGLang's E4M3 128×128 representation with one fused TileLang kernel.
     """
     assert _EXPERT_RE.search(name) is not None, f"Expected routed expert key, got {name!r}"
     assert name.endswith(".weight"), f"Expected .weight suffix, got {name!r}"
 
-    qweight, fp8_scale = fp4_qat_to_sgl_fp8(weight)
+    # BF16 view, not FP32 master: group scales must flip in lockstep with the trainer forward.
+    qweight, fp8_scale = fp4_qat_then_to_fp8(weight.bfloat16().float())
 
     # The regular SGLang path uses float32 scales unless its DeepGEMM path
     # requires the transformed ue8m0 layout. Reuse exactly that decision and
@@ -336,6 +350,26 @@ def quantize_fp4_qat_expert(
 
     scale_name = name[:-len(".weight")] + ".weight_scale_inv"
     return [(name, qweight), (scale_name, scale.contiguous())]
+
+
+def simulate_fp8_wo_a(name: str, weight: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    """Project wo_a onto the trainer's FP8 QAT grid and return it as bf16.
+
+    sglang keeps wo_a bf16 (SGL mirror layout), so we cannot push an FP8
+    qweight+scale pair — doing so corrupts the bf16 module.  Instead, run the
+    exact same fake-quant the training forward applies
+    (:func:`fp8_simulate_qat_128x128`, E4M3 + E8M0, 128×128 tiles) on the
+    BF16 view of the master and push the dequantized result.  E4M3 codes
+    times a power-of-two scale are exactly representable in bf16, so the
+    sampler's wo_a then equals the trainer forward's effective weight
+    bit-for-bit.
+    """
+    assert _WO_A_RE.search(name) is not None, f"Expected wo_a key, got {name!r}"
+    # Lazy import: qat.py pulls in tilelang/tile_kernels, keep them off the
+    # import path of workers that never enable fp4_qat.
+    from gpatch_v4.kernel.quantize.qat import fp8_simulate_qat_128x128
+
+    return [(name, fp8_simulate_qat_128x128(weight.bfloat16()).contiguous())]
 
 
 def iter_fp8_quantized_weights(
@@ -376,6 +410,8 @@ def iter_fp8_quantized_weights(
 
         if fp4_qat and _EXPERT_RE.search(name) is not None:
             yield from quantize_fp4_qat_expert(name, tensor, moe_deepgemm=moe_deepgemm)
+        elif fp4_qat and _WO_A_RE.search(name) is not None:
+            yield from simulate_fp8_wo_a(name, tensor)
         elif should_fp8_quantize(name):
             yield from quantize_fp8(name, tensor, moe_deepgemm=moe_deepgemm)
         else:

@@ -9,23 +9,30 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from gpatch_v4.actor import (
+    AgenticDistillStudentActor,
     DistillStudentActor,
     DpoActor,
+    DynBatchGrpoAsyncTrainActor,
+    EmbeddingActor,
     EvaluateActor,
     FinetuneActor,
     GrpoAsyncTrainActor,
     GrpoTrainActor,
     OffPolicyDistillStudentActor,
+    PretrainActor,
     RewardActor,
     T2iEditSftActor,
     T2iGrpoTrainActor,
 )
 from gpatch_v4.configs.config import (
+    AgenticOnPolicyDistillConfig,
     DpoConfig,
+    EmbeddingConfig,
     EvaluateConfig,
     FinetuneConfig,
     OffPolicyDistillConfig,
     OnPolicyDistillConfig,
+    PretrainConfig,
     RewardConfig,
     RlConfig,
     T2iEditSftConfig,
@@ -89,8 +96,15 @@ class RayTrainGroup:
 
         if isinstance(self.config, T2iRlConfig):
             actor_impl = T2iGrpoTrainActor
+        elif isinstance(self.config, AgenticOnPolicyDistillConfig):
+            # Must come before the OnPolicyDistillConfig branch — agentic
+            # distill subclasses OnPolicyDistillConfig and needs the
+            # async (single-controller) actor, not the sync one.
+            actor_impl = AgenticDistillStudentActor
         elif isinstance(self.config, RlConfig):
-            if getattr(self.config.training, 'single_controller', False):
+            if self.config.training.dynamic_batch_train:
+                actor_impl = DynBatchGrpoAsyncTrainActor
+            elif getattr(self.config.training, 'single_controller', False):
                 actor_impl = GrpoAsyncTrainActor
             else:
                 actor_impl = GrpoTrainActor
@@ -100,6 +114,11 @@ class RayTrainGroup:
             actor_impl = OffPolicyDistillStudentActor
         elif isinstance(self.config, T2iEditSftConfig):
             actor_impl = T2iEditSftActor
+        elif isinstance(self.config, PretrainConfig):
+            # Must come before FinetuneConfig: PretrainConfig subclasses it.
+            actor_impl = PretrainActor
+        elif isinstance(self.config, EmbeddingConfig):
+            actor_impl = EmbeddingActor
         elif isinstance(self.config, FinetuneConfig):
             actor_impl = FinetuneActor
         elif isinstance(self.config, EvaluateConfig):
@@ -110,7 +129,18 @@ class RayTrainGroup:
             actor_impl = RewardActor
         else:
             raise NotImplementedError(f"unknown config {type(self.config)}")
-        ActorClass = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(actor_impl)
+        runtime_env = {"env_vars": env_vars}
+        if self.config.report.profile.use_nsys:
+            profile_dir = self.config.report.profile.profile_save_dir
+            os.makedirs(profile_dir, exist_ok=True)
+            runtime_env["nsight"] = {
+                "t": "cuda,nccl,cudnn,cublas,nvtx,osrt",
+                "capture-range": "cudaProfilerApi",
+                "capture-range-end": "stop",
+                "force-overwrite": "true",
+                "o": f"{profile_dir}/nsys_%p",
+            }
+        ActorClass = ray.remote(num_gpus=1, runtime_env=runtime_env)(actor_impl)
 
         self._actor_handlers = []
         master_addr, master_port = None, None

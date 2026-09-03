@@ -44,6 +44,7 @@ class UpdateWeightMixin:
             sampler_engine_gpu_counts=engine_gpu_counts,
             moe_deepgemm=bool(getattr(sampler_configs[0], "enable_deepep_moe", False))
             if sampler_configs else False,
+            sglang_export_fp4_qdq=bool(getattr(self.config.policy, "sglang_export_fp4_qdq", False)),
             placement_type=self.config.placement_type,
             wake_up=self.wake_up,
             sleep=self.sleep,

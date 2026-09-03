@@ -1,0 +1,53 @@
+# @package _global_
+
+defaults:
+  - rl_config
+  - _self_
+
+placement_type: colocate
+
+training:
+  rollout_gbs: 8
+  sampling_repeat_n: 4
+  sampling_keep_n: 4
+  train_gbs: 8
+  save_interval: 2
+  eval_interval: 0
+  ppo_max_epochs_2: 1
+  single_controller: True
+  async_rollout: False
+  rollout_max_staleness: 0
+
+checkpoint:
+  load_ckpt_path: save_qwen_2_5_1_5b_grpo_colocate_resume
+  save_ckpt_path: save_qwen_2_5_1_5b_grpo_colocate_resume
+
+data:
+  custom_rollout_data_source_path: "tasks/math_rl_v4/resumable_rollout_data_source.py"
+  custom_rollout_data_source_name: "ResumableRolloutDataSource"
+
+policy:
+  dist_config:
+    nnodes: -1
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 2
+  hf_model_path: "hf-hub/Qwen/Qwen2.5-1.5B"
+  hf_tokenizer_path: "hf-hub/Qwen/Qwen2.5-1.5B"
+  ref_hf_model_path: "hf-hub/Qwen/Qwen2.5-1.5B"
+
+sampler:
+  dist_config:
+    nnodes: -1
+  model_info:
+    - model_arch: qwen2
+      hf_model_path: "hf-hub/Qwen/Qwen2.5-1.5B"
+  infer_engine_configs:
+    - dist_config:
+        tensor_model_parallel_size: 2
+        nnodes: -1
+      use_fast_tokenizer: True
+      gpu_memory_utilization: 0.7
+      max_running_requests: 128
+      temperature: 1.0
+      top_p: 0.9
+      generate_max_tokens: 1024
